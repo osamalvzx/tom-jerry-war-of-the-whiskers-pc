@@ -29,7 +29,39 @@ everything else is part of Windows.
 - **Saving** works, to a normal Windows folder.
 - **LAN multiplayer** — host or join over the network, with a lobby, player names and
   configurable fight settings. Frame-locked deterministic lockstep.
-- **MEAT RUSH**, a new mode: no knockouts, grab the meat, first to the target wins.
+- **MEAT RUSH**, a brand new game mode — see below. Playable solo against the AI or over LAN.
+
+## MEAT RUSH
+
+A new mode built on top of the original game: **a race to collect, not a fight to the finish.**
+
+**Nobody can be knocked out.** Punches, kicks and smashes still land, characters still get
+knocked down and sent flying, and every move works exactly as it always did — but health is
+taken out of the equation entirely and the health bars come off the HUD. You cannot lose by
+being beaten up, and you cannot win that way either.
+
+**Instead, a turkey leg keeps dropping into the arena, and you grab it.** It is the only item
+that spawns — no weapons, no first-aid boxes, no mystery crates — and several are on the floor
+at any moment. Press **B** next to one and it is instantly yours: it vanishes on the spot and
+your counter goes up by one. It is never carried, never swung, never thrown, and **it cannot be
+destroyed** — kicking or smashing it just knocks it around, so the only way anything scores is
+a clean pickup.
+
+That turns fighting into a tool rather than the goal. Punching someone away from a drumstick
+is how you deny them a point; a well-timed smash buys you the second you need to reach one
+first. Your count is shown under each player's portrait, so you always know who is ahead.
+
+**Winning.** First to the target wins immediately. Set the target on
+`OPTIONS → FIGHT SETTINGS → MEAT RUSH`: **5, 10, 15, 20 or UNLIMITED**. On UNLIMITED there is
+no target and the round is decided by the clock — whoever has collected the most when time runs
+out takes it, and an equal count is a draw. (UNLIMITED meat together with UNLIMITED time would
+never end, so the game will not let you start that combination.)
+
+**Where to find it:** `MAIN MENU → MULTIPLAYER → MEAT RUSH`, and in the LAN lobby's **MODE**
+row alongside QUICK MATCH and TOURNAMENT. It works in every arena — the drumstick is placed
+into each one at install time, so it looks the same wherever you play.
+
+Controls are the game's own: **A** jump, **B** grab, **X** kick (**X** in mid-air smashes).
 
 ## Building
 
