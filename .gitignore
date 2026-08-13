@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------------------
+# NOTHING DERIVED FROM THE GAME DISC MAY EVER BE COMMITTED.
+#
+# This project ships no game data: the installer extracts everything from a
+# disc image the user supplies themselves. That is what makes it publishable,
+# and these rules are what keep it true. If you are adding an exception here,
+# stop and check whether the file came off the disc.
+# ---------------------------------------------------------------------------
+
+# Disc images and anything extracted from them
+*.iso
+extracted/
+dist/
+
+# Sections lifted out of default.xbe (the game's own .text/.data).
+# Regenerate locally from YOUR OWN copy with port/tools/extract_*_image.py.
+port/src/game/generated/*.bin
+
+# Reverse-engineering workspace: Ghidra project + decompiled game code
+re/
+
+# Emulator and downloaded third-party tools at the repo ROOT. Anchored with a leading slash:
+# a bare "tools/" also matches port/tools/, which silently dropped every build and asset script.
+/xemu*/
+/tools/
+
+# ---------------------------------------------------------------------------
+# Build output and local artifacts
+# ---------------------------------------------------------------------------
+port/build/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Test/capture output
+*.bmp
+*.png
+*.log
+tj_log.txt
+capture_*.*
+*.items.txt
+
+# Saves -- never commit, never delete
+_SAVES/
+*.xsv
+*.xbx
+
+# Local settings
+tomjerry.ini
+portable.txt
+
+# Internal session-handoff notes: working material addressed to whoever picks the project up
+# next, including process notes and reverse-engineering scratch. Not public documentation.
+PROJECT_STATUS.md
+NEXT_SESSION.md
+port/MEAT_RUSH_PLAN.md
+port/LAN_PLAN.md
+port/PORTING_LOG.md
+port/RUNTIME.md
+
+__pycache__/
+*.pyc
+
+# Editor / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
