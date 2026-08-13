@@ -85,19 +85,30 @@ extern "C" __declspec(dllexport) int RunGame(const char* xbePathIn, const char* 
     if (modeIn)    strncpy_s(modeBuf, modeIn, _TRUNCATE);
     const char* xbePath = xbeBuf;
     const char* mode = modeBuf;
-    // When stdout is a live console (user launched by hand), tee the diagnostics to
-    // tj_log.txt next to the exe -- the console dies with the process on a crash, and
-    // the log file is what makes user crash reports actionable. Piped/redirected runs
-    // (the automated tests) keep their pipe untouched.
+    // When stdout is a live console (user launched by hand), tee the diagnostics to a log
+    // file -- the console dies with the process on a crash, and the log is what makes a user
+    // crash report actionable. Piped/redirected runs (the automated tests) keep their pipe.
+    //
+    // ⚠ THE LOG GOES IN THE USER DATA FOLDER, NOT NEXT TO THE EXE, AND A FAILURE HERE MUST NOT
+    // BE FATAL. Both halves of that were a real crash: an installed copy lives in Program
+    // Files, which a standard user cannot write, so freopen_s failed -- and freopen_s CLOSES
+    // the stream before it tries to open the new file, leaving stdout dead. The next printf
+    // then tripped the CRT's invalid-parameter handler and the process died with 0xC0000409
+    // about a second in, showing only a flash of console. It reproduced only on a plain
+    // double-click: the "Play now?" launch straight after installing inherits the installer's
+    // elevation and could write, and any redirected run skips this block entirely.
     if (GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) == FILE_TYPE_CHAR) {
-        char logPath[MAX_PATH]; GetModuleFileNameA(nullptr, logPath, MAX_PATH);
-        char* slash = strrchr(logPath, '\\');
-        strcpy_s(logPath + (slash ? slash + 1 - logPath : 0),
-                 MAX_PATH - (slash ? slash + 1 - logPath : 0), "tj_log.txt");
+        char logPath[MAX_PATH];
+        _snprintf_s(logPath, sizeof logPath, _TRUNCATE, "%s\\tj_log.txt",
+                    tj::hybrid::UserDataDir());
         FILE* f = nullptr;
-        if (freopen_s(&f, logPath, "w", stdout) == 0) {
+        if (freopen_s(&f, logPath, "w", stdout) == 0 && f) {
             setvbuf(stdout, nullptr, _IONBF, 0);
             printf("[hybrid] log file: %s\n", logPath);
+        } else {
+            // Put the console back. Whatever went wrong -- read-only folder, full disk, roaming
+            // profile -- losing the log is acceptable; losing stdout is not.
+            freopen_s(&f, "CONOUT$", "w", stdout);
         }
     }
     printf("[hybrid] RunGame xbe=%s mode=%s (DLL @ %p)\n", xbePath, mode ? mode : "(null)",

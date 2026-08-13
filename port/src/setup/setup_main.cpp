@@ -268,7 +268,10 @@ static bool RunInstall(InstallJob* job) {
     // shim. Leaving them means the player still sees "tj_loader.exe" and "PLAY.cmd" next to the
     // new named exe and has no idea which one to run -- which is the exact confusion the rename
     // was meant to end. Named explicitly: never pattern-delete inside a user's folder.
-    for (const wchar_t* stale : { L"tj_loader.exe", L"PLAY.cmd" }) {
+    // tj_log.txt joins the list: the log moved to the user data folder (Program Files is not
+    // writable by a standard user, and trying to open it there killed the game on launch), so
+    // one left here is stale and only misleads a crash report.
+    for (const wchar_t* stale : { L"tj_loader.exe", L"PLAY.cmd", L"tj_log.txt" }) {
         std::wstring p = job->dest + L"\\" + stale;
         if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) {
             SetFileAttributesW(p.c_str(), FILE_ATTRIBUTE_NORMAL);
