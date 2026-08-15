@@ -24,11 +24,16 @@ everything else is part of Windows.
 ## What works
 
 - The full game: all characters, all arenas, Challenge and Quick Game.
+- **Local multiplayer up to 4 players** — one controller each, on one PC.
 - **Widescreen and any resolution**, windowed / borderless / exclusive fullscreen.
 - **Independent music and effects volume** — the original could only trade one against the other.
 - **Saving** works, to a normal Windows folder.
 - **LAN multiplayer** — host or join over the network, with a lobby, player names and
   configurable fight settings. Frame-locked deterministic lockstep.
+- **Local players and LAN players mix freely.** Two people can share one PC and play against
+  another PC, with CPU opponents filling any seat that is left — four seats in total, in any
+  combination. Everyone at a PC picks their own character and team on their own controller,
+  and the second player appears as `<name> 2`.
 - **MEAT RUSH**, a brand new game mode — see below. Playable solo against the AI or over LAN.
 
 ## MEAT RUSH

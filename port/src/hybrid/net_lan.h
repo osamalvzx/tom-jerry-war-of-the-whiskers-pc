@@ -104,6 +104,16 @@ const char* LanNakText();
 // Lobby actions. Client actions become INTENT packets; host actions apply directly.
 void LanSetReady(bool ready);
 void LanCycleChar(int delta);
+// Seat-addressed forms, for when more than one person is sitting at this PC. Each drives their
+// OWN seat; a seat this machine does not own is ignored. The no-argument forms above are these
+// applied to the primary seat.
+void LanSetReadyFor(int slot, bool ready);
+void LanCycleCharFor(int slot, int delta);
+void LanCycleTeamFor(int slot, int delta);
+void LanCycleCostumeFor(int slot, int delta);
+// How many people are playing on this PC, and the seat the n-th of them occupies (-1 if none).
+int  LanLocalCount();
+int  LanLocalSlotAt(int localIndex);
 // Team letters (0..3 = A..D). Your own seat is yours; every other seat is the host's. The
 // LAYOUT (melee vs teams) is never chosen -- it is derived from the letters at launch, the
 // way retail's own setup screen derives it, so it never has to ride on the wire.
@@ -135,6 +145,9 @@ uint32_t LanPingMs();
 void LanHostSetArena(uint8_t arena);
 void LanHostSetMode(uint8_t mode);      // 0 quick, 1 tournament
 void LanHostToggleCpu(int slot);
+// Remove the player in `slot` and free the seat. Host only, and never a seat this PC drives --
+// unplug that controller instead.
+void LanHostKick(int slot);
 bool LanHostCanStart();
 void LanHostStart();                     // -> LAN_STARTING -> GO -> armed
 void LanLeave();

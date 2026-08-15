@@ -147,6 +147,23 @@ static void Txt(int slot, const char* fmt, ...) {
     }
     o[n] = 0;
 }
+// Add to a row that has already been composed this frame, so a marker can be tacked onto
+// whatever the cell happens to say. Same filtering as Txt: '%' is dropped, because the row
+// text is handed to the game's own formatter and a stray one would eat the next character.
+static void TxtAppend(uint16_t slot, const char* fmt, ...) {
+    char tmp[sizeof(g_txt[0])];
+    va_list ap; va_start(ap, fmt);
+    _vsnprintf_s(tmp, sizeof tmp, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    char* o = g_txt[slot];
+    int n = (int)strlen(o);
+    for (const char* p = tmp; *p && n < (int)sizeof(g_txt[0]) - 1; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '%' || (c < 0x20 && c != 0x08)) continue;
+        o[n++] = (char)c;
+    }
+    o[n] = 0;
+}
 // A BUTTON GLYPH MUST BE PRECEDED BY A SPACE, never by a printing character: FUN_00016680
 // charges DOUBLE width for the D/O/S/T/X escapes and the drawer paints the glyph over that
 // double cell, so it covers whatever sits immediately before it. Measured: "... ("BTN_A" TO
@@ -1002,6 +1019,24 @@ static const uint8_t kCell[kRows][4] = {
 };
 static int g_curCol = 0, g_curRow = 0;
 
+// A SECOND PERSON AT THE SAME PC GETS THEIR OWN CURSOR. Retail screen 11 has exactly one
+// selection flare, and it belongs to this machine's player 1 -- so the extra players get a
+// cursor that is locked to their OWN seat column and walks only the four rows in it
+// (character, skin, type, team). That is everything they can legitimately change anyway: the
+// arena, the rules and START are the host's, and a second player sharing a PC is never the
+// host in their own right. Locking the column also means their cursor needs no flare of its
+// own: it is drawn as a "<P3" caret appended to the cell they are on.
+static int g_cur2Row[4] = { 0, 0, 0, 0 };          // by LOCAL player index (1..3 used)
+static const int kSeatRows = 4;                    // rows 0..3 are the per-seat controls
+
+// Per-pad edge test. `Pressed` deliberately accepts ANY pad so a lone player can use whichever
+// controller they picked up; once two people share the lobby each must be read separately or
+// one d-pad would move both cursors.
+static bool PressedPad(uint32_t id, int pad) {
+    uint32_t in = InputObj();
+    return in && pad >= 0 && pad < 4 && InputTest(in, 0, id, (uint32_t)pad) != 0;
+}
+
 static uint32_t CellItem(int row, int col) {
     switch (kCell[row][col]) {
     case C_CHAR:  return g_lIt_char[col];
@@ -1045,6 +1080,13 @@ static void CursorMove(uint32_t self, int dcol, int drow) {
     CursorApply(self);
     Sfx(5);
     printf("[lan] cursor -> col %d row %d (cell %d)\n", col, row, kCell[row][col]);
+}
+
+// Player 1's view of the pad. With one person at this PC any controller drives the menus (the
+// long-standing behaviour). The moment a second person is in the lobby that has to stop: their
+// d-pad would move BOTH cursors and their A press would change player 1's character.
+static bool PressedP1(uint32_t id) {
+    return LanLocalCount() > 1 ? PressedPad(id, 0) : Pressed(id);
 }
 
 static void __fastcall Hk_LobbyBuild(uint32_t self, uint32_t) {
@@ -1136,20 +1178,32 @@ static void __fastcall Hk_LobbyBuild(uint32_t self, uint32_t) {
 
 // Who may drive a given cell. The cursor can always LAND on one -- this only decides whether
 // the action does anything, and whether the row is drawn at half alpha.
+// "Mine" means ANY seat this PC drives, not just the primary one. With two people sharing a
+// machine the second seat is every bit as local as the first, and testing `col == LanLocalSlot()`
+// locked that player out of their own character, skin and team.
+static bool SeatIsMine(int col) {
+    const LanSlotInfo* s = LanSlot(col);
+    return s && s->isLocal != 0;
+}
+
 static bool CellEnabled(int row, int col) {
     const bool host = LanIsHost();
-    const int  me   = LanLocalSlot();
+    const int  me   = col;                       // ownership is per-seat now, see SeatIsMine
+    (void)me;
     const LanSlotInfo* s = LanSlot(col);
     switch (kCell[row][col]) {
-    case C_CHAR: return (col == me) || (host && s && s->kind == 2);
+    case C_CHAR: return SeatIsMine(col) || (host && s && s->kind == 2);
     // A character with only one costume has nothing to cycle, so the cell greys out on its
     // own -- five of the eleven are like that, and the ceiling is the same on every PC.
     // Only what THIS save has unlocked. On a fresh save that is one costume per character, so
     // the row is simply dimmed until the player earns something -- progression is preserved.
-    case C_SKIN: return ((col == me) || (host && s && s->kind == 2)) && s && s->kind &&
+    case C_SKIN: return (SeatIsMine(col) || (host && s && s->kind == 2)) && s && s->kind &&
                         LanCostumeUnlocked(s->charId) > 1;
-    case C_TYPE: return host && col != me && !(s && s->kind == 1);   // never evict a human
-    case C_TEAM: return (col == me) || (host && s && s->kind);
+    // The host may act on ANY seat that is not this PC's: empty cycles OPEN<->CPU, and a
+    // seat with a person in it is removed. Somebody has to be able to clear a seat when a
+    // pad dies or a player wanders off.
+    case C_TYPE: return host && !SeatIsMine(col);
+    case C_TEAM: return SeatIsMine(col) || (host && s && s->kind);
     case C_ARENA: case C_SET: case C_MODE: case C_START: return host;
     default: return false;
     }
@@ -1185,9 +1239,26 @@ static void RefreshLobbyText(uint32_t self) {
         // One meaning per slot, always. The old lobby put "ADD CPU" in the READY slot, so the
         // same line meant a state on a filled seat and an instruction on an empty one.
         Txt(T_SLOTTYPE0 + i, "%s", !used ? "OPEN" : (s->kind == 2 ? "CPU" : "HUMAN"));
+        // Say what the button will actually do, and only while the host is standing on it: a
+        // cell that reads "HUMAN" gives no hint that A throws that player out of the game.
+        if (host && used && s->kind == 1 && !SeatIsMine(i) &&
+            g_curRow == 2 && g_curCol == i)
+            Txt(T_SLOTTYPE0 + i, "REMOVE?");
         if (used) Txt(T_SLOTTEAM0 + i, "TEAM %c%s", 'A' + (s->team & 3),
                       (s->kind == 1 && s->ready) ? "  READY" : "");
         else      Txt(T_SLOTTEAM0 + i, "-");
+        // The extra local players' cursors. They have no selection flare of their own -- there
+        // is only one on this screen and it is player 1's -- so each marks the cell it sits on
+        // with its player number. Appended after the cell text is composed, so it survives
+        // whatever the row happens to say this frame.
+        for (int j = 1; j < LanLocalCount(); ++j) {
+            if (LanLocalSlotAt(j) != i) continue;
+            int row = g_cur2Row[j];
+            if (row < 0 || row >= kSeatRows) row = 0;
+            static const uint16_t kRowText[kSeatRows] = { T_SLOTCHAR0, T_SLOTSKIN0,
+                                                          T_SLOTTYPE0, T_SLOTTEAM0 };
+            TxtAppend((uint16_t)(kRowText[row] + i), "  <P%d", i + 1);
+        }
         RowShow((uint32_t)(uintptr_t)g_l_slotName[i].mem, used, false);
         RowShow(g_lIt_char[i], true, true);
         RowShow(g_lIt_skin[i], true, true);
@@ -1290,15 +1361,15 @@ static uint32_t __fastcall Hk_LobbyUpdate(uint32_t self, uint32_t) {
         return 15;
     }
 
-    if (Pressed(IN_B) && !AutoDriving()) { Sfx(1); LanLeave(); LanBlobRestore(); return 4; }
+    if (PressedP1(IN_B) && !AutoDriving()) { Sfx(1); LanLeave(); LanBlobRestore(); return 4; }
 
     // MOVE. The d-pad moves the cursor and nothing else -- left/right between the seat
     // columns, up/down between the controls in one. That is the whole point of the redesign:
     // the layout is a grid, so the d-pad has to be a grid.
-    if (Pressed(IN_LEFT))  CursorMove(self, -1, 0);
-    if (Pressed(IN_RIGHT)) CursorMove(self, +1, 0);
-    if (Pressed(IN_UP))    CursorMove(self, 0, -1);
-    if (Pressed(IN_DOWN))  CursorMove(self, 0, +1);
+    if (PressedP1(IN_LEFT))  CursorMove(self, -1, 0);
+    if (PressedP1(IN_RIGHT)) CursorMove(self, +1, 0);
+    if (PressedP1(IN_UP))    CursorMove(self, 0, -1);
+    if (PressedP1(IN_DOWN))  CursorMove(self, 0, +1);
 
     // CHANGE. Retail moved every value change onto A (id 7, forward) and X (id 8, backward)
     // the moment a screen had more than one column, and prints that mapping in its hint band.
@@ -1308,9 +1379,9 @@ static uint32_t __fastcall Hk_LobbyUpdate(uint32_t self, uint32_t) {
     // well, so pressing START to go ready was silently cycling whatever the cursor sat on --
     // pick your character, press START, and the character changed. START means ready (or, for
     // the host, begin) and nothing else, so it is taken out of the running here first.
-    const bool startPressed = Pressed(IN_START);
+    const bool startPressed = PressedP1(IN_START);
     int step = startPressed ? 0
-             : (Pressed(IN_NEXT) || Pressed(IN_A)) ? +1 : Pressed(IN_PREV) ? -1 : 0;
+             : (PressedP1(IN_NEXT) || PressedP1(IN_A)) ? +1 : PressedP1(IN_PREV) ? -1 : 0;
     if (step) {
         const int col = g_curCol;
         const int me  = LanLocalSlot();
@@ -1319,18 +1390,20 @@ static uint32_t __fastcall Hk_LobbyUpdate(uint32_t self, uint32_t) {
             Sfx(1);                                  // the retail "refused" blip
         } else switch (kCell[g_curRow][col]) {
         case C_CHAR:
-            if (col == me) LanCycleChar(step); else LanHostCycleChar(col, step);
+            if (SeatIsMine(col)) LanCycleCharFor(col, step); else LanHostCycleChar(col, step);
             Sfx(5);
             break;
         case C_SKIN:
-            if (col == me) LanCycleCostume(step); else LanHostCycleCostume(col, step);
+            if (SeatIsMine(col)) LanCycleCostumeFor(col, step); else LanHostCycleCostume(col, step);
             Sfx(5);
             break;
         case C_TYPE:
-            LanHostToggleCpu(col); Sfx(5);
+            if (s && s->kind == 1) LanHostKick(col);      // a person is sitting there
+            else                   LanHostToggleCpu(col); // OPEN <-> CPU
+            Sfx(5);
             break;
         case C_TEAM:
-            if (col == me) LanCycleTeam(step); else LanHostCycleTeam(col, step);
+            if (SeatIsMine(col)) LanCycleTeamFor(col, step); else LanHostCycleTeam(col, step);
             Sfx(5);
             break;
         case C_ARENA: {
@@ -1357,6 +1430,39 @@ static uint32_t __fastcall Hk_LobbyUpdate(uint32_t self, uint32_t) {
         default: break;
         }
         (void)s;
+    }
+
+    // EXTRA LOCAL PLAYERS. Local player j reads pad j and drives seat LanLocalSlotAt(j) and
+    // nothing else -- no screen changes, no host controls, so none of the transitions above can
+    // be triggered from here and the flow below stays player 1's.
+    for (int j = 1; j < LanLocalCount(); ++j) {
+        const int seat = LanLocalSlotAt(j);
+        if (seat < 0) continue;
+        int& row = g_cur2Row[j];
+        if (row < 0 || row >= kSeatRows) row = 0;
+        if (PressedPad(IN_UP, j))   { row = (row + kSeatRows - 1) % kSeatRows; Sfx(5); }
+        if (PressedPad(IN_DOWN, j)) { row = (row + 1) % kSeatRows; Sfx(5); }
+
+        const bool start2 = PressedPad(IN_START, j);
+        int step2 = start2 ? 0
+                  : (PressedPad(IN_NEXT, j) || PressedPad(IN_A, j)) ? +1
+                  : PressedPad(IN_PREV, j) ? -1 : 0;
+        if (step2) {
+            if (!CellEnabled(row, seat)) {
+                Sfx(1);
+            } else switch (kCell[row][seat]) {
+            case C_CHAR: LanCycleCharFor(seat, step2);    Sfx(5); break;
+            case C_SKIN: LanCycleCostumeFor(seat, step2); Sfx(5); break;
+            case C_TEAM: LanCycleTeamFor(seat, step2);    Sfx(5); break;
+            // C_TYPE (OPEN/CPU) is the host's seat-filling control, not a player's own.
+            default: Sfx(1); break;
+            }
+        }
+        if (start2) {
+            const LanSlotInfo* s2 = LanSlot(seat);
+            LanSetReadyFor(seat, !(s2 && s2->ready));
+            Sfx(0x13);
+        }
     }
 
     // START is the commit, exactly as retail's own setup screen says on the tin: the host

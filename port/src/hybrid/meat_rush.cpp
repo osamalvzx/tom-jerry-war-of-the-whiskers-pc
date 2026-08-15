@@ -76,6 +76,12 @@ static const uint32_t kDescCat1Cnt  = 0x2B;      // descriptor: category-1 count
 static const uint32_t kDescCat1Ids  = 0x2C;      // ... and its class-id list
 static const uint32_t kClassStride  = 0x80;
 static const uint32_t kLvlCat2Count = 0x1DA3;    // LEVEL+ : category-2 type count
+// The category-1 SPAWN POINT table: one 0x1C-byte record per point, `state` at +0x1A06 and
+// the slot of the item it put out at +0x1A07 (0xFF = none). Count at LEVEL+0x1D8D.
+static const uint32_t kSpawnState   = 0x1A06;    // LEVEL + i*0x1C + this
+static const uint32_t kSpawnItem    = 0x1A07;
+static const uint32_t kSpawnStride  = 0x1C;
+static const uint32_t kSpawnCount   = 0x1D8D;    // LEVEL+ : number of points
 
 static const uint32_t kMeatSetting  = 0x16A26B;  // the FIGHT SETTINGS byte (meat_ui.cpp owns it)
 static const uint32_t kMasterPtr    = 0x15C470C;
@@ -370,8 +376,10 @@ static void MeatFrameTick() {
 // once per simulated frame from FUN_000179C0 at 0x18CB5, before the fighter loop, so the tick
 // lands at the same point in every peer's frame.  A render-phase hook would not -- the render
 // phase can run a different number of times per simulated frame.
+static void MeatDebugTick(uint32_t level);       // TJ_MEATDBG, defined below
+
 static void __fastcall Hk_PropSpawner(uint32_t level, uint32_t edx) {
-    if (g_applied) { MeatFrameTick(); return; }
+    if (g_applied) { MeatDebugTick(level); MeatFrameTick(); return; }
     ((FnPropSpawn)(uintptr_t)kPropSpawn)(level, edx);
 }
 
@@ -398,6 +406,53 @@ static uint32_t LevelBlock() {
     if (!m || m < 0x04000000u || m >= 0x10000000u) return 0;
     uint32_t l = *(volatile uint32_t*)(uintptr_t)(m + kLvlPtrOff);
     return (l >= 0x04000000u && l < 0x10000000u) ? l : 0;
+}
+
+// GIVE THE SPAWN POINT BACK.  A point walks state 0 -> 1/4 (armed, counting down) -> 2/5
+// (spawning) -> 3 (its item is out), and the retail state machine at 0x31622 has NO transition
+// out of 3: the only writes of 0 anywhere in the table are the arena-load init at 0x310D9.  So
+// each point fires exactly ONCE per match, and a match can never contain more items than the
+// arena has points.  Retail never trips over that -- items linger on the floor and its cap is
+// one at a time, so a round ends long before the table drains.
+//
+// MEAT RUSH consumes the meat the instant it is grabbed, so it drains the table as fast as
+// people can pick things up.  Reported from a real 4-player round: 3 + 3 + 1 + 0 collected with
+// MAX MEAT 5, then no meat ever again and the round ran out the clock -- an arena with seven
+// points, all spent.
+//
+// Returning the point to state 0 makes the scheduler re-arm it through its OWN path (0x315CC:
+// state 1 with a 60..360 frame randomised delay), so pacing stays the game's rather than ours.
+// It is lockstep-safe: this runs from a take, which is simulation state both peers reach on the
+// same frame, so the re-arm and its RNG draw happen identically on both.
+// TJ_MEATDBG=1: once a second, print exactly the two quantities the scheduler compares against
+// its concurrent cap at 0x31500 --
+//     bl = (spawn points in state 1,2,4,5) + (item records with kind==1 and state != 0)
+// -- plus the raw per-point states. When the meat stops appearing, this says which half is
+// stuck, which is the difference between a leaked item record and a stuck spawn point.
+static void MeatDebugTick(uint32_t level) {
+    static int on = -1;
+    if (on < 0) { char* e = nullptr; size_t n = 0; _dupenv_s(&e, &n, "TJ_MEATDBG");
+                  on = (e && *e && atoi(e)) ? 1 : 0; free(e); }
+    if (!on || !level) return;
+    static uint32_t tick = 0;
+    if (++tick % 60) return;
+
+    uint32_t pts = *U8(level + kSpawnCount);
+    if (pts > 64) pts = 64;
+    int busy = 0;
+    char states[160]; int at = 0;
+    for (uint32_t i = 0; i < pts; ++i) {
+        uint8_t st = *U8(level + i * kSpawnStride + kSpawnState);
+        if (st == 1 || st == 2 || st == 4 || st == 5) ++busy;
+        at += _snprintf_s(states + at, sizeof(states) - at, _TRUNCATE, "%u ", st);
+    }
+    int live = 0;
+    for (uint32_t i = 0; i < 50; ++i) {
+        const uint8_t* rec = U8(level + kItemArr + i * kItemStride);
+        if (rec[0x1408] != 0 && rec[0x140B] == 1) ++live;
+    }
+    printf("[meatdbg] cap=%d (busyPoints=%d + liveItems=%d) of %u  points[%s]\n",
+           busy + live, busy, live, kConcurrentItems, states);
 }
 
 static void BankHeldMeat(uint32_t carry) {

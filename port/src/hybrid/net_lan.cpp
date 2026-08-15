@@ -47,7 +47,10 @@ namespace tj::hybrid {
 static const uint32_t kMagic     = 0x314E4A54;   // 'TJN1'
 // 5: PktLobby and PktStart both grew a MEAT RUSH byte. A peer on 4 must be REFUSED at the
 // version check rather than misparse a shorter packet, so this bump is mandatory.
-static const uint8_t  kProtoVer  = 5;
+// 6: JOIN carries the number of players sitting at one PC and the reply grants a seat MASK, so
+// two people can share a machine. Both packets grew, so an older peer must be refused at JOIN
+// rather than left to misparse them.
+static const uint8_t  kProtoVer  = 6;
 static const int      kBasePort  = 27100;
 static const int      kPortSpan  = 8;
 static const int      kRing      = 256;          // frames of input history (power of two)
@@ -76,13 +79,23 @@ struct PktBeacon {
     char host[16]; uint8_t players, maxPlayers, mode, arena, locked, inMatch; uint16_t rsv;
 };
 struct PktProbe { Hdr h; uint32_t nonce; };
+// ⚠ THE TWO JOIN PACKETS MUST STAY READABLE BY AN OLDER BUILD, or a version mismatch has no
+// way to announce itself. Both grew in protocol 6, and the receiver used to require its OWN
+// size -- so a v5 peer's shorter packet was dropped before anything looked at it, and BOTH
+// sides sat in silence: the joiner retried forever and the host never even saw a request.
+// The new fields are appended at the END and the length is checked against the v5 size, so an
+// old packet still parses far enough to be refused with a message the player can act on.
 struct PktJoinReq {
     Hdr h; uint32_t sessionId, buildHash, dataHash, pwHash; char name[16];
+    uint8_t players, rsv[3];       // how many people are sitting at THIS PC (proto 6)
 };
 struct PktJoinRsp {
     Hdr h; uint32_t sessionId; uint8_t ok, nak, slot, players;
     uint32_t buildHash, dataHash;
+    uint8_t slotMask, rsv[3];      // every seat granted to this PC, bit s = seat s (proto 6)
 };
+static const int kJoinReqV5 = (int)(sizeof(PktJoinReq) - 4);
+static const int kJoinRspV5 = (int)(sizeof(PktJoinRsp) - 4);
 struct PktLobby {
     Hdr h; uint32_t sessionId, lobbyVer;
     uint8_t players, mode, arena, hostReadyMask;
@@ -120,7 +133,29 @@ static bool     g_wsaUp = false;
 
 static bool     g_armed = false;             // lockstep running
 static bool     g_isHost = false;
+// SEATS THIS PC DRIVES. Two people sharing one console is how this game was played, so one
+// peer can own more than one seat: g_localSlot stays the PRIMARY seat (the one this PC's
+// player 1 sits in, and the one lobby intents are addressed from), while g_localMask is every
+// seat driven by a controller plugged into THIS machine. Local player j -- meaning pad j --
+// owns the j-th set bit, in ascending seat order.
 static int      g_localSlot = 0;
+static uint8_t  g_localMask = 1;
+static int      g_localCount = 1;
+static inline bool IsLocalSlot(int s) {
+    return s >= 0 && s < kSlots && (g_localMask & (1u << s)) != 0;
+}
+// Seat -> which local player drives it (0 = this PC's player 1), or -1 if it is not ours.
+static int LocalIndexOf(int slot) {
+    if (!IsLocalSlot(slot)) return -1;
+    int j = 0;
+    for (int s = 0; s < slot; ++s) if (IsLocalSlot(s)) ++j;
+    return j;
+}
+// The n-th seat this PC drives, or -1.
+static int LocalSlotAt(int j) {
+    for (int s = 0; s < kSlots; ++s) if (IsLocalSlot(s) && j-- == 0) return s;
+    return -1;
+}
 static int      g_slotCount = 2;
 static int      g_delay = 2;
 static int      g_delayForced = 0;           // TJ_NET_DELAY overrides the auto value
@@ -184,7 +219,12 @@ static uint32_t g_tBeacon = 0, g_tPing = 0, g_tRetry = 0, g_tJoin = 0, g_tProbe 
 static uint32_t g_stallFrames = 0, g_sent = 0, g_recv = 0, g_lastRemote = 0, g_dropped = 0;
 static uint32_t g_rttMs = 0;
 
-extern "C" void GetLocalPadForNet(NetInput* out);   // d3d8_bridge.cpp
+// `which` is the local player index on THIS PC (0 = first controller), not the seat.
+extern "C" void GetLocalPadForNet(NetInput* out, int which);   // d3d8_bridge.cpp
+// How many controllers are claimed on this PC right now -- i.e. how many people are sitting
+// here. A pad claims a player number on its first press, so a second player must press
+// something BEFORE hosting or joining to be counted.
+extern "C" int  GetLocalPlayerCount();                          // d3d8_bridge.cpp
 
 // ---------------------------------------------------------------- small helpers
 static uint32_t Fnv32(const void* p, size_t n, uint32_t h = 2166136261u) {
@@ -415,9 +455,23 @@ static void Broadcast(const void* p, int len) {
         Send(p, len, to);
     }
 }
+// One datagram per REMOTE MACHINE, not per remote seat. Two players sharing a PC occupy two
+// seats behind one address, and sending to both would duplicate every lobby update and every
+// input window at them -- harmless for correctness, but it doubles their traffic and makes the
+// packet counters lie.
 static void SendToPeers(const void* p, int len) {
-    for (int i = 0; i < kSlots; ++i)
-        if (g_peers[i].active && i != g_localSlot) Send(p, len, g_peers[i].addr);
+    sockaddr_in sent[kSlots];
+    int n = 0;
+    for (int i = 0; i < kSlots; ++i) {
+        if (!g_peers[i].active || IsLocalSlot(i)) continue;
+        bool dup = false;
+        for (int k = 0; k < n && !dup; ++k)
+            dup = sent[k].sin_addr.s_addr == g_peers[i].addr.sin_addr.s_addr &&
+                  sent[k].sin_port == g_peers[i].addr.sin_port;
+        if (dup) continue;
+        sent[n++] = g_peers[i].addr;
+        Send(p, len, g_peers[i].addr);
+    }
 }
 
 // ---------------------------------------------------------------- input ring
@@ -481,6 +535,18 @@ static bool OpenSocket() {
     return false;
 }
 
+// The name a second (or third) person at the same PC appears under: "SHIHAB", "SHIHAB 2".
+// One base name is typed per machine, so the extra seats are derived rather than asked for --
+// and the suffix has to fit the 16-byte name field, so the base is trimmed, not the number.
+static void LocalPlayerName(char* out, size_t cap, const char* base, int localIndex) {
+    if (localIndex <= 0) { strncpy_s(out, cap, base, _TRUNCATE); return; }
+    char trimmed[16];
+    strncpy_s(trimmed, base, _TRUNCATE);
+    size_t room = cap - 3;                       // " N" + NUL
+    if (strlen(trimmed) > room) trimmed[room] = 0;
+    _snprintf_s(out, cap, _TRUNCATE, "%s %d", trimmed, localIndex + 1);
+}
+
 // ---------------------------------------------------------------- lobby helpers
 static void LobbyReset(bool host) {
     memset(g_peers, 0, sizeof g_peers);
@@ -489,19 +555,27 @@ static void LobbyReset(bool host) {
     memset(g_readySeen, 0, sizeof g_readySeen);
     g_lobbyVer = 0;
     if (host) {
+        // The host takes one seat per person sitting at it, starting at 0.
+        int n = GetLocalPlayerCount();
+        if (n < 1) n = 1; if (n > kSlots) n = kSlots;
         g_localSlot = 0;
-        g_peers[0].active = true; g_peers[0].slot = 0; g_peers[0].lastRecv = Now();
-        strncpy_s(g_peers[0].name, g_myName, _TRUNCATE);
-        g_slotKind[0] = 1;
+        g_localCount = n;
+        g_localMask = (uint8_t)((1u << n) - 1u);
         for (int i = 0; i < kSlots; ++i) { g_slots[i].charId = (uint8_t)i; g_slots[i].team = (uint8_t)i; }
-        strncpy_s(g_slots[0].name, g_myName, _TRUNCATE);
-        g_slots[0].kind = 1; g_slots[0].isLocal = 1;
+        for (int i = 0; i < n; ++i) {
+            g_peers[i].active = true; g_peers[i].slot = (uint8_t)i; g_peers[i].lastRecv = Now();
+            LocalPlayerName(g_peers[i].name, 16, g_myName, i);
+            g_slotKind[i] = 1;
+            strncpy_s(g_slots[i].name, g_peers[i].name, _TRUNCATE);
+            g_slots[i].kind = 1; g_slots[i].isLocal = 1;
+        }
+        if (n > 1) printf("[lan] hosting with %d players on this PC\n", n);
     }
 }
 static void PublishSlots() {
     for (int i = 0; i < kSlots; ++i) {
         g_slots[i].kind = g_slotKind[i];
-        g_slots[i].isLocal = (i == g_localSlot) ? 1 : 0;
+        g_slots[i].isLocal = IsLocalSlot(i) ? 1 : 0;
         if (g_slotKind[i] && !g_slots[i].name[0])
             _snprintf_s(g_slots[i].name, sizeof(g_slots[i].name), _TRUNCATE, "P%d", i + 1);
     }
@@ -680,7 +754,7 @@ static void OnBeacon(const PktBeacon& b, const sockaddr_in& from) {
     }
 }
 
-static void OnJoinReq(const PktJoinReq& q, const sockaddr_in& from) {
+static void OnJoinReq(const PktJoinReq& q, const sockaddr_in& from, int len) {
     if (!g_isHost) return;
     PktJoinRsp r{}; Hdrs(r.h, P_JOIN_RSP);
     r.sessionId = g_sessionId; r.buildHash = g_buildHash; r.dataHash = g_dataHash;
@@ -693,31 +767,73 @@ static void OnJoinReq(const PktJoinReq& q, const sockaddr_in& from) {
         nak(NAK_PASSWORD); return;
     }
     if (g_state == LAN_MATCH || g_state == LAN_STARTING) { nak(NAK_INMATCH); return; }
-    // Already known? (JOIN_REQ is retried until answered, so this must be idempotent.)
-    int slot = -1;
+    // How many people are at that PC? Clamped hard: a malformed or hostile count must not be
+    // able to claim the whole lobby.
+    int want = (len >= (int)sizeof(PktJoinReq) && q.players) ? q.players : 1;
+    if (want < 1) want = 1;
+    if (want > kSlots - 1) want = kSlots - 1;
+
+    // Already known? (JOIN_REQ is retried until answered, so this must be idempotent -- and
+    // for a 2-player PC that means returning the SAME seats, not allocating another pair.)
+    uint8_t mask = 0;
+    int slot = -1, have = 0;
     for (int i = 1; i < kSlots; ++i)
         if (g_peers[i].active && g_peers[i].addr.sin_addr.s_addr == from.sin_addr.s_addr &&
-            g_peers[i].addr.sin_port == from.sin_port) { slot = i; break; }
-    if (slot < 0)
-        for (int i = 1; i < kSlots; ++i) if (!g_peers[i].active) { slot = i; break; }
+            g_peers[i].addr.sin_port == from.sin_port) {
+            if (slot < 0) slot = i;
+            mask |= (uint8_t)(1u << i);
+            ++have;
+        }
+    // Top up rather than only allocating on a first join: someone can plug a second controller
+    // in AFTER joining, and the re-sent JOIN_REQ then asks for more seats than they hold. Seats
+    // are never taken away here -- a pad being unplugged mid-lobby leaves the seat sitting
+    // there, which is far better than silently evicting a player who nudged a cable.
+    for (int i = 1; i < kSlots && have < want; ++i) {
+        if (g_peers[i].active) continue;
+        if (slot < 0) slot = i;
+        mask |= (uint8_t)(1u << i);
+        ++have;
+    }
     if (slot < 0) { nak(NAK_FULL); return; }
 
-    g_peers[slot].active = true; g_peers[slot].addr = from; g_peers[slot].slot = (uint8_t)slot;
-    g_peers[slot].lastRecv = Now();
-    SanitizeName(g_peers[slot].name, 16, q.name);
-    g_slotKind[slot] = 1;
-    memcpy(g_slots[slot].name, g_peers[slot].name, 16);
-    g_slots[slot].ready = 0;
+    int localIdx = 0;
+    for (int i = 1; i < kSlots; ++i) {
+        if (!(mask & (1u << i))) continue;
+        g_peers[i].active = true; g_peers[i].addr = from; g_peers[i].slot = (uint8_t)i;
+        g_peers[i].lastRecv = Now();
+        char base[16];
+        SanitizeName(base, 16, q.name);
+        LocalPlayerName(g_peers[i].name, 16, base, localIdx);
+        g_slotKind[i] = 1;
+        memcpy(g_slots[i].name, g_peers[i].name, 16);
+        g_slots[i].ready = 0;
+        ++localIdx;
+    }
     PublishSlots();
-    r.ok = 1; r.slot = (uint8_t)slot; r.players = (uint8_t)HostPlayerCount();
+    r.ok = 1; r.slot = (uint8_t)slot; r.slotMask = mask;
+    r.players = (uint8_t)HostPlayerCount();
     Send(&r, sizeof r, from);
-    printf("[lan] %s joined as slot %d (%s:%d)\n", g_peers[slot].name, slot,
-           inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+    printf("[lan] %s joined as slot %d (mask %X, %d player(s)) (%s:%d)\n", g_peers[slot].name,
+           slot, mask, localIdx, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
     Status("%s JOINED", g_peers[slot].name);
     SendLobbyState();
 }
 
-static void OnJoinRsp(const PktJoinRsp& r, const sockaddr_in& from) {
+static void OnJoinRsp(const PktJoinRsp& r, const sockaddr_in& from, int len) {
+    // A JOIN_RSP also arrives in the LOBBY: that is the host answering a re-sent JOIN_REQ from
+    // someone who has just plugged in another controller, and it carries their new seat mask.
+    if (g_state == LAN_LOBBY && !g_isHost && r.ok && r.sessionId == g_sessionId) {
+        uint8_t mask = (len >= (int)sizeof(PktJoinRsp) && r.slotMask)
+                     ? r.slotMask : (uint8_t)(1u << r.slot);
+        if (mask != g_localMask) {
+            g_localMask = mask;
+            g_localCount = 0;
+            for (int i = 0; i < kSlots; ++i) if (g_localMask & (1u << i)) ++g_localCount;
+            printf("[lan] seats updated: this PC now drives %d (mask %X)\n", g_localCount, mask);
+            LanSetName(g_myName);        // re-derive "<name> 2" for the seat we just gained
+        }
+        return;
+    }
     if (g_state != LAN_JOINING) return;
     if (!r.ok) {
         g_lastNak = (LanNak)r.nak;
@@ -729,6 +845,13 @@ static void OnJoinRsp(const PktJoinRsp& r, const sockaddr_in& from) {
     g_lastNak = NAK_NONE;
     g_sessionId = r.sessionId;
     g_localSlot = r.slot;
+    // The host decides how many seats we actually got -- it may have had fewer free than we
+    // asked for, so trust the granted mask over our own request.
+    g_localMask = (len >= (int)sizeof(PktJoinRsp) && r.slotMask)
+                ? r.slotMask : (uint8_t)(1u << r.slot);
+    g_localCount = 0;
+    for (int i = 0; i < kSlots; ++i) if (g_localMask & (1u << i)) ++g_localCount;
+    if (g_localCount > 1) printf("[lan] this PC drives %d seats (mask %X)\n", g_localCount, g_localMask);
     g_isHost = false;
     memset(g_peers, 0, sizeof g_peers);
     g_peers[0].active = true; g_peers[0].addr = from; g_peers[0].lastRecv = Now();
@@ -841,17 +964,22 @@ static void PumpRecv() {
         // ANY packet from a known peer is proof of life. Refreshing only on JOIN and INPUT
         // timed clients out of an idle lobby after 5 s -- they had nothing to say, and their
         // 4 Hz PING was answered but never counted.
+        //
+        // ⚠ EVERY SEAT AT THAT ADDRESS, not just the first. Two people sharing a PC are two
+        // peer entries behind ONE address, and their PING carries only the primary seat's
+        // number -- so stopping at the first match left the second seat's clock frozen and the
+        // host evicted that player a few seconds into the lobby, every time.
         for (int s = 0; s < kSlots; ++s)
             if (g_peers[s].active &&
                 g_peers[s].addr.sin_addr.s_addr == from.sin_addr.s_addr &&
-                g_peers[s].addr.sin_port == from.sin_port) { g_peers[s].lastRecv = Now(); break; }
+                g_peers[s].addr.sin_port == from.sin_port) g_peers[s].lastRecv = Now();
         switch (h->type) {
         case P_BEACON: if (r >= (int)sizeof(PktBeacon)) OnBeacon(*(PktBeacon*)buf, from); break;
         case P_PROBE:
             if (g_isHost && g_state != LAN_OFF) OnProbe(from);   // unicast reply, right now
             break;
-        case P_JOIN_REQ: if (r >= (int)sizeof(PktJoinReq)) OnJoinReq(*(PktJoinReq*)buf, from); break;
-        case P_JOIN_RSP: if (r >= (int)sizeof(PktJoinRsp)) OnJoinRsp(*(PktJoinRsp*)buf, from); break;
+        case P_JOIN_REQ: if (r >= kJoinReqV5) OnJoinReq(*(PktJoinReq*)buf, from, r); break;
+        case P_JOIN_RSP: if (r >= kJoinRspV5) OnJoinRsp(*(PktJoinRsp*)buf, from, r); break;
         case P_LOBBY:    if (r >= (int)sizeof(PktLobby))   OnLobby(*(PktLobby*)buf, from); break;
         case P_INTENT:   if (r >= (int)sizeof(PktIntent))  OnIntent(*(PktIntent*)buf); break;
         case P_START:    if (r >= (int)sizeof(PktStart))   OnStart(*(PktStart*)buf); break;
@@ -882,6 +1010,19 @@ static void PumpRecv() {
                                 g_slots[b.slot].ready = 0; g_slots[b.slot].name[0] = 0;
                                 PublishSlots(); SendLobbyState(); }
                 else if (b.slot == 0) { Status("HOST LEFT THE GAME"); LanClose("host left"); }
+                else if (IsLocalSlot(b.slot)) {
+                    // The host removed one of us. If it was this PC's only seat we are out of
+                    // the game; if two people were sharing the machine, the other one plays on.
+                    g_localMask &= (uint8_t)~(1u << b.slot);
+                    g_localCount = 0;
+                    for (int i = 0; i < kSlots; ++i) if (g_localMask & (1u << i)) ++g_localCount;
+                    if (!g_localCount) { Status("REMOVED BY THE HOST"); LanClose("kicked"); }
+                    else {
+                        g_localSlot = LocalSlotAt(0);
+                        Status("A PLAYER WAS REMOVED");
+                        printf("[lan] host removed our seat %d; %d left\n", b.slot, g_localCount);
+                    }
+                }
             }
             break;
         }
@@ -910,6 +1051,8 @@ bool NetInit() {
 
     g_isHost = _strnicmp(mode, "host", 4) == 0;
     g_localSlot = g_isHost ? 0 : 1;
+    g_localMask = (uint8_t)(1u << g_localSlot);   // legacy harness: one seat per instance
+    g_localCount = 1;
     if (!OpenSocket()) return false;
 
     g_legacyMode = true;
@@ -1017,10 +1160,12 @@ static void ApplyWander(NetInput& in, uint32_t frame, int slot) {
     if (((frame >> 4) & 3) == 0) in.analog[2] = 255;      // X
 }
 
-static void SendInputWindow(uint32_t frame) {
+// One window per seat this PC drives. PktInput already names its slot, so a second local
+// player needs no new packet type -- just a second packet.
+static void SendInputWindowFor(uint32_t frame, int mySlot) {
     PktInput p{}; Hdrs(p.h, P_INPUT);
     p.seed = g_isHost ? NetSyncGetSeed() : 0u;
-    p.slot = (uint8_t)g_localSlot;
+    p.slot = (uint8_t)mySlot;
     p.need = frame;                       // tell the peers which frame WE are stuck on
     // Start the window at the OLDEST frame any peer says it still needs, not at our own
     // frame: after a burst of loss the other side can be many frames behind, and a window
@@ -1037,13 +1182,20 @@ static void SendInputWindow(uint32_t frame) {
     uint32_t cnt = 0;
     for (uint32_t f = lo; f <= hi && cnt < 16; ++f) {
         NetInput out;
-        if (!RingGet(g_localSlot, f, &out)) break;
+        if (!RingGet(mySlot, f, &out)) break;
         p.in[cnt++] = out;
     }
     if (!cnt) return;
     p.count = (uint8_t)cnt;
     if (g_legacyMode) { if (g_haveLegacyPeer) Send(&p, sizeof p, g_legacyPeer); }
     else SendToPeers(&p, sizeof p);
+}
+
+static void SendInputWindow(uint32_t frame) {
+    for (int j = 0; j < g_localCount; ++j) {
+        int slot = LocalSlotAt(j);
+        if (slot >= 0) SendInputWindowFor(frame, slot);
+    }
 }
 
 bool NetTickBegin(uint32_t frame) {
@@ -1055,13 +1207,18 @@ bool NetTickBegin(uint32_t frame) {
     // immutable: while stalled we retry this function many times per frame, and re-sampling
     // would rewrite a slot the peer may have already received and acted on, so the two
     // peers would disagree about what was pressed. Sample only when the slot is empty.
+    // ...for EVERY seat this PC drives. Local player j reads pad j; the seat they sit in is
+    // whatever the lobby gave them, so the pad index and the seat index are unrelated.
     uint32_t sched = frame + (uint32_t)g_delay;
-    NetInput probe;
-    if (!RingGet(g_localSlot, sched, &probe)) {
+    for (int j = 0; j < g_localCount; ++j) {
+        int slot = LocalSlotAt(j);
+        if (slot < 0) continue;
+        NetInput probe;
+        if (RingGet(slot, sched, &probe)) continue;
         NetInput local{};
-        GetLocalPadForNet(&local);
-        ApplyWander(local, sched, g_localSlot);
-        RingPut(g_localSlot, sched, local);
+        GetLocalPadForNet(&local, j);
+        ApplyWander(local, sched, slot);
+        RingPut(slot, sched, local);
     }
 
     // ...and send a WINDOW of our recent scheduled frames, not just the newest one.
@@ -1105,6 +1262,8 @@ void NetStatus(char* out, int cap) {
 LanState LanGetState() { return g_state; }
 bool LanIsHost() { return g_isHost; }
 int  LanLocalSlot() { return g_localSlot; }
+int  LanLocalCount() { return g_localCount; }
+int  LanLocalSlotAt(int localIndex) { return LocalSlotAt(localIndex); }
 int  LanSlotCount() { return kSlots; }
 const LanSlotInfo* LanSlot(int i) { return (i >= 0 && i < kSlots) ? &g_slots[i] : nullptr; }
 const char* LanStatusLine() { return g_status; }
@@ -1114,7 +1273,9 @@ const char* LanNakText() {
     case NAK_FULL:     return "THAT GAME IS FULL";
     case NAK_BUILD:    return "THAT PLAYER HAS A DIFFERENT VERSION";
     case NAK_DATA:     return "THAT PLAYER HAS DIFFERENT GAME FILES";
-    case NAK_PROTO:    return "INCOMPATIBLE LAN PROTOCOL";
+    // The player sees this when the two PCs are on different releases. Say what to DO about it
+    // -- "incompatible LAN protocol" is true and completely useless to somebody in a lobby.
+    case NAK_PROTO:    return "DIFFERENT VERSION - UPDATE BOTH PCS";
     case NAK_INMATCH:  return "THAT GAME HAS ALREADY STARTED";
     case NAK_PASSWORD: return "WRONG PASSWORD";
     default:           return "";
@@ -1131,14 +1292,24 @@ void LanSetName(const char* name) {
     SanitizeName(g_myName, sizeof g_myName, name);
     char ini[MAX_PATH]; IniPathLan(ini, sizeof ini);
     WritePrivateProfileStringA("Player", "Name", g_myName, ini);
+    // One name is typed per machine and the other people sitting at it are derived from it, so
+    // renaming has to re-derive every seat this PC owns -- otherwise "SHIHAB 2" keeps the old
+    // player's surname after the first one renames themselves.
     if (g_isHost) {
-        memcpy(g_slots[g_localSlot].name, g_myName, 16);
+        for (int j = 0; j < g_localCount; ++j) {
+            int slot = LocalSlotAt(j);
+            if (slot >= 0) LocalPlayerName(g_slots[slot].name, 16, g_myName, j);
+        }
         PublishSlots(); SendLobbyState();
     } else if (g_state == LAN_LOBBY) {
-        PktIntent p{}; Hdrs(p.h, P_INTENT); p.sessionId = g_sessionId;
-        p.slot = (uint8_t)g_localSlot; p.what = IN_NAME;
-        memcpy(p.name, g_myName, 16);
-        Send(&p, sizeof p, g_peers[0].addr);
+        for (int j = 0; j < g_localCount; ++j) {
+            int slot = LocalSlotAt(j);
+            if (slot < 0) continue;
+            PktIntent p{}; Hdrs(p.h, P_INTENT); p.sessionId = g_sessionId;
+            p.slot = (uint8_t)slot; p.what = IN_NAME;
+            LocalPlayerName(p.name, 16, g_myName, j);
+            Send(&p, sizeof p, g_peers[0].addr);
+        }
     }
 }
 static void LoadName() {
@@ -1204,6 +1375,7 @@ static void SendJoinReq() {
     q.sessionId = g_sessionId; q.buildHash = g_buildHash; q.dataHash = g_dataHash;
     q.pwHash = g_joinPwHash;
     memcpy(q.name, g_myName, 16);
+    q.players = (uint8_t)GetLocalPlayerCount();
     Send(&q, sizeof q, g_peers[0].addr);
 }
 
@@ -1272,25 +1444,33 @@ bool LanJoinIp(const char* host, const char* password) {
     return true;
 }
 
-void LanSetReady(bool ready) {
-    if (g_isHost) { g_slots[g_localSlot].ready = ready ? 1 : 0; PublishSlots(); SendLobbyState(); return; }
+// Every lobby action names the seat it applies to. Two people at one PC each drive their own
+// seat, so "my seat" is no longer a single answer -- the no-argument forms below keep working
+// and mean the primary seat (this PC's player 1).
+void LanSetReadyFor(int slot, bool ready) {
+    if (!IsLocalSlot(slot)) return;
+    g_slots[slot].ready = ready ? 1 : 0;
+    if (g_isHost) { PublishSlots(); SendLobbyState(); return; }
     if (g_state != LAN_LOBBY) return;
-    g_slots[g_localSlot].ready = ready ? 1 : 0;
     PktIntent p{}; Hdrs(p.h, P_INTENT); p.sessionId = g_sessionId;
-    p.slot = (uint8_t)g_localSlot; p.what = IN_READY; p.arg = ready ? 1 : 0;
+    p.slot = (uint8_t)slot; p.what = IN_READY; p.arg = ready ? 1 : 0;
     Send(&p, sizeof p, g_peers[0].addr);
 }
-static void SendSimpleIntent(uint8_t what, uint8_t arg) {
+void LanSetReady(bool ready) { LanSetReadyFor(g_localSlot, ready); }
+
+static void SendSeatIntent(int slot, uint8_t what, uint8_t arg) {
     if (g_state != LAN_LOBBY || g_isHost) return;
     PktIntent p{}; Hdrs(p.h, P_INTENT); p.sessionId = g_sessionId;
-    p.slot = (uint8_t)g_localSlot; p.what = what; p.arg = arg;
+    p.slot = (uint8_t)slot; p.what = what; p.arg = arg;
     Send(&p, sizeof p, g_peers[0].addr);
 }
+static void SendSimpleIntent(uint8_t what, uint8_t arg) { SendSeatIntent(g_localSlot, what, arg); }
 // Character/costume picks are validated against the LOCAL unlock tables before they are
 // offered, and again by the host, so a LAN pick can never be something the engine rejects.
 static const int kCharCount = 11, kCostumeCount = 6;
-void LanCycleChar(int delta) {
-    LanSlotInfo& s = g_slots[g_localSlot];
+void LanCycleCharFor(int slot, int delta) {
+    if (!IsLocalSlot(slot)) return;
+    LanSlotInfo& s = g_slots[slot];
     int c = s.charId;
     for (int i = 0; i < kCharCount; ++i) {
         c = (c + delta + kCharCount) % kCharCount;
@@ -1300,17 +1480,20 @@ void LanCycleChar(int delta) {
     // Characters do not all have the same number of costumes (5 down to 1), so a costume
     // index that was legal for the last character may not be for this one.
     if (s.costume >= LanCostumeCount(s.charId)) s.costume = 0;
-    if (g_isHost) { SendLobbyState(); } else SendSimpleIntent(IN_CHAR, s.charId);
+    if (g_isHost) { SendLobbyState(); } else SendSeatIntent(slot, IN_CHAR, s.charId);
 }
+void LanCycleChar(int delta) { LanCycleCharFor(g_localSlot, delta); }
 // TEAM LETTERS. A player owns their own letter; the host owns every other seat's, which is
 // how a host arranges 2v2 without waiting on anyone. Letters are cosmetic-plus-grouping: the
 // retail commit compacts whatever it is given, and there is no friendly-fire gate anywhere in
 // the damage path -- a shared letter only removes knockback and the impact FX (FUN_000409B0).
-void LanCycleTeam(int delta) {
-    LanSlotInfo& s = g_slots[g_localSlot];
+void LanCycleTeamFor(int slot, int delta) {
+    if (!IsLocalSlot(slot)) return;
+    LanSlotInfo& s = g_slots[slot];
     s.team = (uint8_t)((s.team + delta + 4) & 3);
-    if (g_isHost) { SendLobbyState(); } else SendSimpleIntent(IN_TEAM, s.team);
+    if (g_isHost) { SendLobbyState(); } else SendSeatIntent(slot, IN_TEAM, s.team);
 }
+void LanCycleTeam(int delta) { LanCycleTeamFor(g_localSlot, delta); }
 void LanHostCycleTeam(int slot, int delta) {
     if (!g_isHost || slot < 0 || slot >= kSlots || !g_slotKind[slot]) return;
     g_slots[slot].team = (uint8_t)((g_slots[slot].team + delta + 4) & 3);
@@ -1345,13 +1528,15 @@ int LanCostumeCount(int charId) {
 // what can be drawn); this says what this PC's save has earned, which is what the lobby is
 // allowed to cycle through. Defined in lan_match.cpp, where the blob snapshot lives.
 int LanCostumeUnlocked(int charId);
-void LanCycleCostume(int delta) {
-    LanSlotInfo& s = g_slots[g_localSlot];
+void LanCycleCostumeFor(int slot, int delta) {
+    if (!IsLocalSlot(slot)) return;
+    LanSlotInfo& s = g_slots[slot];
     int n = LanCostumeUnlocked(s.charId);
     if (n < 2) return;
     s.costume = (uint8_t)((s.costume + delta + n) % n);
-    if (g_isHost) { SendLobbyState(); } else SendSimpleIntent(IN_COSTUME, s.costume);
+    if (g_isHost) { SendLobbyState(); } else SendSeatIntent(slot, IN_COSTUME, s.costume);
 }
+void LanCycleCostume(int delta) { LanCycleCostumeFor(g_localSlot, delta); }
 void LanHostCycleCostume(int slot, int delta) {
     if (!g_isHost || slot < 0 || slot >= kSlots || g_slotKind[slot] != 2) return;
     LanSlotInfo& s = g_slots[slot];
@@ -1384,6 +1569,27 @@ void LanHostSetArena(uint8_t arena) {
     if (g_isHost && LanArenaSelectable(arena)) { g_ruleArena = arena; SendLobbyState(); }
 }
 void LanHostSetMode(uint8_t mode)   { if (g_isHost) { g_ruleMode = mode <= 2 ? mode : 0; SendLobbyState(); } }
+// THE HOST CAN REMOVE A PLAYER. Someone has to be able to: a pad dies, somebody wanders off,
+// or a seat is simply in the way of starting. The seat is freed here and the peer is told with
+// the same BYE it would have sent itself, so a 2-player PC losing one seat keeps the other.
+void LanHostKick(int slot) {
+    if (!g_isHost || slot <= 0 || slot >= kSlots) return;
+    if (IsLocalSlot(slot)) return;                  // not for our own seats -- unplug instead
+    if (g_slotKind[slot] != 1) return;              // only a human occupies a seat this way
+    char who[16]; strncpy_s(who, g_slots[slot].name, _TRUNCATE);
+    if (g_peers[slot].active) {
+        PktBye b{}; Hdrs(b.h, P_BYE); b.sessionId = g_sessionId;
+        b.slot = (uint8_t)slot; b.reason = 1;
+        Send(&b, sizeof b, g_peers[slot].addr);
+    }
+    g_peers[slot].active = false;
+    g_slotKind[slot] = 0;
+    g_slots[slot].ready = 0; g_slots[slot].name[0] = 0;
+    printf("[lan] host removed slot %d (%s)\n", slot, who);
+    Status("%s WAS REMOVED", who[0] ? who : "A PLAYER");
+    PublishSlots(); SendLobbyState();
+}
+
 void LanHostToggleCpu(int slot) {
     if (!g_isHost || slot <= 0 || slot >= kSlots) return;
     if (g_peers[slot].active) return;               // a real player owns it
@@ -1405,7 +1611,7 @@ const char* LanStartRefusal() {
         letter[g_slots[i].team & 3] = true;
         if (g_slotKind[i] != 1) continue;
         ++humans;
-        if (i != g_localSlot && !g_slots[i].ready) return "WAITING FOR EVERYONE TO BE READY";
+        if (!IsLocalSlot(i) && !g_slots[i].ready) return "WAITING FOR EVERYONE TO BE READY";
     }
     if (humans < 1) return "NEED AT LEAST ONE HUMAN PLAYER";
     if (filled < 2) return "NEED AT LEAST TWO PLAYERS";
@@ -1421,7 +1627,7 @@ void LanHostStart() {
     g_cfgCrc = LanConfigCrc(&g_cfg);
     g_haveCfg = true;
     memset(g_readySeen, 0, sizeof g_readySeen);
-    g_readySeen[g_localSlot] = true;
+    for (int i = 0; i < kSlots; ++i) if (IsLocalSlot(i)) g_readySeen[i] = true;
     g_state = LAN_STARTING;
     g_tRetry = 0;
     Status("STARTING MATCH...");
@@ -1462,10 +1668,84 @@ void LanMatchEnded() {
 extern bool LanFrontendCanLaunch();               // lan_ui.cpp
 
 // ---------------------------------------------------------------- pump
+// A CONTROLLER PLUGGED IN DURING THE LOBBY SHOULD JOIN THE GAME. Seats used to be counted once
+// at host/join time, so someone who picked up a pad after the lobby opened -- the normal way it
+// happens, since a pad only claims a player number on its first press -- simply never appeared.
+// Checked in the lobby only: seats cannot change once the match is arming, or the two peers
+// would disagree about who is playing.
+static void PollLocalPlayers() {
+    if (g_state != LAN_LOBBY) return;
+    int want = GetLocalPlayerCount();
+
+    // A CONTROLLER UNPLUGGED IN THE LOBBY GIVES ITS SEAT BACK -- but not instantly. Wireless
+    // pads drop for a second or two all the time, and evicting somebody because their batteries
+    // hiccuped is worse than a seat that lingers. The seat is only released after the pad has
+    // been gone continuously for the grace period; plugging back in inside that window is a
+    // no-op. The HIGHEST local seat goes first, so the person who joined last is the one who
+    // loses their place rather than an arbitrary one.
+    static uint32_t goneSince = 0;
+    if (want < g_localCount) {
+        if (!goneSince) goneSince = Now();
+        if (Now() - goneSince < 4000) return;
+        goneSince = 0;
+        while (g_localCount > want && g_localCount > 1) {
+            int slot = LocalSlotAt(g_localCount - 1);
+            if (slot < 0) break;
+            printf("[lan] a controller was unplugged: releasing seat %d\n", slot);
+            if (g_isHost) {
+                g_peers[slot].active = false;
+                g_slotKind[slot] = 0;
+                g_slots[slot].ready = 0; g_slots[slot].name[0] = 0;
+            } else {
+                PktIntent p{}; Hdrs(p.h, P_INTENT); p.sessionId = g_sessionId;
+                p.slot = (uint8_t)slot; p.what = IN_LEAVE;
+                memcpy(p.name, g_slots[slot].name, 16);
+                Send(&p, sizeof p, g_peers[0].addr);
+            }
+            g_localMask &= (uint8_t)~(1u << slot);
+            --g_localCount;
+        }
+        g_localSlot = LocalSlotAt(0) < 0 ? g_localSlot : LocalSlotAt(0);
+        Status("A CONTROLLER WAS UNPLUGGED");
+        if (g_isHost) { PublishSlots(); SendLobbyState(); }
+        return;
+    }
+    goneSince = 0;
+
+    if (want <= g_localCount) return;
+    if (g_isHost) {
+        int added = 0;
+        for (int i = 0; i < kSlots && g_localCount < want; ++i) {
+            if (g_peers[i].active || g_slotKind[i]) continue;
+            g_peers[i].active = true; g_peers[i].slot = (uint8_t)i; g_peers[i].lastRecv = Now();
+            g_localMask |= (uint8_t)(1u << i);
+            ++g_localCount; ++added;
+            g_slotKind[i] = 1;
+            g_slots[i].ready = 0;
+        }
+        if (added) {
+            for (int j = 0; j < g_localCount; ++j) {
+                int slot = LocalSlotAt(j);
+                if (slot >= 0) LocalPlayerName(g_slots[slot].name, 16, g_myName, j);
+            }
+            printf("[lan] a controller joined: this PC now drives %d seat(s)\n", g_localCount);
+            PublishSlots(); SendLobbyState();
+        }
+    } else {
+        // Ask the host for another seat. JOIN_REQ is idempotent and now tops up, and the reply
+        // is handled in the lobby by OnJoinRsp. Rate-limited: it rides the existing retry.
+        static uint32_t lastAsk = 0;
+        if (Now() - lastAsk < 500) return;
+        lastAsk = Now();
+        SendJoinReq();
+    }
+}
+
 void LanPump() {
     if (g_state == LAN_OFF) return;
     FlushHeld();
     PumpRecv();
+    PollLocalPlayers();
     uint32_t now = Now();
 
     // age the browser table
@@ -1512,8 +1792,12 @@ void LanPump() {
     if (g_isHost && g_state == LAN_LOBBY && now - g_tRetry >= 1000) {
         g_tRetry = now;
         SendLobbyState();
+        // ⚠ A LOCAL SEAT CAN NEVER TIME OUT. The host's own extra players are peer entries like
+        // any other, but no datagram ever arrives from this machine to refresh them, so the TTL
+        // expired and the host evicted its own player 2 a few seconds into every lobby. Only
+        // seats reached over the network are subject to the timeout.
         for (int i = 1; i < kSlots; ++i)
-            if (g_peers[i].active && now - g_peers[i].lastRecv > kPeerTtlMs) {
+            if (g_peers[i].active && !IsLocalSlot(i) && now - g_peers[i].lastRecv > kPeerTtlMs) {
                 printf("[lan] slot %d timed out\n", i);
                 g_peers[i].active = false; g_slotKind[i] = 0;
                 g_slots[i].ready = 0; g_slots[i].name[0] = 0;
@@ -1531,7 +1815,7 @@ void LanPump() {
             SendToPeers(&s, sizeof s);
             bool all = true;
             for (int i = 0; i < kSlots; ++i)
-                if (g_slotKind[i] == 1 && i != g_localSlot && !g_readySeen[i]) all = false;
+                if (g_slotKind[i] == 1 && !IsLocalSlot(i) && !g_readySeen[i]) all = false;
             if (all && LanFrontendCanLaunch()) {
                 PktGo g{}; Hdrs(g.h, P_GO); g.sessionId = g_sessionId; g.matchId = g_cfg.matchId;
                 for (int k = 0; k < 4; ++k) SendToPeers(&g, sizeof g);
@@ -1556,7 +1840,7 @@ void LanPump() {
         g_tGo = now;
         bool missing = false;
         for (int i = 0; i < kSlots; ++i)
-            if (i != g_localSlot && g_slotKind[i] == 1 && g_peers[i].active && !g_peerInputSeen[i])
+            if (!IsLocalSlot(i) && g_slotKind[i] == 1 && g_peers[i].active && !g_peerInputSeen[i])
                 missing = true;
         if (missing) {
             PktGo g{}; Hdrs(g.h, P_GO); g.sessionId = g_sessionId; g.matchId = g_cfg.matchId;

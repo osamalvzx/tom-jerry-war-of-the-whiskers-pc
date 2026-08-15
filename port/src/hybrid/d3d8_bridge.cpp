@@ -2162,8 +2162,15 @@ static void __stdcall Br_XInitDevices(uint32_t count, void* types) { (void)count
 // boot (it is decided in the lobby), so ports appear and disappear as the session changes,
 // exactly the way the game's own hot-plug path expects. Single-player, with no session and
 // one pad, reports the same mask 1 it always did.
+static int LocalPadCount();
+
 static uint32_t DesiredPadMask() {
     uint32_t mask = 1;                     // port 0 always
+    // LOCAL PLAY: one port per controller. The game only lets a second, third or fourth
+    // player join a match if it has been told those pads exist, so this is what makes local
+    // 2-4 player work at all -- previously it always reported exactly one pad.
+    int local = LocalPadCount();
+    if (local > 1 && local <= 4) mask = (1u << local) - 1u;
     tj::hybrid::LanState st = tj::hybrid::LanGetState();
     if (tj::hybrid::NetArmed() || st == tj::hybrid::LAN_LOBBY ||
         st == tj::hybrid::LAN_STARTING || st == tj::hybrid::LAN_MATCH) {
@@ -2211,18 +2218,41 @@ static uint32_t __stdcall Br_XInputClose(uint32_t h) { (void)h; return 0; }
 // (the user's pad can enumerate at any XInput index) and publishes a snapshot the game
 // thread reads under a light lock.
 static CRITICAL_SECTION g_padLock;
-static tj::input::XboxGamepad g_padSnap;
-static bool g_padConnected = false;
-// Merge ALL connected PC pads into Xbox port 0: systems often expose extra virtual
-// XInput devices (vendor software), and latching onto an idle one leaves the user's
-// physical pad dead. OR the buttons, take the larger-magnitude axis -- whichever
-// controller the user touches just works.
+static tj::input::XboxGamepad g_padSnap[4];      // indexed by XBOX PORT (= player number)
+static bool g_padLive[4];
+static int  g_padCount = 0;
+
+// ONE CONTROLLER PER PLAYER. This used to merge every connected PC pad into Xbox port 0 --
+// buttons OR'd together, largest-magnitude axis wins -- so that whichever pad the user
+// touched would drive the game. That is right for one player and completely wrong for the
+// four the game supports: every extra controller just moved player 1, and players 2-4 read a
+// dead pad.
+//
+// A port is claimed on the pad's FIRST ACTUAL INPUT, not when it enumerates. This machine
+// reports four XInput devices with one controller attached: vendor software and wireless
+// dongles routinely expose idle virtual pads, so index order says nothing about who is
+// playing. Claiming on connection would have made a real controller "player 3" and looked
+// exactly as broken as the bug this replaces. Claiming on first press means the pad someone
+// actually touches becomes player 1, the next one to be touched player 2, and idle phantom
+// devices never take a seat. Assignments are sticky for the session; unplugging frees the
+// port without renumbering anybody still playing.
+static bool PadIsActive(const tj::input::XboxGamepad& gp) {
+    if (gp.wButtons) return true;
+    for (int b = 0; b < 8; ++b) if (gp.bAnalogButtons[b] > 40) return true;
+    const int kStick = 12000;      // far beyond any resting drift
+    return (gp.sThumbLX > kStick || gp.sThumbLX < -kStick) ||
+           (gp.sThumbLY > kStick || gp.sThumbLY < -kStick) ||
+           (gp.sThumbRX > kStick || gp.sThumbRX < -kStick) ||
+           (gp.sThumbRY > kStick || gp.sThumbRY < -kStick);
+}
+
 static DWORD WINAPI InputThreadMain(LPVOID) {
-    bool conn[4] = {};
+    bool conn[4] = {};                 // XInput index -> connected?
+    int  portOf[4] = { -1, -1, -1, -1 };   // XInput index -> Xbox port (-1 = not claimed yet)
     DWORD nextScan = 0;
     for (;;) {
-        tj::input::XboxGamepad merged{};
-        bool any = false;
+        tj::input::XboxGamepad snap[4]{};
+        bool live[4] = {};
         DWORD now = GetTickCount();
         bool rescan = now >= nextScan;
         if (rescan) nextScan = now + 1000;      // disconnected-index polls are slow: ~1/s
@@ -2233,23 +2263,56 @@ static DWORD WINAPI InputThreadMain(LPVOID) {
             if (got != conn[i]) {
                 conn[i] = got;
                 printf("[input] PC pad %d %s\n", i, got ? "connected" : "disconnected");
+                if (!got && portOf[i] >= 0) {
+                    printf("[input] player %d's controller was unplugged\n", portOf[i] + 1);
+                    portOf[i] = -1;
+                }
             }
             if (!got) continue;
-            any = true;
-            merged.wButtons |= gp.wButtons;
-            for (int b = 0; b < 8; ++b)
-                if (gp.bAnalogButtons[b] > merged.bAnalogButtons[b]) merged.bAnalogButtons[b] = gp.bAnalogButtons[b];
-            auto maxAxis = [](int16_t a, int16_t b) { return (a < 0 ? -a : a) >= (b < 0 ? -b : b) ? a : b; };
-            merged.sThumbLX = maxAxis(merged.sThumbLX, gp.sThumbLX);
-            merged.sThumbLY = maxAxis(merged.sThumbLY, gp.sThumbLY);
-            merged.sThumbRX = maxAxis(merged.sThumbRX, gp.sThumbRX);
-            merged.sThumbRY = maxAxis(merged.sThumbRY, gp.sThumbRY);
+            if (portOf[i] < 0) {
+                if (!PadIsActive(gp)) continue;          // idle/phantom pad: claims nothing
+                bool used[4] = {};
+                for (int k = 0; k < 4; ++k) if (portOf[k] >= 0) used[portOf[k]] = true;
+                int p = 0; while (p < 4 && used[p]) ++p;
+                if (p >= 4) continue;
+                portOf[i] = p;
+                printf("[input] PC pad %d -> player %d (first input)\n", i, p + 1);
+            }
+            snap[portOf[i]] = gp;
+            live[portOf[i]] = true;
         }
+        int count = 0;
+        for (int p = 0; p < 4; ++p) if (live[p]) count = p + 1;   // highest occupied port
         EnterCriticalSection(&g_padLock);
-        g_padSnap = merged; g_padConnected = any;
+        for (int p = 0; p < 4; ++p) { g_padSnap[p] = snap[p]; g_padLive[p] = live[p]; }
+        g_padCount = count;
         LeaveCriticalSection(&g_padLock);
         Sleep(4);
     }
+}
+
+// How many Xbox ports currently have a controller on them. Drives the hot-plug mask the game
+// is told about, which is what lets it accept a second, third and fourth local player.
+static int LocalPadCount() {
+    EnterCriticalSection(&g_padLock);
+    int n = g_padCount;
+    LeaveCriticalSection(&g_padLock);
+    return n;
+}
+
+// How many people are sitting at THIS PC, as netplay should count them: at least one (the
+// keyboard always drives player 1 even with no pad attached).
+extern "C" int GetLocalPlayerCount() {
+    // TJ_LOCAL_PLAYERS=<n> pretends n people are sitting here. The automated LAN harness has no
+    // controllers at all, so without this there is no way to exercise two players sharing a PC
+    // -- which is exactly where the seat bookkeeping (timeouts, per-seat input, naming) breaks.
+    static int forced = -1;
+    if (forced < 0) { char* e = nullptr; size_t sz = 0; _dupenv_s(&e, &sz, "TJ_LOCAL_PLAYERS");
+                      forced = (e && *e) ? atoi(e) : 0; free(e);
+                      if (forced > 0) printf("[input] TJ_LOCAL_PLAYERS=%d\n", forced); }
+    if (forced > 0) return forced > 4 ? 4 : forced;
+    int n = LocalPadCount();
+    return n < 1 ? 1 : (n > 4 ? 4 : n);
 }
 static void StartInputThread() {
     static bool started = false;
@@ -2260,21 +2323,27 @@ static void StartInputThread() {
     if (t) CloseHandle(t);
     printf("[input] pad poll thread started\n");
 }
-// The local player's controls for THIS instance, as netplay should see them: physical pad
-// (unless TJ_NOINPUT) + keyboard + the scripted sequence. net_lan.cpp schedules this D
-// frames ahead and sends it; while armed it is never applied to a port directly.
-extern "C" void GetLocalPadForNet(tj::hybrid::NetInput* out) {
+// The controls of ONE local player on THIS instance, as netplay should see them: their own
+// physical pad (unless TJ_NOINPUT), plus -- for local player 1 only -- the keyboard and the
+// scripted sequence. net_lan.cpp schedules this D frames ahead and sends it; while armed it
+// is never applied to a port directly.
+//
+// `which` is the LOCAL player index (0 = the first controller on this PC), not the Xbox port
+// and not the seat: a second player sharing this PC is local player 1 here but may hold any
+// seat in the lobby.
+extern "C" void GetLocalPadForNet(tj::hybrid::NetInput* out, int which) {
     tj::input::XboxGamepad gp{};
+    if (which < 0 || which > 3) which = 0;
     static int noInput = -1;
     if (noInput < 0) { char* e = nullptr; size_t n = 0; _dupenv_s(&e, &n, "TJ_NOINPUT");
                        noInput = e && atoi(e) ? 1 : 0; free(e); }
     if (!noInput) {
         EnterCriticalSection(&g_padLock);
-        gp = g_padSnap;
+        gp = g_padSnap[which];
         LeaveCriticalSection(&g_padLock);
-        MergeKeyboard(gp);
+        if (which == 0) MergeKeyboard(gp);
     }
-    MergeScript(gp);
+    if (which == 0) MergeScript(gp);
     out->buttons = gp.wButtons;
     memcpy(out->analog, gp.bAnalogButtons, 8);
     out->thumb[0] = gp.sThumbLX; out->thumb[1] = gp.sThumbLY;
@@ -2297,7 +2366,7 @@ static uint32_t __stdcall Br_XInputGetState(uint32_t h, void* state) {
             gp.sThumbLX = ni->thumb[0]; gp.sThumbLY = ni->thumb[1];
             gp.sThumbRX = ni->thumb[2]; gp.sThumbRY = ni->thumb[3];
         }
-    } else if (port == 0) {
+    } else if (port >= 0 && port < 4) {
         // TJ_NOINPUT=1: ignore PHYSICAL input (pad + keyboard) and accept only the scripted
         // sequence. Determinism A/B runs are controlled experiments: a connected pad's
         // analog drift or a stray keypress feeds player 1 differently in run A than run B,
@@ -2308,11 +2377,16 @@ static uint32_t __stdcall Br_XInputGetState(uint32_t h, void* state) {
                            if (noInput) printf("[input] TJ_NOINPUT: physical pad+keyboard ignored\n"); }
         if (!noInput) {
             EnterCriticalSection(&g_padLock);
-            gp = g_padSnap;
+            gp = g_padSnap[port];
             LeaveCriticalSection(&g_padLock);
-            MergeKeyboard(gp);
         }
-        MergeScript(gp);
+        // The keyboard and the TJ_INPUT script are player 1's, and only player 1's: they are
+        // a single set of controls, so feeding them to every port would make one keypress
+        // move all four fighters at once.
+        if (port == 0) {
+            if (!noInput) MergeKeyboard(gp);
+            MergeScript(gp);
+        }
     }
     static uint32_t packet[4];
     *(uint32_t*)state = ++packet[port];
