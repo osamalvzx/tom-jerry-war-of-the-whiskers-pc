@@ -17,6 +17,7 @@ bool RunGameLoop();      // startup.cpp
 int  GfxSelfTest();      // d3d8_bridge.cpp
 bool EnsureDisplay(int width, int height, int sampleCount); // d3d8_bridge.cpp
 bool ReserveGpuAperture(); // d3d8_bridge.cpp
+void ReserveTrampPad();     // xdk_patch.cpp (guest-window trampoline pad)
 void SetupContiguousPool(); // kernel.cpp
 void SetAssetRoot(const char* dir); // file_io.cpp
 void MigrateSaves();                // file_io.cpp -- must run AFTER SetAssetRoot
@@ -127,6 +128,7 @@ extern "C" __declspec(dllexport) int RunGame(const char* xbePathIn, const char* 
     if (mode && (strcmp(mode, "m3") == 0 || strcmp(mode, "m4") == 0)) {
         tj::hybrid::ReserveGpuAperture();   // before D3D11/DXGI grab address space
         tj::hybrid::SetupContiguousPool();  // grab the low physical + 0x80000000 alias early
+        tj::hybrid::ReserveTrampPad();      // guest-window trampoline pad (same reason)
         char ini[MAX_PATH];
         _snprintf_s(ini, sizeof ini, _TRUNCATE, "%s\\tomjerry.ini", tj::hybrid::UserDataDir());
         int rw = (int)GetPrivateProfileIntA("Display", "Width",  640, ini);

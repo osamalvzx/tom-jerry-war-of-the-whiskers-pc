@@ -6,6 +6,7 @@
 //   * replace __getptd (FUN_0008f928) + the __xi CRT init (FUN_0008fac5) with native
 //     shims that keep _tiddata in a Win32 TLS slot, so all CRT per-thread code works.
 #include "hybrid/xdk_patch.h"
+#include "hybrid/guest_call.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstdint>
@@ -34,8 +35,10 @@ bool CreateGameHeap() {
     memcpy(&commit,  (void*)(uintptr_t)0x10138, 4); // PeHeapCommit
     uint8_t params[0x30]; memset(params, 0, sizeof(params));
     *(uint32_t*)params = 0x30;                       // params.Length
-    CreateHeapFn create = (CreateHeapFn)(uintptr_t)VA_RtlCreateHeap;
-    uint32_t heap = create(2, 0, reserve, commit, 0, params);
+    // Engine::Call seam (guest_call.h): pre-engine this is the raw native call, exactly
+    // as before; if the CRT ever re-enters here under interpretation it stays guest.
+    uint32_t heap = GCALL(Stdcall, CreateHeapFn, VA_RtlCreateHeap,
+                          2, 0, reserve, commit, 0, params);
     *HeapHandleGlobal = heap;
     printf("[crt] heap create: reserve=%x commit=%x -> handle=%08x\n", reserve, commit, heap);
     return heap != 0;
@@ -46,14 +49,12 @@ bool CreateGameHeap() {
 static void* __cdecl Sh_getptd() {
     void* ptd = TlsGetValue(g_tlsTid);
     if (!ptd) {
-        CallocFn calloc_ = (CallocFn)(uintptr_t)VA_calloc;
-        ptd = calloc_(1, 0x88);
+        ptd = GCALL(Cdecl, CallocFn, VA_calloc, 1, 0x88);
         if (ptd) {
             uint8_t* p = (uint8_t*)ptd;
             *(uint32_t*)(p + 0x54) = 0x182ec8;      // ptmbcinfo / locale table (as original)
             *(uint32_t*)(p + 0x14) = 1;
-            ThreadIdFn tid = (ThreadIdFn)(uintptr_t)VA_GetCurThreadId;
-            *(uint32_t*)(p + 0x00) = tid();
+            *(uint32_t*)(p + 0x00) = GCALL0(Cdecl, ThreadIdFn, VA_GetCurThreadId);
             *(uint32_t*)(p + 0x04) = 0xffffffff;
             TlsSetValue(g_tlsTid, ptd);
         }
@@ -66,9 +67,9 @@ static void* __cdecl Sh_getptd() {
 // runs __mtinitlocks (fs-clean) to build the CRT lock table at 0x182a08 that _lock
 // depends on -- skipping it made _lock abort via _amsg_exit.
 static const uint32_t VA_mtinitlocks = 0x0008fbad; // __cdecl(void) -> BOOL
+typedef uint32_t (__cdecl* MtInitFn)(void);
 static void __cdecl Sh_xi_init() {
-    typedef uint32_t (__cdecl* MtInitFn)(void);
-    ((MtInitFn)(uintptr_t)VA_mtinitlocks)();
+    GCALL0(Cdecl, MtInitFn, VA_mtinitlocks);
     Sh_getptd();
 }
 
@@ -79,10 +80,10 @@ static void     __stdcall Sh_SetLastError(uint32_t e) { ::SetLastError(e); }
 
 void InstallCrtGlue() {
     if (g_tlsTid == TLS_OUT_OF_INDEXES) g_tlsTid = TlsAlloc();
-    PatchJump(VA_getptd,  (const void*)&Sh_getptd,  "__getptd");
-    PatchJump(VA_xi_init, (const void*)&Sh_xi_init, "__xi_init");
-    PatchJump(0x00074543, (const void*)&Sh_GetLastError, "GetLastError");
-    PatchJump(0x0007456b, (const void*)&Sh_SetLastError, "SetLastError");
+    PatchJump(VA_getptd,  HOOK_CDECL(Sh_getptd),  "__getptd");
+    PatchJump(VA_xi_init, HOOK_CDECL(Sh_xi_init), "__xi_init");
+    PatchJump(0x00074543, HOOK_STD(Sh_GetLastError), "GetLastError");
+    PatchJump(0x0007456b, HOOK_STD(Sh_SetLastError), "SetLastError");
     printf("[crt] CRT glue installed (tls slot %lu)\n", g_tlsTid);
 }
 

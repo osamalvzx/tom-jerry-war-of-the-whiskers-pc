@@ -38,6 +38,7 @@
 #include "xdk_patch.h"
 #include "net_lan.h"
 #include "hybrid/meat_rush.h"
+#include "hybrid/guest_call.h"
 
 namespace tj::hybrid {
 
@@ -53,8 +54,13 @@ static const uint32_t kMatchTick  = 0x15C4710;  // per-frame match tick (FUN_000
 static const uint32_t kMti        = 0xF57D0;    // MT index
 
 typedef void(__cdecl* FnVoid)();
-static const FnVoid Orig_Update = (FnVoid)(uintptr_t)0x179C0;
-static const FnVoid Orig_Render = (FnVoid)(uintptr_t)0x17500;
+typedef void(__cdecl* FnSeedMt)(uint32_t seed);
+// THE two host->guest calls that carry ~97% of every frame (guest_call.h). Resolved
+// through the seam at EVERY call, never at static-init time: engine mode arms only
+// after all Install*() have run, so a load-time initializer would freeze the raw
+// native address and silently un-interpret the whole game under TJ_ENGINE=1.
+#define Orig_Update() GCALL0(Cdecl, FnVoid, 0x179C0)
+#define Orig_Render() GCALL0(Cdecl, FnVoid, 0x17500)
 
 // --- RNG draw counters ------------------------------------------------------
 // Bumped by the naked hooks below; the phase brackets snapshot them around each phase, so
@@ -63,29 +69,27 @@ static volatile uint32_t g_mtCalls = 0;
 static volatile uint32_t g_lcgCalls = 0;
 static uint32_t g_netFrame = 0;      // SIMULATION STEPS since boot = the lockstep frame index
 static bool     g_stepped = false;   // did the update actually run this presented frame?
-static void* g_mtTramp = nullptr;
-static void* g_lcgTramp = nullptr;
+static uint32_t g_mtTramp = 0;   // guest-window trampoline VA (xdk_patch MakeGuestTramp,
+                                 // which carries the same leading-E8/E9 relocation rule)
 
-// Copy `len` bytes of the function at `va` into freshly allocated executable memory and
-// append `jmp va+len`, so a hook can run the original body after doing its own work.
-// Relocates a leading E8/E9 rel32 (the CRT `rand` starts with `call __getptd`), which is
-// the only relocation the two sites we patch require -- asserted, not assumed.
-static void* MakeTrampoline(uint32_t va, uint32_t len, const char* label) {
-    uint8_t* src = (uint8_t*)(uintptr_t)va;
-    uint8_t* tr = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!tr) { printf("[net] %s: trampoline alloc failed\n", label); return nullptr; }
-    memcpy(tr, src, len);
-    if (src[0] == 0xE8 || src[0] == 0xE9) {          // relocate a leading rel32
-        int32_t rel; memcpy(&rel, src + 1, 4);
-        uint32_t target = va + 5 + (uint32_t)rel;
-        int32_t newRel = (int32_t)(target - ((uint32_t)(uintptr_t)tr + 5));
-        memcpy(tr + 1, &newRel, 4);
+// --- MT caller trace (TJ_MTTRACE=<lo>-<hi>, frames) --------------------------
+// Divergence forensics: when two runs disagree on the number of update-phase MT draws,
+// the missing draw's CALL SITE is the whole diagnosis. Records the caller return address
+// of every MT draw in a ring; the update bracket prints the frame's callers when the
+// frame is in range. In engine mode the top-of-stack at the hook is the escape's capture
+// thunk, not the caller — the true guest return address is recovered from the escape
+// LIFO and marked with bit 31 so the log shows which draws ran interpreted.
+static uint32_t g_mtRing[1024];
+static volatile uint32_t g_mtTraceOn = 0;
+static uint32_t g_mtTraceLo = 0, g_mtTraceHi = 0;
+
+static void __cdecl MtTraceRecord(uint32_t rawRet) {
+    uint32_t v = rawRet;
+    if (v >= 0x02000000u) {              // not guest code: the escape displaced the true ret
+        uint32_t t = EngineModeDisplacedRet();
+        if (t) v = t | 0x80000000u;
     }
-    tr[len] = 0xE9;                                   // jmp back to va+len
-    int32_t back = (int32_t)((va + len) - ((uint32_t)(uintptr_t)tr + len + 5));
-    memcpy(tr + len + 1, &back, 4);
-    FlushInstructionCache(GetCurrentProcess(), tr, 64);
-    return tr;
+    g_mtRing[g_mtCalls & 1023] = v;
 }
 
 // Naked so the original stack/registers are untouched: only the counter and (briefly) the
@@ -94,10 +98,26 @@ static void* MakeTrampoline(uint32_t va, uint32_t len, const char* label) {
 __declspec(naked) static void Hk_MtNext() {
     __asm {
         pushfd
+        cmp  g_mtTraceOn, 0
+        je   notrace
+        pushad
+        mov  eax, [esp + 36]             ; the caller's return-address slot at hook entry
+        push eax
+        call MtTraceRecord
+        add  esp, 4
+        popad
+    notrace:
         inc dword ptr [g_mtCalls]
         popfd
         jmp dword ptr [g_mtTramp]
     }
+}
+// Portable semantic for the naked hook above (engine mode, registered jmp-hook): count
+// the draw, record the TRUE caller from the interpreted stack (no escape thunk to see
+// through here), resume interpreting at the guest-window trampoline.
+static void __cdecl MtNextEngine(tj::engine::CpuState& s) {
+    if (g_mtTraceOn) MtTraceRecord(*(const uint32_t*)(uintptr_t)s.r[tj::engine::ESP]);
+    ++g_mtCalls;
 }
 // --- STAGE 1b: RNG OWNERSHIP ------------------------------------------------
 // The CRT LCG is the one confirmed determinism blocker: the game reaches
@@ -140,15 +160,23 @@ static void __cdecl Hk_CrtSrand(unsigned s) { g_lcgSeed = s; }
 // out yet. So the hook is naked: preserve everything, reseed, then TAIL-JUMP to the original
 // with ecx and the caller's return address exactly as they were.
 static void __cdecl SeedBothRngs(const char* why) {
-    ((void(__cdecl*)(uint32_t))(uintptr_t)0x11EE0)(g_matchSeed);   // MT19937 seeder (cdecl)
+    GCALL(Cdecl, FnSeedMt, 0x11EE0, g_matchSeed);                  // MT19937 seeder
     g_lcgSeed = g_matchSeed;
     // MEAT RUSH's per-fighter score lives in the hashed fighter block, so it has to be cleared
     // at the same instant on both peers -- and this barrier is the only point that is.
     MeatRushResetScores(why);
     printf("[net] %s @frame %u: reseeded MT+LCG with %u\n", why, g_netFrame, g_matchSeed);
 }
-static void __cdecl SeedAtBarrier() { SeedBothRngs("match barrier"); }
 static volatile uint32_t g_mode6Orig = 0x14EC0;
+static void __cdecl SeedAtBarrier() {
+    SeedBothRngs("match barrier");
+    // The naked hook's tail-jump target, refreshed through the host->guest seam on EVERY
+    // call (engine mode arms after install, so this cannot be resolved once up front).
+    // Native mode: GuestFnPtr returns the raw 0x14EC0 -- byte-for-byte the old behaviour.
+    // Entering the gate stub by jmp is equivalent to the call the guest would have made:
+    // [esp] already holds the caller's return address and ecx the fade object.
+    g_mode6Orig = (uint32_t)(uintptr_t)GuestFnPtr(0x14EC0);
+}
 __declspec(naked) static void Hk_Mode6Begin() {
     __asm {
         pushad
@@ -158,6 +186,13 @@ __declspec(naked) static void Hk_Mode6Begin() {
         popad
         jmp dword ptr [g_mode6Orig]   // thiscall: ecx must still hold the fade object
     }
+}
+// Portable semantic (engine mode): reseed, then resume interpreting at the ORIGINAL
+// callee 0x14EC0 — its entry bytes are intact (the patch was on the CALL SITE), the
+// return address is already at [esp], and ecx still holds the fade object in s. The
+// reseed's guest call (the MT seeder) marshals through the jmp-hook's dispatch frame.
+static void __cdecl Mode6Engine(tj::engine::CpuState&) {
+    SeedAtBarrier();
 }
 
 // --- determinism log --------------------------------------------------------
@@ -435,6 +470,12 @@ static void __cdecl Hk_GameUpdate() {
     Orig_Update();
     g_mtUpd = g_mtCalls - mt0;
     g_lcgUpd = g_lcgCalls - lcg0;
+    if (g_mtTraceOn && g_netFrame >= g_mtTraceLo && g_netFrame <= g_mtTraceHi) {
+        printf("[mtt] f%u mtU=%u:", g_netFrame, g_mtUpd);
+        for (uint32_t k = mt0; k != g_mtCalls; ++k) printf(" %08X", g_mtRing[k & 1023]);
+        printf("\n");
+        fflush(stdout);
+    }
     g_stepped = true;        // only a real sim step advances the lockstep frame index
 }
 
@@ -563,6 +604,12 @@ int InstallNetSync() {
     e = nullptr; _dupenv_s(&e, &n, "TJ_DETLOG2"); g_detTier2 = e && atoi(e) ? 1 : 0; free(e);
     e = nullptr; _dupenv_s(&e, &n, "TJ_DETFROM"); g_detFrom = e ? atoi(e) : 0; free(e);
     e = nullptr; _dupenv_s(&e, &n, "TJ_DETDUMP"); g_detDumpAt = e ? atoi(e) : -1; free(e);
+    e = nullptr; _dupenv_s(&e, &n, "TJ_MTTRACE");
+    if (e && *e && sscanf_s(e, "%u-%u", &g_mtTraceLo, &g_mtTraceHi) == 2) {
+        g_mtTraceOn = 1;
+        printf("[net] MT caller trace armed: frames %u..%u\n", g_mtTraceLo, g_mtTraceHi);
+    }
+    free(e);
     e = nullptr; _dupenv_s(&e, &n, "TJ_NETCAP");
     g_netCapAt = e && *e ? atoi(e) : -1;
     g_netCapEvery = e && strchr(e, '+') != nullptr;
@@ -577,18 +624,29 @@ int InstallNetSync() {
 
     // Phase brackets: rewrite only the rel32 of each call, leaving the opcode alone.
     int ok = 0;
-    ok += PatchCallSite(kCallUpdate, (void*)&Hk_GameUpdate, "net:update") ? 1 : 0;
-    ok += PatchCallSite(kCallRender, (void*)&Hk_GameRender, "net:render") ? 1 : 0;
+    ok += PatchCallSite(kCallUpdate, HOOK_CDECL(Hk_GameUpdate), "net:update") ? 1 : 0;
+    ok += PatchCallSite(kCallRender, HOOK_CDECL(Hk_GameRender), "net:render") ? 1 : 0;
 
     // RNG counters. Both sites start with a single 5-byte instruction (MT:
     // `mov eax,[0xF57D0]`, rand: `call __getptd`), so a 5-byte trampoline is exact.
-    g_mtTramp = MakeTrampoline(kMtNext, 5, "net:mt");
-    if (g_mtTramp && PatchJump(kMtNext, (void*)&Hk_MtNext, "net:mt")) ++ok;
+    g_mtTramp = MakeGuestTramp(kMtNext, 5, "net:tr.mt");
+    // HOOK_RAW ×2 below: naked hooks stay the NATIVE-mode path. Engine mode uses the
+    // registered jmp-hook semantics (MtNextEngine / Mode6Engine — portable, the ARM
+    // shape); TJ_ENG_RAWHOOKS=1 reverts those to escape+naked for same-binary A/B.
+    if (g_mtTramp && PatchJump(kMtNext, HOOK_RAW(Hk_MtNext), "net:mt")) {
+        EngineModeRegisterJmpHook((const void*)&Hk_MtNext, g_mtTramp,
+                                  &MtNextEngine, /*escapeSafe=*/true);
+        ++ok;
+    }
     // rand/srand are REPLACED (not trampolined): we own the state so `srand(time())` in
     // the game's own startup can no longer make two peers diverge.
-    if (PatchJump(kCrtRand, (void*)&Hk_CrtRand, "net:rand")) ++ok;
-    if (PatchJump(kCrtSrand, (void*)&Hk_CrtSrand, "net:srand")) ++ok;
-    if (PatchCallSite(kMode6Begin, (void*)&Hk_Mode6Begin, "net:matchbarrier")) ++ok;
+    if (PatchJump(kCrtRand, HOOK_CDECL(Hk_CrtRand), "net:rand")) ++ok;
+    if (PatchJump(kCrtSrand, HOOK_CDECL(Hk_CrtSrand), "net:srand")) ++ok;
+    if (PatchCallSite(kMode6Begin, HOOK_RAW(Hk_Mode6Begin), "net:matchbarrier")) {
+        EngineModeRegisterJmpHook((const void*)&Hk_Mode6Begin, 0x14EC0u,
+                                  &Mode6Engine, /*escapeSafe=*/true);
+        ++ok;
+    }
 
     NetInit();      // TJ_NET=host | join:<ip>  -- no-op when unset (single-player unchanged)
 

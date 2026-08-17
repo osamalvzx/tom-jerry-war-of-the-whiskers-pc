@@ -7,6 +7,7 @@
 // draw / present / textures) is wired in as the crash-by-crash bring-up reaches it,
 // guided by the D3D8 device-model RE.
 #include "hybrid/xdk_patch.h"
+#include "hybrid/guest_call.h"
 #include "hybrid/dsound_stubs.h"
 #include "hybrid/net_lan.h"
 #include "hybrid/lan_ui.h"
@@ -2468,19 +2469,12 @@ static void InstallAudioStubs() {
 // being destroyed anyway, so nothing visible is lost). This is deterministic in attract
 // (crashed at frame ~29958 every run) and is the true "few minutes then crash".
 typedef void (__cdecl* FnDb80)(uint32_t inst, uint8_t bright, uint32_t arg3);
-static FnDb80 g_orig_db80 = nullptr;
+static uint32_t g_orig_db80 = 0;   // guest-window trampoline VA (GCALL it)
 // Build a call-through trampoline: copy `len` bytes of the original prologue, then jmp to
 // the rest. `len` must be >= 5 and land on an instruction boundary; the copied bytes must
 // be position-independent (no rel jumps). FUN_0007db80's prologue (mov eax,[esp+0xc];
 // sub esp,0x40 = 7 bytes) is both.
-static void* MakeCallTramp(uint32_t va, int len) {
-    uint8_t* t = (uint8_t*)VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!t) return nullptr;
-    memcpy(t, (const void*)(uintptr_t)va, len);
-    t[len] = 0xE9;
-    *(int32_t*)(t + len + 1) = (int32_t)(va + len) - (int32_t)((uintptr_t)t + len + 5);
-    return t;
-}
+// (call-through trampolines now come from xdk_patch's guest-window pad — MakeGuestTramp)
 // Validate EVERY part's vertex buffer -- the game loops all parts, so a bad VB on ANY
 // part crashes (an earlier version checked only part[0] and still crashed on part[3]).
 static bool BrightnessObjOk(uint32_t inst) {
@@ -2504,7 +2498,7 @@ static bool BrightnessObjOk(uint32_t inst) {
     return true;
 }
 static void __cdecl Hk_Brightness(uint32_t inst, uint8_t bright, uint32_t arg3) {
-    if (BrightnessObjOk(inst)) { g_orig_db80(inst, bright, arg3); return; }
+    if (BrightnessObjOk(inst)) { GCALL(Cdecl, FnDb80, g_orig_db80, inst, bright, arg3); return; }
     static int logged = 0;
     if (logged < 8) { ++logged;
         printf("[fx] skip stale brightness object inst=%08x (a part VB is out of range/unreadable)\n", inst); }
@@ -2525,55 +2519,55 @@ int InstallD3D8Bridge() {
     SetGlobal32(0xA65B8, 0x302);        // src blend GL_SRC_ALPHA
     SetGlobal32(0xA65BC, 0x303);        // dst blend GL_ONE_MINUS_SRC_ALPHA
     int n = 0;
-    n += PatchJump(0x7c6f0, (void*)&Br_Init3DEnvironment, "SYS_Init3DEnvironment");
-    n += PatchJump(0x95f70, (void*)&Br_CreateDevice,     "Direct3D_CreateDevice");
-    n += PatchJump(0x98910, (void*)&Br_Clear,            "D3DDevice_Clear");
-    n += PatchJump(0x9b1d0, (void*)&Br_Swap,             "D3DDevice_Swap");
-    n += PatchJump(0x95aa0, (void*)&Br_ResourceRelease,  "D3DResource_Release");
-    n += PatchJump(0x97f90, (void*)&Br_SetTexture,       "D3DDevice_SetTexture");
-    n += PatchJump(0x99570, (void*)&Br_SetStreamSource,  "D3DDevice_SetStreamSource");
-    n += PatchJump(0x981d0, (void*)&Br_SetIndices,       "D3DDevice_SetIndices");
-    n += PatchJump(0x98140, (void*)&Br_SetPalette,       "D3DDevice_SetPalette");
-    n += PatchJump(0x958c0, (void*)&Br_LockRect,         "D3DTexture_LockRect");
+    n += PatchJump(0x7c6f0, HOOK_CDECL(Br_Init3DEnvironment), "SYS_Init3DEnvironment");
+    n += PatchJump(0x95f70, HOOK_STD(Br_CreateDevice),     "Direct3D_CreateDevice");
+    n += PatchJump(0x98910, HOOK_STD(Br_Clear),            "D3DDevice_Clear");
+    n += PatchJump(0x9b1d0, HOOK_STD(Br_Swap),             "D3DDevice_Swap");
+    n += PatchJump(0x95aa0, HOOK_STD(Br_ResourceRelease),  "D3DResource_Release");
+    n += PatchJump(0x97f90, HOOK_STD(Br_SetTexture),       "D3DDevice_SetTexture");
+    n += PatchJump(0x99570, HOOK_STD(Br_SetStreamSource),  "D3DDevice_SetStreamSource");
+    n += PatchJump(0x981d0, HOOK_STD(Br_SetIndices),       "D3DDevice_SetIndices");
+    n += PatchJump(0x98140, HOOK_STD(Br_SetPalette),       "D3DDevice_SetPalette");
+    n += PatchJump(0x958c0, HOOK_STD(Br_LockRect),         "D3DTexture_LockRect");
     // Shaders + draw (semantic replacement)
-    n += PatchJump(0x99950, (void*)&Br_SetVertexShader,  "SetVertexShader");
-    n += PatchJump(0x99cc0, (void*)&Br_SetPixelShader,   "SetPixelShader");
-    n += PatchJump(0x99200, (void*)&Br_CreateVertexShader,"CreateVertexShader");
-    n += PatchJump(0x99c70, (void*)&Br_CreatePixelShader, "CreatePixelShader");
-    n += PatchJump(0x993a0, (void*)&Br_SetVSConst4,      "SetVertexShaderConstant4");
-    n += PatchJump(0x99340, (void*)&Br_SetVSConst1,      "SetVertexShaderConstant1");
-    n += PatchJump(0x99ec0, (void*)&Br_SetPSConst,       "SetPixelShaderConstant");
-    n += PatchJump(0x99530, (void*)&Br_SetVSConstN,      "SetVertexShaderConstantNotInline");
-    n += PatchJump(0x99450, (void*)&Br_SetVSConstN,      "SetVertexShaderConstantNotInlineFast");
-    n += PatchJump(0x99600, (void*)&Br_LoadVertexShader, "LoadVertexShader");
-    n += PatchJump(0x99660, (void*)&Br_SelectVertexShader,"SelectVertexShader");
-    n += PatchJump(0x99ac0, (void*)&Br_SetVertexShaderInput,"SetVertexShaderInput");
-    n += PatchJump(0x9b410, (void*)&Br_DrawVerticesUP,   "DrawVerticesUP");
+    n += PatchJump(0x99950, HOOK_STD(Br_SetVertexShader),  "SetVertexShader");
+    n += PatchJump(0x99cc0, HOOK_STD(Br_SetPixelShader),   "SetPixelShader");
+    n += PatchJump(0x99200, HOOK_STD(Br_CreateVertexShader),"CreateVertexShader");
+    n += PatchJump(0x99c70, HOOK_STD(Br_CreatePixelShader), "CreatePixelShader");
+    n += PatchJump(0x993a0, HOOK_FC(Br_SetVSConst4),       "SetVertexShaderConstant4");
+    n += PatchJump(0x99340, HOOK_FC(Br_SetVSConst1),       "SetVertexShaderConstant1");
+    n += PatchJump(0x99ec0, HOOK_STD(Br_SetPSConst),       "SetPixelShaderConstant");
+    n += PatchJump(0x99530, HOOK_FC(Br_SetVSConstN),       "SetVertexShaderConstantNotInline");
+    n += PatchJump(0x99450, HOOK_FC(Br_SetVSConstN),       "SetVertexShaderConstantNotInlineFast");
+    n += PatchJump(0x99600, HOOK_STD(Br_LoadVertexShader), "LoadVertexShader");
+    n += PatchJump(0x99660, HOOK_STD(Br_SelectVertexShader),"SelectVertexShader");
+    n += PatchJump(0x99ac0, HOOK_STD(Br_SetVertexShaderInput),"SetVertexShaderInput");
+    n += PatchJump(0x9b410, HOOK_STD(Br_DrawVerticesUP),   "DrawVerticesUP");
     // 3D mesh path
-    n += PatchJump(0x9b6c0, (void*)&Br_DrawVertices,     "DrawVertices");
-    n += PatchJump(0x9b760, (void*)&Br_DrawIndexedVertices, "DrawIndexedVertices");
-    n += PatchJump(0x9b580, (void*)&Br_DrawIndexedVerticesUP, "DrawIndexedVerticesUP");
-    n += PatchJump(0x9a280, (void*)&Br_RunPushBuffer,    "RunPushBuffer");
+    n += PatchJump(0x9b6c0, HOOK_STD(Br_DrawVertices),     "DrawVertices");
+    n += PatchJump(0x9b760, HOOK_STD(Br_DrawIndexedVertices), "DrawIndexedVertices");
+    n += PatchJump(0x9b580, HOOK_STD(Br_DrawIndexedVerticesUP), "DrawIndexedVerticesUP");
+    n += PatchJump(0x9a280, HOOK_STD(Br_RunPushBuffer),    "RunPushBuffer");
     // Render-to-texture pass redirect (motion-blur smear textures, preview panels).
-    n += PatchJump(0x82660, (void*)&Br_RttBegin,         "RttBegin");
-    n += PatchJump(0x826e0, (void*)&Br_RttContinue,      "RttContinue");
-    n += PatchJump(0x82620, (void*)&Br_RttEnd,           "RttEnd");
-    n += PatchJump(0x79b50, (void*)&Br_FindEntByName,    "FindEntityByName");   // diag: TJ_NAMELOG
+    n += PatchJump(0x82660, HOOK_CDECL(Br_RttBegin),       "RttBegin");
+    n += PatchJump(0x826e0, HOOK_CDECL(Br_RttContinue),    "RttContinue");
+    n += PatchJump(0x82620, HOOK_CDECL(Br_RttEnd),         "RttEnd");
+    n += PatchJump(0x79b50, HOOK_CDECL(Br_FindEntByName),  "FindEntityByName");   // diag: TJ_NAMELOG
     // Brightness/status flush guard (skip stale objects w/ bad VB pointers). Build the
     // call-through trampoline from the UNPATCHED prologue FIRST, then patch the entry.
-    g_orig_db80 = (FnDb80)MakeCallTramp(0x7db80, 7);
-    if (g_orig_db80) n += PatchJump(0x7db80, (void*)&Hk_Brightness, "BrightnessGuard");
+    g_orig_db80 = MakeGuestTramp(0x7db80, 7, "d3d8:tr.brightness");
+    if (g_orig_db80) n += PatchJump(0x7db80, HOOK_CDECL(Hk_Brightness), "BrightnessGuard");
     // Audio: fully disabled (MCPX hardware can't run natively). GPU-sync waits: stubbed.
     InstallAudioStubs();
     InstallGpuSyncStubs();
     // Input (XAPI device layer)
-    n += PatchJump(0xe7e38, (void*)&Br_XInitDevices,     "XInitDevices");
-    n += PatchJump(0xe8b09, (void*)&Br_XGetDeviceChanges,"XGetDeviceChanges");
-    n += PatchJump(0xe8bd8, (void*)&Br_XInputOpen,       "XInputOpen");
-    n += PatchJump(0xe8c2e, (void*)&Br_XInputClose,      "XInputClose");
-    n += PatchJump(0xe8e12, (void*)&Br_XInputGetState,   "XInputGetState");
-    n += PatchJump(0xe8e85, (void*)&Br_XInputSetState,   "XInputSetState");
-    n += PatchJump(0xe8c3a, (void*)&Br_XInputGetCapabilities, "XInputGetCapabilities");
+    n += PatchJump(0xe7e38, HOOK_STD(Br_XInitDevices),     "XInitDevices");
+    n += PatchJump(0xe8b09, HOOK_STD(Br_XGetDeviceChanges),"XGetDeviceChanges");
+    n += PatchJump(0xe8bd8, HOOK_STD(Br_XInputOpen),       "XInputOpen");
+    n += PatchJump(0xe8c2e, HOOK_STD(Br_XInputClose),      "XInputClose");
+    n += PatchJump(0xe8e12, HOOK_STD(Br_XInputGetState),   "XInputGetState");
+    n += PatchJump(0xe8e85, HOOK_STD(Br_XInputSetState),   "XInputSetState");
+    n += PatchJump(0xe8c3a, HOOK_STD(Br_XInputGetCapabilities), "XInputGetCapabilities");
     printf("[d3d8] bridge installed: %d hooks\n", n);
     return n;
 }

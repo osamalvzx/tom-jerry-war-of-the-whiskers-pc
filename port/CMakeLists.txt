@@ -103,6 +103,7 @@ add_library(tj_hybrid SHARED
     src/hybrid/kernel.cpp
     src/hybrid/symbolize.cpp
     src/hybrid/xdk_patch.cpp
+    src/hybrid/dispatch.cpp
     src/hybrid/crt_glue.cpp
     src/hybrid/fs_fixup.cpp
     src/hybrid/d3d8_bridge.cpp
@@ -118,13 +119,17 @@ add_library(tj_hybrid SHARED
     src/hybrid/meat_ui.cpp
     src/hybrid/meat_menu.cpp
     src/hybrid/file_io.cpp
+    src/hybrid/prof.cpp
+    src/hybrid/engine_mode.cpp
     src/hybrid/startup.cpp
     src/hybrid/hybrid_run.cpp
 )
 target_include_directories(tj_hybrid PRIVATE src)
 target_compile_definitions(tj_hybrid PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(tj_hybrid PRIVATE tj_runtime tj_game)
-target_link_options(tj_hybrid PRIVATE /BASE:0x30000000)
+# winmm: timeBeginPeriod for the TJ_PROF sampler; psapi is in kernel32 on modern SDKs.
+# tj_engine: the x86 interpreter (TJ_ENGINE=1 runs the whole game through it, Stage 3).
+target_link_libraries(tj_hybrid PRIVATE tj_runtime tj_game tj_engine tj_softfloat winmm)
+target_link_options(tj_hybrid PRIVATE /BASE:0x30000000 /MAP)
 set_target_properties(tj_hybrid PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -223,6 +228,150 @@ set_target_properties(xmf_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINAR
 add_executable(diff_test tests/diff_test.cpp)
 target_link_libraries(diff_test PRIVATE tj_game)
 set_target_properties(diff_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# --- Berkeley SoftFloat-3e: extFloat80 subset, 8086 specialization ----------
+# Vendored from github.com/ucb-bar/berkeley-softfloat-3 (BSD-3-Clause; license
+# preserved as src/engine/softfloat/COPYING.txt). EXACT deterministic 80-bit
+# x87 soft-float for the interpreter FPU (ANDROID_PLAN.md S1d): the 8086
+# specialization models x87 NaN propagation, extF80_roundingPrecision models
+# x87 precision control. Flattened; platform.h is the only non-upstream file
+# (MSVC build glue). NOT linked into tj_engine yet.
+add_library(tj_softfloat STATIC
+    src/engine/softfloat/extF80_add.c
+    src/engine/softfloat/extF80_sub.c
+    src/engine/softfloat/extF80_mul.c
+    src/engine/softfloat/extF80_div.c
+    src/engine/softfloat/extF80_rem.c
+    src/engine/softfloat/extF80_sqrt.c
+    src/engine/softfloat/extF80_roundToInt.c
+    src/engine/softfloat/extF80_eq.c
+    src/engine/softfloat/extF80_eq_signaling.c
+    src/engine/softfloat/extF80_le.c
+    src/engine/softfloat/extF80_le_quiet.c
+    src/engine/softfloat/extF80_lt.c
+    src/engine/softfloat/extF80_lt_quiet.c
+    src/engine/softfloat/extF80_isSignalingNaN.c
+    src/engine/softfloat/extF80_to_f32.c
+    src/engine/softfloat/extF80_to_f64.c
+    src/engine/softfloat/extF80_to_i32.c
+    src/engine/softfloat/extF80_to_i32_r_minMag.c
+    src/engine/softfloat/extF80_to_i64.c
+    src/engine/softfloat/extF80_to_i64_r_minMag.c
+    src/engine/softfloat/f32_to_extF80.c
+    src/engine/softfloat/f64_to_extF80.c
+    src/engine/softfloat/i32_to_extF80.c
+    src/engine/softfloat/i64_to_extF80.c
+    src/engine/softfloat/softfloat_state.c
+    src/engine/softfloat/softfloat_raiseFlags.c
+    src/engine/softfloat/s_propagateNaNExtF80UI.c
+    src/engine/softfloat/s_extF80UIToCommonNaN.c
+    src/engine/softfloat/s_commonNaNToExtF80UI.c
+    src/engine/softfloat/s_f32UIToCommonNaN.c
+    src/engine/softfloat/s_commonNaNToF32UI.c
+    src/engine/softfloat/s_f64UIToCommonNaN.c
+    src/engine/softfloat/s_commonNaNToF64UI.c
+    src/engine/softfloat/s_addMagsExtF80.c
+    src/engine/softfloat/s_subMagsExtF80.c
+    src/engine/softfloat/s_normSubnormalExtF80Sig.c
+    src/engine/softfloat/s_normRoundPackToExtF80.c
+    src/engine/softfloat/s_roundPackToExtF80.c
+    src/engine/softfloat/s_normSubnormalF32Sig.c
+    src/engine/softfloat/s_normSubnormalF64Sig.c
+    src/engine/softfloat/s_roundPackToF32.c
+    src/engine/softfloat/s_roundPackToF64.c
+    src/engine/softfloat/s_roundToI32.c
+    src/engine/softfloat/s_roundToI64.c
+    src/engine/softfloat/s_add128.c
+    src/engine/softfloat/s_sub128.c
+    src/engine/softfloat/s_le128.c
+    src/engine/softfloat/s_lt128.c
+    src/engine/softfloat/s_mul64To128.c
+    src/engine/softfloat/s_mul64ByShifted32To128.c
+    src/engine/softfloat/s_shortShiftLeft128.c
+    src/engine/softfloat/s_shiftRightJam32.c
+    src/engine/softfloat/s_shiftRightJam64.c
+    src/engine/softfloat/s_shiftRightJam64Extra.c
+    src/engine/softfloat/s_shiftRightJam128.c
+    src/engine/softfloat/s_shortShiftRightJam64.c
+    src/engine/softfloat/s_shortShiftRightJam64Extra.c
+    src/engine/softfloat/s_countLeadingZeros8.c
+    src/engine/softfloat/s_countLeadingZeros32.c
+    src/engine/softfloat/s_countLeadingZeros64.c
+    src/engine/softfloat/s_approxRecip32_1.c
+    src/engine/softfloat/s_approxRecip_1Ks.c
+    src/engine/softfloat/s_approxRecipSqrt32_1.c
+    src/engine/softfloat/s_approxRecipSqrt_1Ks.c
+)
+target_include_directories(tj_softfloat PUBLIC src/engine/softfloat)
+# SOFTFLOAT_FAST_INT64 is PUBLIC because softfloat.h's API shape depends on it.
+# LITTLEENDIAN is PUBLIC because softfloat_types.h picks the FIELD ORDER of
+# extFloat80M from it -- a client TU without it silently gets the reversed
+# struct layout (ABI break, caught by softfloat_smoke).
+# The PRIVATE options are speed-only (per SoftFloat docs) -- none change results,
+# so the engine stays bit-deterministic across compilers/platforms.
+target_compile_definitions(tj_softfloat
+    PUBLIC  SOFTFLOAT_FAST_INT64 LITTLEENDIAN=1
+    PRIVATE INLINE_LEVEL=5 SOFTFLOAT_FAST_DIV32TO16 SOFTFLOAT_FAST_DIV64TO32)
+
+# Smoke test: hard-coded x87 bit patterns (add/round-trip/precision-control/
+# sqrt/default-NaN); exits nonzero on any mismatch.
+add_executable(softfloat_smoke tests/softfloat_smoke.cpp)
+target_link_libraries(softfloat_smoke PRIVATE tj_softfloat)
+set_target_properties(softfloat_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# --- x86-32 execution engine (Android plan, port/ANDROID_PLAN.md Stage 1) ----
+# Interpreter + NATIVE-x87 unit + the engine gate. eng_test is diff_test's oracle
+# pointed at the engine: original code executed NATIVELY vs INTERPRETED must be
+# byte-identical on randomized memory (Gate S1b: the 141; Gate S1c: all 1,764).
+add_library(tj_engine STATIC
+    src/engine/x86_interp.cpp
+    src/engine/x87_native.cpp
+    src/engine/x87_exact.cpp
+    src/engine/eng_gate.cpp
+    src/engine/fpu_host.cpp
+)
+target_include_directories(tj_engine PUBLIC src)
+target_compile_definitions(tj_engine PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+# x87_exact.cpp is the EXACT soft-float unit (ANDROID_PLAN S1d); the softfloat
+# PUBLIC defines (SOFTFLOAT_FAST_INT64, LITTLEENDIAN) flow in through this link.
+target_link_libraries(tj_engine PRIVATE tj_softfloat)
+
+add_executable(eng_test tests/eng_test.cpp)
+target_link_libraries(eng_test PRIVATE tj_game tj_engine)
+set_target_properties(eng_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Stage-5 cross-host smoke (also in port/android/CMakeLists.txt): outputs must match
+# the aarch64 build line for line — a miniature Gate S5c.
+add_executable(eng_smoke tests/eng_smoke.cpp)
+target_link_libraries(eng_smoke PRIVATE tj_engine tj_softfloat)
+set_target_properties(eng_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_executable(eng_bench tests/eng_bench.cpp)
+target_link_libraries(eng_bench PRIVATE tj_engine tj_softfloat)
+set_target_properties(eng_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Stage-5 CALL-BOUNDARY cross-host smoke (also in port/android/CMakeLists.txt):
+# dispatch typed shims + Engine::Call marshaling, outputs line-identical across hosts.
+add_executable(eng_call_smoke tests/eng_call_smoke.cpp src/hybrid/dispatch.cpp)
+target_link_libraries(eng_call_smoke PRIVATE tj_engine tj_softfloat)
+set_target_properties(eng_call_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Gate S1d: EXACT-vs-NATIVE x87 differential corpus (see tests/x87_corpus.cpp).
+add_executable(x87_corpus tests/x87_corpus.cpp)
+target_link_libraries(x87_corpus PRIVATE tj_engine tj_game tj_softfloat)
+set_target_properties(x87_corpus PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Gate S1c: the signature-free full-context sweep over every .text function.
+add_executable(eng_sweep tests/eng_sweep.cpp)
+target_link_libraries(eng_sweep PRIVATE tj_game tj_engine)
+set_target_properties(eng_sweep PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_custom_command(TARGET eng_sweep POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/src/game/generated/data_image.bin
+        ${CMAKE_SOURCE_DIR}/src/game/generated/text_image.bin
+        ${CMAKE_SOURCE_DIR}/src/game/generated/text_relocs.bin
+        ${CMAKE_SOURCE_DIR}/../re/functions.csv
+        $<TARGET_FILE_DIR:eng_sweep>
+)
 # Stage the extracted images + relocation table next to the test binary.
 add_custom_command(TARGET diff_test POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

@@ -20,6 +20,7 @@
 #include "hybrid/meat_rush.h"
 #include "hybrid/lan_ui.h"
 #include "hybrid/audio_ui.h"
+#include "hybrid/guest_call.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstdint>
@@ -37,12 +38,15 @@ using FnReady      = uint8_t  (__cdecl*)();                                    /
 using FnThis       = void     (__fastcall*)(uint32_t self, uint32_t);
 using FnThisU32    = void     (__fastcall*)(uint32_t self, uint32_t, uint32_t);
 using FnThisU32U32 = uint8_t  (__fastcall*)(uint32_t self, uint32_t, uint32_t, uint32_t);
-static const FnThis    ItemCtor  = (FnThis)   0x1A340;   // MenuOptionItem ctor
-static const FnThisU32 SetLabel  = (FnThisU32)0x19E70;   // (u16 label idx)
-static const FnThisU32 SetValue  = (FnThisU32)0x19E80;   // (u8 value idx; 0x24 = none)
-static const FnThisU32 SetAlign  = (FnThisU32)0x19E90;
-static const FnThisU32 SetScale  = (FnThisU32)0x1A320;   // (float as raw bits)
-static const FnThisU32 AppendItem= (FnThisU32)0x1D030;   // Screen::AppendItem(item)
+// Host->guest seam (guest_call.h): resolved through GuestFnPtr at EVERY call -- engine
+// mode arms after all Install*() have run, so a static-init value would freeze the raw
+// native address. Native mode: the raw address, exactly as shipped.
+#define ItemCtor(...)   GCALL(Fastcall, FnThis,    0x1A340, __VA_ARGS__)  // MenuOptionItem ctor
+#define SetLabel(...)   GCALL(Fastcall, FnThisU32, 0x19E70, __VA_ARGS__)  // (u16 label idx)
+#define SetValue(...)   GCALL(Fastcall, FnThisU32, 0x19E80, __VA_ARGS__)  // (u8 value idx; 0x24 = none)
+#define SetAlign(...)   GCALL(Fastcall, FnThisU32, 0x19E90, __VA_ARGS__)
+#define SetScale(...)   GCALL(Fastcall, FnThisU32, 0x1A320, __VA_ARGS__)  // (float as raw bits)
+#define AppendItem(...) GCALL(Fastcall, FnThisU32, 0x1D030, __VA_ARGS__)  // Screen::AppendItem(item)
 
 // ---- resolution mode table + current state ----
 struct Mode { int w, h; };
@@ -117,29 +121,20 @@ static char* __cdecl Hk_GetText(uint32_t idxArg) {
     if (const char* mt = MeatCustomText(idx)) return (char*)mt;  // MAX MEAT row (0x1A0, 0xE6+)
     if (const char* mm = MeatMenuText(idx)) return (char*)mm;    // MULTIPLAYER menu (0x1C8+)
     if (idx > 0xE5) return g_resLabel;                        // unused custom slots
-    if (!((FnReady)0x198e0)()) return (char*)0x116FFC;        // "" until text ready
+    if (!GCALL0(Cdecl, FnReady, 0x198e0)) return (char*)0x116FFC;    // "" until text ready
     uint32_t lang = *(uint8_t*)(uintptr_t)0x114C18;
     return (char*)(uintptr_t)((lang * 0xE3 + idx) * 0xFF + 0x114C20);
 }
 
 // ---- minimal trampoline (prologue lengths hand-verified in the disassembly; the copied
 // bytes contain no relative branches) ----
-static void* MakeTramp(uint32_t va, int prologueLen) {
-    uint8_t* t = (uint8_t*)VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE,
-                                        PAGE_EXECUTE_READWRITE);
-    if (!t) return nullptr;
-    memcpy(t, (const void*)(uintptr_t)va, prologueLen);
-    t[prologueLen] = 0xE9;
-    *(int32_t*)(t + prologueLen + 1) =
-        (int32_t)(va + prologueLen) - (int32_t)((uintptr_t)t + prologueLen + 5);
-    return t;
-}
+// (call-through trampolines now come from xdk_patch's guest-window pad — MakeGuestTramp)
 
 // ---- OPTIONS screen builder (FUN_00027590) post-hook: append the hidden VIDEO row ----
-static FnThis Orig_OptionsBuild = nullptr;
+static uint32_t Orig_OptionsBuild = 0;   // guest-window trampoline VAs (GCALL them)
 static void __fastcall Hk_OptionsBuild(uint32_t self, uint32_t edx) {
     (void)edx;
-    Orig_OptionsBuild(self, 0);
+    GCALL(Fastcall, FnThis, Orig_OptionsBuild, self, 0);
     uint32_t vid = self + 0x1A8;                 // the fully-built, never-appended item
     *(float*)(uintptr_t)(vid + 0x40) = 0.5f;
     *(float*)(uintptr_t)(vid + 0x44) = 0.65f;    // the free row (CHEATS 0.58, EXIT 0.72)
@@ -185,10 +180,10 @@ static void MakeCustomRow(uint8_t* store, uint16_t label, float y,
     *(uint32_t*)(uintptr_t)(prevIt + 0x60) = it;
     if (next) *(uint32_t*)(uintptr_t)(next + 0x64) = it;
 }
-static FnThis Orig_VideoBuild = nullptr;
+static uint32_t Orig_VideoBuild = 0;
 static void __fastcall Hk_VideoBuild(uint32_t self, uint32_t edx) {
     (void)edx;
-    Orig_VideoBuild(self, 0);
+    GCALL(Fastcall, FnThis, Orig_VideoBuild, self, 0);
     // Diagnostic bisect: TJ_FE_NOROW=1 keeps the VIDEO screen stock (no custom items).
     static int noRow = -1;
     if (noRow < 0) { char* e = nullptr; size_t n = 0; _dupenv_s(&e, &n, "TJ_FE_NOROW");
@@ -202,10 +197,10 @@ static void __fastcall Hk_VideoBuild(uint32_t self, uint32_t edx) {
 }
 
 // ---- VIDEO screen Enter (FUN_00028BC0) post-hook: show the live resolution ----
-static FnThis Orig_VideoEnter = nullptr;
+static uint32_t Orig_VideoEnter = 0;
 static void __fastcall Hk_VideoEnter(uint32_t self, uint32_t edx) {
     (void)edx;
-    Orig_VideoEnter(self, 0);
+    GCALL(Fastcall, FnThis, Orig_VideoEnter, self, 0);
     RefreshLabel();
 }
 
@@ -216,7 +211,7 @@ static void __fastcall Hk_VideoEnter(uint32_t self, uint32_t edx) {
 // thiscall on the input object [master+0x4BC], (id, pad) -> al; id 3 = left, 4 = right
 // (from the WIDESCREEN handler's own usage; it passes pad = 0).
 using FnUpdate = uint32_t (__fastcall*)(uint32_t self, uint32_t);
-static FnUpdate Orig_VideoUpdate = nullptr;
+static uint32_t Orig_VideoUpdate = 0;
 // Auto-pair the game's WIDESCREEN (anamorphic 16:9 projection, settings byte
 // [0x16A254]) with the picked resolution's aspect: a 16:9 window without it renders a
 // stretched 4:3 image. The screen's own toggle stays usable as an override -- we also
@@ -301,13 +296,13 @@ void FeMenuFrameTick(int frame) {
 static uint32_t __fastcall Hk_VideoUpdate(uint32_t self, uint32_t edx) {
     (void)edx;
     uint32_t selBefore = *(uint32_t*)(uintptr_t)(self + 4);
-    uint32_t r = Orig_VideoUpdate(self, 0);
+    uint32_t r = GCALL(Fastcall, FnUpdate, Orig_VideoUpdate, self, 0);
     uint32_t master = *(uint32_t*)(uintptr_t)0x15C470C;
     uint32_t input = master ? *(uint32_t*)(uintptr_t)(master + 0x4BC) : 0;
     if (!input) return r;
     if (selBefore == (uint32_t)(uintptr_t)g_resItem) {
-        uint8_t left  = ((FnThisU32U32)0x13470)(input, 0, 3, 0);
-        uint8_t right = ((FnThisU32U32)0x13470)(input, 0, 4, 0);
+        uint8_t left  = GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 3, 0);
+        uint8_t right = GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 4, 0);
         if (left || right) {
             g_mode = (g_mode + (right ? 1 : kModeCount - 1)) % kModeCount;
             RefreshLabel();
@@ -315,8 +310,8 @@ static uint32_t __fastcall Hk_VideoUpdate(uint32_t self, uint32_t edx) {
             PairWidescreen(self);
         }
     } else if (selBefore == (uint32_t)(uintptr_t)g_dispItem) {
-        uint8_t left  = ((FnThisU32U32)0x13470)(input, 0, 3, 0);
-        uint8_t right = ((FnThisU32U32)0x13470)(input, 0, 4, 0);
+        uint8_t left  = GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 3, 0);
+        uint8_t right = GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 4, 0);
         if (left || right) {
             g_dispKind = (g_dispKind + (right ? 1 : 2)) % 3;
             RefreshLabel();
@@ -343,11 +338,11 @@ static uint8_t g_exitMsg[0x84], g_exitYes[0x84], g_exitNo[0x84];
 static bool    g_exitModal = false;
 static uint8_t g_savedVis[24]; static uint32_t g_savedItems[24]; static int g_savedN = 0;
 using FnSetSel = void (__fastcall*)(uint32_t self, uint32_t, uint32_t item, uint32_t cursor);
-static const FnSetSel SetSelected = (FnSetSel)0x1D230;
+#define SetSelected(...) GCALL(Fastcall, FnSetSel, 0x1D230, __VA_ARGS__)
 static void PlayUiSound(uint32_t id) {
     uint32_t master = *(uint32_t*)(uintptr_t)0x15C470C;
     uint32_t snd = master ? *(uint32_t*)(uintptr_t)(master + 0x1C904) : 0;
-    if (snd) ((FnThisU32)0x705E0)(snd, 0, id);
+    if (snd) GCALL(Fastcall, FnThisU32, 0x705E0, snd, 0, id);
 }
 static void ExitModalShow(uint32_t self, bool show) {
     // toggle the stock items' visibility (walk the child list, skipping ours)
@@ -377,10 +372,10 @@ static void ExitModalShow(uint32_t self, bool show) {
         SetSelected(self, 0, (uint32_t)(uintptr_t)(show ? g_exitNo : (uint8_t*)(uintptr_t)(self + 0x20)), c);
     g_exitModal = show;
 }
-static FnThis Orig_MenuBuild = nullptr;
+static uint32_t Orig_MenuBuild = 0;
 static void __fastcall Hk_MenuBuild(uint32_t self, uint32_t edx) {
     (void)edx;
-    Orig_MenuBuild(self, 0);
+    GCALL(Fastcall, FnThis, Orig_MenuBuild, self, 0);
     g_exitModal = false;
     uint32_t ex = self + 0x1AC;                  // the cut VERSUS item -> EXIT
     SetLabel(ex, 0, 0x6A);                       // "EXIT"
@@ -402,7 +397,7 @@ static void __fastcall Hk_MenuBuild(uint32_t self, uint32_t edx) {
     LanMenuBuild(self);          // LAN GAME row on the other cut item (+0x230 -> screen 5)
     MeatMenuBuild(self);         // MULTIPLAYER row on +0x2B4; QUICK GAME/TOURNAMENT move into it
 }
-static FnUpdate Orig_MenuUpdate = nullptr;
+static uint32_t Orig_MenuUpdate = 0;
 static uint32_t __fastcall Hk_MenuUpdate(uint32_t self, uint32_t edx) {
     (void)edx;
     uint32_t master = *(uint32_t*)(uintptr_t)0x15C470C;
@@ -410,20 +405,20 @@ static uint32_t __fastcall Hk_MenuUpdate(uint32_t self, uint32_t edx) {
     if (g_exitModal) {
         // modal: the stock update never runs (no nav, no attract timer)
         if (input) for (uint32_t pad = 0; pad < 4; ++pad) {
-            if (((FnThisU32U32)0x13470)(input, 0, 3, pad)) {          // left -> YES
+            if (GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 3, pad)) {   // left -> YES
                 PlayUiSound(5);
                 for (uint32_t c = 0; c < 4; ++c) SetSelected(self, 0, (uint32_t)(uintptr_t)g_exitYes, c);
             }
-            if (((FnThisU32U32)0x13470)(input, 0, 4, pad)) {          // right -> NO
+            if (GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 4, pad)) {   // right -> NO
                 PlayUiSound(5);
                 for (uint32_t c = 0; c < 4; ++c) SetSelected(self, 0, (uint32_t)(uintptr_t)g_exitNo, c);
             }
-            if (((FnThisU32U32)0x13470)(input, 0, 2, pad)) {          // B = cancel
+            if (GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 2, pad)) {   // B = cancel
                 PlayUiSound(1);
                 ExitModalShow(self, false);
                 return 4;
             }
-            if (((FnThisU32U32)0x13470)(input, 0, 1, pad)) {          // A = confirm
+            if (GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 1, pad)) {   // A = confirm
                 PlayUiSound(0x13);
                 bool yes = *(uint32_t*)(uintptr_t)(self + 4) == (uint32_t)(uintptr_t)g_exitYes;
                 ExitModalShow(self, false);
@@ -436,7 +431,7 @@ static uint32_t __fastcall Hk_MenuUpdate(uint32_t self, uint32_t edx) {
         }
         return 4;
     }
-    uint32_t r = Orig_MenuUpdate(self, 0);
+    uint32_t r = GCALL(Fastcall, FnUpdate, Orig_MenuUpdate, self, 0);
     // MULTIPLAYER is a DLL-side item, so retail's A dispatch does not know it: catch the
     // press here. (The cut +0x2B4 slot was tried first and is unusable -- FUN_00021010
     // moves the cursor off it whenever fewer than two pads are connected.)
@@ -444,7 +439,7 @@ static uint32_t __fastcall Hk_MenuUpdate(uint32_t self, uint32_t edx) {
         uint32_t sel = *(uint32_t*)(uintptr_t)(self + 4);
         if (sel == MeatMenuRow())
             for (uint32_t pad = 0; pad < 4; ++pad)
-                if (((FnThisU32U32)0x13470)(input, 0, 1, pad)) return 14;
+                if (GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 1, pad)) return 14;
     }
     if (r == 0x0E) {                              // the EXIT item's press site fired
         PlayUiSound(0x13);
@@ -473,31 +468,31 @@ int InstallFeMenu() {
     // Trampolines FIRST (PatchJump overwrites the prologues). Lengths hand-verified:
     // 0x27590/0x28C00: push ebx/ebp/esi + mov esi,ecx + push edi = 6 bytes;
     // 0x28BC0: mov al,[0x16A254] = 5 bytes; 0x28D30: push ecx + mov eax,[imm] = 6 bytes.
-    Orig_OptionsBuild = (FnThis)  MakeTramp(0x27590, 6);
-    Orig_VideoBuild   = (FnThis)  MakeTramp(0x28C00, 6);
-    Orig_VideoEnter   = (FnThis)  MakeTramp(0x28BC0, 5);
-    Orig_VideoUpdate  = (FnUpdate)MakeTramp(0x28D30, 6);
+    Orig_OptionsBuild = MakeGuestTramp(0x27590, 6, "fe:tr.optbuild");
+    Orig_VideoBuild   = MakeGuestTramp(0x28C00, 6, "fe:tr.vidbuild");
+    Orig_VideoEnter   = MakeGuestTramp(0x28BC0, 5, "fe:tr.videnter");
+    Orig_VideoUpdate  = MakeGuestTramp(0x28D30, 6, "fe:tr.vidupdate");
     // main menu (screen 4): builder push ebx/ebp/esi + mov esi,ecx + push edi = 6 bytes;
     // update push ecx + mov eax,[imm32] = 6 bytes (both verified in the disassembly).
-    Orig_MenuBuild    = (FnThis)  MakeTramp(0x21140, 6);
-    Orig_MenuUpdate   = (FnUpdate)MakeTramp(0x212D0, 6);
+    Orig_MenuBuild    = MakeGuestTramp(0x21140, 6, "fe:tr.menubuild");
+    Orig_MenuUpdate   = MakeGuestTramp(0x212D0, 6, "fe:tr.menuupdate");
     if (!Orig_OptionsBuild || !Orig_VideoBuild || !Orig_VideoEnter || !Orig_VideoUpdate ||
         !Orig_MenuBuild || !Orig_MenuUpdate) {
         printf("[fe] trampoline alloc failed -- menu injection skipped\n");
         return 0;
     }
     int n = 0;
-    n += PatchJump(0x21140, (void*)&Hk_MenuBuild,  "FE_MenuBuild");
-    n += PatchJump(0x212D0, (void*)&Hk_MenuUpdate, "FE_MenuUpdate");
+    n += PatchJump(0x21140, HOOK_FC(Hk_MenuBuild),  "FE_MenuBuild");
+    n += PatchJump(0x212D0, HOOK_FC(Hk_MenuUpdate), "FE_MenuUpdate");
     // Diagnostic bisect: TJ_FE_NOVID=1 leaves the VIDEO screen's enter/update stock.
     char* e = nullptr; size_t sz = 0; _dupenv_s(&e, &sz, "TJ_FE_NOVID");
     bool noVid = e && atoi(e); free(e);
-    n += PatchJump(0x19910, (void*)&Hk_GetText,     "FE_GetText");
-    n += PatchJump(0x27590, (void*)&Hk_OptionsBuild,"FE_OptionsBuild");
-    n += PatchJump(0x28C00, (void*)&Hk_VideoBuild,  "FE_VideoBuild");
+    n += PatchJump(0x19910, HOOK_CDECL(Hk_GetText),  "FE_GetText");
+    n += PatchJump(0x27590, HOOK_FC(Hk_OptionsBuild),"FE_OptionsBuild");
+    n += PatchJump(0x28C00, HOOK_FC(Hk_VideoBuild),  "FE_VideoBuild");
     if (!noVid) {
-        n += PatchJump(0x28BC0, (void*)&Hk_VideoEnter,  "FE_VideoEnter");
-        n += PatchJump(0x28D30, (void*)&Hk_VideoUpdate, "FE_VideoUpdate");
+        n += PatchJump(0x28BC0, HOOK_FC(Hk_VideoEnter),  "FE_VideoEnter");
+        n += PatchJump(0x28D30, HOOK_FC(Hk_VideoUpdate), "FE_VideoUpdate");
     }
     // Retail bug hidden by the cut: the transition early-out returns screen id 8
     // (AUDIO) instead of 9 (VIDEO). mov eax,8 at 0x28D62 -> imm32 at 0x28D63.

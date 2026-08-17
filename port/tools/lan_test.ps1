@@ -29,6 +29,12 @@ param(
   [switch]$Items,
   [switch]$Contest,
   [switch]$Tier2,             # 64 sub-block digests per frame: bisects a divergence to bytes
+  # Gate S3e (ANDROID_PLAN Stage 3): run the JOINER through the x86 interpreter
+  # (TJ_ENGINE=1) against a native host. Lockstep paces both peers to the slower one, so
+  # give the run more -Seconds (engine in-match is ~40-60 ms/f). Judge by the standing
+  # battery rule: match 1 IDENTICAL and no new t1 divergence (the multi-match mti drift
+  # is pre-existing and native-side).
+  [switch]$EngineJoin,
   [string]$Tag = "lan",
   # Which folder to run FROM. Point this at dist\TomJerryWOW-LAN to test the copyable build
   # exactly as it will be shipped; logs still land in the build output, not in the package.
@@ -69,6 +75,7 @@ function Launch([string]$who, [hashtable]$extra) {
   $env:TJ_NET = $null; $env:TJ_LAN = $null; $env:TJ_LAN_PW = $null
   $env:TJ_LAN_NAME = $null; $env:TJ_LAN_ARENA = $null; $env:TJ_LAN_ROUNDS = $null
   $env:TJ_LAN_TIME = $null; $env:TJ_SEED = $null
+  $env:TJ_ENGINE = $null      # per-peer via $extra only — must not leak to the other peer
   foreach ($k in $extra.Keys) { Set-Item -Path "env:$k" -Value $extra[$k] }
   Start-Process -FilePath "$bin\tj_loader.exe" -ArgumentList "m4" `
     -WorkingDirectory $bin -RedirectStandardOutput "$out\$Tag`_$who.log" -PassThru
@@ -85,6 +92,7 @@ if ($Mode -eq "legacy") {
   if ($Rounds -gt 0) { $h["TJ_LAN_ROUNDS"] = "$Rounds" }
   if ($Time -ge 0)   { $h["TJ_LAN_TIME"]   = "$Time" }
 }
+if ($EngineJoin) { $j["TJ_ENGINE"] = "1" }
 
 Write-Host "== launching host =="
 $ph = Launch "host" $h

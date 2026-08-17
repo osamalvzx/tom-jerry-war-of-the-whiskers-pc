@@ -15,6 +15,10 @@ namespace tj::hybrid {
 
 static uint8_t* g_fakeKpcr = nullptr;
 
+// Engine mode points the interpreter's fs base here so ALL fs-prefixed sites (not just
+// the 24 rewritten ones) resolve to the fake KPCR uniformly.
+uint32_t FsFixupKpcrBase() { return (uint32_t)(uintptr_t)g_fakeKpcr; }
+
 void ApplyFsFixups() {
     // KPCR blob (fields up to ~0x100 used) + a secondary zeroed target for the self /
     // current-thread pointers so second-level derefs ([ptr+0x250], [ptr+0x28]) read 0.

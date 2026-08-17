@@ -25,6 +25,9 @@ int  InstallAudioUi();        // audio_ui.cpp  (two independent music/effects sl
 int  InstallMeatRush();       // meat_rush.cpp (MEAT RUSH: the meat is the only item)
 int  InstallMeatUi();         // meat_ui.cpp   (the MAX MEAT rule on FIGHT SETTINGS)
 int  InstallMeatMenu();       // meat_menu.cpp (MULTIPLAYER row + the submenu on screen 14)
+int  InstallProf();           // prof.cpp     (TJ_PROF: Stage-0 EIP sampler, Android plan)
+bool RunGameMainEngine(uint32_t vaGameMain);  // engine_mode.cpp (TJ_ENGINE=1, Stage 3)
+void EngineModeCrashDump();                   // engine_mode.cpp (VEH FATAL context)
 
 // Original init entry points (see re: __rtinit/__cinit walk the CRT init tables).
 static const uint32_t VA_rtinit = 0x000761fb;   // __xi table (heap/fpu pre-init)
@@ -133,7 +136,8 @@ static LONG CALLBACK HybridVeh(EXCEPTION_POINTERS* ep) {
                 printf("\n");
             } __except (EXCEPTION_EXECUTE_HANDLER) { printf("  %s @%08x <unreadable>\n", label, a); }
         };
-        dump("esi", c->Esi); dump("edi", c->Edi);
+        dump("esi", c->Esi); dump("edi", c->Edi); dump("esp", c->Esp);
+        EngineModeCrashDump();
     }
     if (fatal || firstChanceTraces++ < 3)
         StackTrace((uint32_t)ep->ContextRecord->Ebp, 16);
@@ -270,6 +274,10 @@ bool RunGameLoop() {
     InstallMeatUi();           // MEAT RUSH: the MAX MEAT rule
     InstallMeatMenu();         // MEAT RUSH: the MULTIPLAYER menu (before the menu Build hook)
     InstallNetSync();          // phase-2 LAN: main-loop phase brackets + RNG counters
+    InstallProf();             // TJ_PROF only; must be on the game thread (samples it)
+    char eng[8] = {0};
+    if (GetEnvironmentVariableA("TJ_ENGINE", eng, 8) && eng[0] == '1')
+        return RunGameMainEngine(VA_gameMain);   // Stage 3: interpret the whole game
     return GuardedCallAddr("game main", VA_gameMain);
 }
 

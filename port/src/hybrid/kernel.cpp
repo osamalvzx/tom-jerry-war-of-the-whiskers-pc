@@ -7,6 +7,7 @@
 // crash-by-crash bring-up loop.
 #include "hybrid/kernel.h"
 #include "hybrid/xbe_image.h"
+#include "hybrid/dispatch.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstdint>
@@ -736,15 +737,34 @@ void FillKernelThunks(uint32_t thunkTableVa) {
         int ord = (int)(enc & 0x7FFFFFFF);
         void* target = nullptr;
         for (int j = 0; j < g_tableCount; ++j) if (g_table[j].ord == ord) {
-            target = g_table[j].shim;
-            if ((target == (void*)&Sh_ok0 || target == (void*)&Sh_ok1) && g_table[j].argBytes > 0) {
-                void* clean = MakeCleanStub(target == (void*)&Sh_ok1 ? 1u : 0u, g_table[j].argBytes);
-                if (clean) { target = clean; ++cleaned; }
+            const Entry& te = g_table[j];
+            target = te.shim;
+            if ((target == (void*)&Sh_ok0 || target == (void*)&Sh_ok1) && te.argBytes > 0) {
+                uint32_t rv = target == (void*)&Sh_ok1 ? 1u : 0u;
+                void* clean = MakeCleanStub(rv, te.argBytes);
+                if (clean) {
+                    target = clean; ++cleaned;
+                    // Stage-5 dispatch (dispatch.h): stub semantics as data — the ARM
+                    // build cannot execute the generated x86 bytes.
+                    DispatchRegisterRetStub(clean, te.name, rv, te.argBytes);
+                }
+            } else {
+                // Every kernel shim's convention is already data in this table:
+                // argBytes = stdcall stack bytes, -1 = cdecl/varargs (escape-only).
+                // VAR exports are guest-READ data, never executed — recorded so the
+                // ARM relocation sweep has the complete list.
+                if (te.isVar) DispatchRegisterData(target, te.name);
+                else          DispatchRegisterArgBytes(target, te.name, te.argBytes,
+                                                       CallConv::Stdcall);
             }
             break;
         }
         if (target) { slot[i] = (uint32_t)(uintptr_t)target; ++filled; }
-        else        { slot[i] = (uint32_t)(uintptr_t)MakeTrap(ord); ++trapped; }
+        else {
+            void* trap = MakeTrap(ord);
+            DispatchRegisterTrap(trap, KernelOrdinalName(ord), (uint32_t)ord, &TrapReport);
+            slot[i] = (uint32_t)(uintptr_t)trap; ++trapped;
+        }
     }
     FlushInstructionCache(GetCurrentProcess(), g_traps, sizeof(Trap) * 512);
     if (g_stubs) FlushInstructionCache(GetCurrentProcess(), g_stubs, sizeof(StubThunk) * 128);

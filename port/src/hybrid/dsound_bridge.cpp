@@ -22,6 +22,7 @@
 //    LATER DoWork tick (the game inspects statuses between pump stages).
 #include "hybrid/xdk_patch.h"
 #include "hybrid/dsound_bridge.h"
+#include "hybrid/guest_call.h"
 #include "runtime/snd/xaudio_backend.h"
 #include "runtime/snd/xadpcm.h"
 #include "runtime/snd/wav_dump.h"
@@ -925,6 +926,7 @@ static void RestoreGameFn(int i, const char* name) {
     memcpy((void*)(uintptr_t)kSndFnVa[i], g_sndFnBytes[i], 8);
     VirtualProtect((void*)(uintptr_t)kSndFnVa[i], 8, old, &old);
     FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)kSndFnVa[i], 8);
+    EngineModeInvalidateCode(kSndFnVa[i], 8);      // engine mode: stale cached decodes
     printf("[snd] un-stubbed %s @0x%x\n", name, kSndFnVa[i]);
 }
 
@@ -984,37 +986,59 @@ int InstallDSoundBridge() {
     // cleanly (same era as the D3D bridge's UI/input threads).
     int n = 0;
     // device
-    n += PatchJump(0x0acf29, (void*)&DS_DirectSoundCreate, "DirectSoundCreate");
-    n += PatchJump(0x0a9e41, (void*)&DS_Release,           "IDirectSound_Release");
-    n += PatchJump(0x0acc9c, (void*)&DS_CreateSoundBuffer, "IDirectSound_CreateSoundBuffer");
-    n += PatchJump(0x0acf70, (void*)&DS_CreateBuffer,      "DirectSoundCreateBuffer");
-    n += PatchJump(0x0acfc7, (void*)&DS_CreateStream,      "DirectSoundCreateStream");
-    n += PatchJump(0x0aad6c, (void*)&DS_SynchPlayback,     "IDirectSound_SynchPlayback");
-    n += PatchJump(0x0aaeb3, (void*)&DS_DoWork,            "DirectSoundDoWork");
+    n += PatchJump(0x0acf29, HOOK_STD(DS_DirectSoundCreate), "DirectSoundCreate");
+    n += PatchJump(0x0a9e41, HOOK_STD(DS_Release),           "IDirectSound_Release");
+    n += PatchJump(0x0acc9c, HOOK_STD(DS_CreateSoundBuffer), "IDirectSound_CreateSoundBuffer");
+    n += PatchJump(0x0acf70, HOOK_STD(DS_CreateBuffer),      "DirectSoundCreateBuffer");
+    n += PatchJump(0x0acfc7, HOOK_STD(DS_CreateStream),      "DirectSoundCreateStream");
+    n += PatchJump(0x0aad6c, HOOK_STD(DS_SynchPlayback),     "IDirectSound_SynchPlayback");
+    n += PatchJump(0x0aaeb3, HOOK_STD(DS_DoWork),            "DirectSoundDoWork");
     // buffer (opaque object; static entry points only)
-    n += PatchJump(0x0ac3bd, (void*)&DSB_SetFormat,          "DSB_SetFormat");
-    n += PatchJump(0x0ac3d9, (void*)&DSB_SetBufferData,      "DSB_SetBufferData");
-    n += PatchJump(0x0abcd0, (void*)&DSB_SetPlayRegion,      "DSB_SetPlayRegion");
-    n += PatchJump(0x0aae14, (void*)&DSB_SetLoopRegion,      "DSB_SetLoopRegion");
-    n += PatchJump(0x0aae70, (void*)&DSB_SetCurrentPosition, "DSB_SetCurrentPosition");
-    n += PatchJump(0x0aadbc, (void*)&DSB_Play,               "DSB_Play");
-    n += PatchJump(0x0aade0, (void*)&DSB_Stop,               "DSB_Stop");
-    n += PatchJump(0x0aadf8, (void*)&DSB_Pause,              "DSB_Pause");
-    n += PatchJump(0x0aae34, (void*)&DSB_GetStatus,          "DSB_GetStatus");
-    n += PatchJump(0x0aae50, (void*)&DSB_GetCurrentPosition, "DSB_GetCurrentPosition");
-    n += PatchJump(0x0aad84, (void*)&DSB_SetVolume,          "DSB_SetVolume");
-    n += PatchJump(0x0aada0, (void*)&DSB_SetHeadroom,        "DSB_SetHeadroom");
-    n += PatchJump(0x0abb82, (void*)&DSB_SetFrequency,       "DSB_SetFrequency");
-    n += PatchJump(0x0a9e57, (void*)&DSB_Release,            "DSB_Release");
+    n += PatchJump(0x0ac3bd, HOOK_STD(DSB_SetFormat),          "DSB_SetFormat");
+    n += PatchJump(0x0ac3d9, HOOK_STD(DSB_SetBufferData),      "DSB_SetBufferData");
+    n += PatchJump(0x0abcd0, HOOK_STD(DSB_SetPlayRegion),      "DSB_SetPlayRegion");
+    n += PatchJump(0x0aae14, HOOK_STD(DSB_SetLoopRegion),      "DSB_SetLoopRegion");
+    n += PatchJump(0x0aae70, HOOK_STD(DSB_SetCurrentPosition), "DSB_SetCurrentPosition");
+    n += PatchJump(0x0aadbc, HOOK_STD(DSB_Play),               "DSB_Play");
+    n += PatchJump(0x0aade0, HOOK_STD(DSB_Stop),               "DSB_Stop");
+    n += PatchJump(0x0aadf8, HOOK_STD(DSB_Pause),              "DSB_Pause");
+    n += PatchJump(0x0aae34, HOOK_STD(DSB_GetStatus),          "DSB_GetStatus");
+    n += PatchJump(0x0aae50, HOOK_STD(DSB_GetCurrentPosition), "DSB_GetCurrentPosition");
+    n += PatchJump(0x0aad84, HOOK_STD(DSB_SetVolume),          "DSB_SetVolume");
+    n += PatchJump(0x0aada0, HOOK_STD(DSB_SetHeadroom),        "DSB_SetHeadroom");
+    n += PatchJump(0x0abb82, HOOK_STD(DSB_SetFrequency),       "DSB_SetFrequency");
+    n += PatchJump(0x0a9e57, HOOK_STD(DSB_Release),            "DSB_Release");
     // stream named exports (vtable slots are wired in the object itself)
-    n += PatchJump(0x0ac3f9, (void*)&DSS_SetFormat,    "DSS_SetFormat");
-    n += PatchJump(0x0aae8c, (void*)&DSS_SetVolume,    "DSS_SetVolume");
-    n += PatchJump(0x0aae91, (void*)&DSS_SetHeadroom,  "DSS_SetHeadroom");
-    n += PatchJump(0x0aae96, (void*)&DSS_Pause,        "DSS_Pause");
-    n += PatchJump(0x0aae9b, (void*)&DSS_FlushEx,      "DSS_FlushEx");
-    n += PatchJump(0x0abcf0, (void*)&DSS_SetFrequency, "DSS_SetFrequency");
+    n += PatchJump(0x0ac3f9, HOOK_STD(DSS_SetFormat),    "DSS_SetFormat");
+    n += PatchJump(0x0aae8c, HOOK_STD(DSS_SetVolume),    "DSS_SetVolume");
+    n += PatchJump(0x0aae91, HOOK_STD(DSS_SetHeadroom),  "DSS_SetHeadroom");
+    n += PatchJump(0x0aae96, HOOK_STD(DSS_Pause),        "DSS_Pause");
+    n += PatchJump(0x0aae9b, HOOK_STD(DSS_FlushEx),      "DSS_FlushEx");
+    n += PatchJump(0x0abcf0, HOOK_STD(DSS_SetFrequency), "DSS_SetFrequency");
     // file media object factory
-    n += PatchJump(0x0aaedc, (void*)&XF_CreateMediaObjectAsync, "XFileCreateMediaObjectAsync");
+    n += PatchJump(0x0aaedc, HOOK_STD(XF_CreateMediaObjectAsync), "XFileCreateMediaObjectAsync");
+    // The ShimStream/ShimFile VTABLES are guest->host boundaries too: the game calls
+    // through them (music pump ticks vtbl+0x24 every frame). Register each entry —
+    // the arrays keep raw addresses on the x86 host (key == address), so guest-visible
+    // words are unchanged; on ARM the arrays must hold the returned keys AND relocate
+    // below 4 GB (host statics stored into guest objects — the gptr sweep's list).
+    DispatchRegister(HOOK_STD(Strm_AddRef),        "snd:strm.addref");
+    DispatchRegister(HOOK_STD(Strm_Release),       "snd:strm.release");
+    DispatchRegister(HOOK_STD(Strm_GetInfo),       "snd:strm.getinfo");
+    DispatchRegister(HOOK_STD(Strm_GetStatus),     "snd:strm.getstatus");
+    DispatchRegister(HOOK_STD(Strm_Process),       "snd:strm.process");
+    DispatchRegister(HOOK_STD(Strm_Discontinuity), "snd:strm.discontinuity");
+    DispatchRegister(HOOK_STD(Strm_Flush),         "snd:strm.flush");
+    DispatchRegister(HOOK_STD(File_AddRef),        "snd:file.addref");
+    DispatchRegister(HOOK_STD(File_Release),       "snd:file.release");
+    DispatchRegister(HOOK_STD(File_GetInfo),       "snd:file.getinfo");
+    DispatchRegister(HOOK_STD(File_GetStatus),     "snd:file.getstatus");
+    DispatchRegister(HOOK_STD(File_Process),       "snd:file.process");
+    DispatchRegister(HOOK_STD(File_Discontinuity), "snd:file.discontinuity");
+    DispatchRegister(HOOK_STD(File_Flush),         "snd:file.flush");
+    DispatchRegister(HOOK_STD(File_Seek),          "snd:file.seek");
+    DispatchRegister(HOOK_STD(File_GetLength),     "snd:file.getlength");
+    DispatchRegister(HOOK_STD(File_DoWork),        "snd:file.dowork");
     // Everything else (3D setters, mixbins, I3DL2, DownloadEffectsImage,
     // UseFullHRTF, CommitDeferredSettings) keeps its ret-0 stub: safe no-ops
     // per the RE spec. 3D positioning is a follow-up (plain volume for now).

@@ -59,6 +59,7 @@
 #include <cstring>
 
 #include "hybrid/xdk_patch.h"
+#include "hybrid/guest_call.h"
 
 namespace tj::hybrid {
 
@@ -275,7 +276,7 @@ static void __fastcall Hk_LoadArena(uint32_t level, uint32_t edx, uint32_t arena
         }
     }
 
-    ((FnLoadArena)(uintptr_t)kLoadArena)(level, edx, arenaId);
+    GCALL(Fastcall, FnLoadArena, kLoadArena, level, edx, arenaId);
 
     if (on) {
         // A round with NO target and NO clock never ends. The FIGHT SETTINGS row skips
@@ -380,7 +381,7 @@ static void MeatDebugTick(uint32_t level);       // TJ_MEATDBG, defined below
 
 static void __fastcall Hk_PropSpawner(uint32_t level, uint32_t edx) {
     if (g_applied) { MeatDebugTick(level); MeatFrameTick(); return; }
-    ((FnPropSpawn)(uintptr_t)kPropSpawn)(level, edx);
+    GCALL(Fastcall, FnPropSpawn, kPropSpawn, level, edx);
 }
 
 // ---- pick up -> vanish -> score ---------------------------------------------
@@ -473,8 +474,8 @@ static void BankHeldMeat(uint32_t carry) {
                *U8(carry + 0x04), slot, *score);
     }
     *U8(carry + 0x38) = 0;                         // never take the "eat it" release branch
-    ((FnDespawn)(uintptr_t)kDespawnItem)(level, 0, slot);
-    ((FnRelease)(uintptr_t)kRelease)(carry, 0, 0);
+    GCALL(Fastcall, FnDespawn, kDespawnItem, level, 0, slot);
+    GCALL(Fastcall, FnRelease, kRelease, carry, 0, 0);
 }
 
 // THE MEAT SURVIVES BEING HIT.  Three retail paths destroy an item that is merely lying on
@@ -494,15 +495,15 @@ static void __fastcall Hk_SmashItem(uint32_t level, uint32_t edx, uint32_t slot,
         const uint8_t* rec = U8(level + kItemArr + slot * kItemStride);
         if (rec[0x140B] == 1 && rec[0x140C] == kMeatTypeIdx) return;
     }
-    ((FnSetObjState)(uintptr_t)kSetObjState)(level, edx, slot, state, flag);
+    GCALL(Fastcall, FnSetObjState, kSetObjState, level, edx, slot, state, flag);
 }
 
 static void __fastcall Hk_TryTake(uint32_t carry, uint32_t edx) {
-    ((FnTryTake)(uintptr_t)kTryTake)(carry, edx);
+    GCALL(Fastcall, FnTryTake, kTryTake, carry, edx);
     BankHeldMeat(carry);
 }
 static void __fastcall Hk_TakeEat(uint32_t carry, uint32_t edx, uint32_t slot) {
-    ((FnTakeEat)(uintptr_t)kTakeEat)(carry, edx, slot);
+    GCALL(Fastcall, FnTakeEat, kTakeEat, carry, edx, slot);
     BankHeldMeat(carry);
 }
 
@@ -548,12 +549,13 @@ static void BlankHealthBars(bool on) {
         }
         VirtualProtect(U8(kHealthBars[i]), 3, old, &old);
         FlushInstructionCache(GetCurrentProcess(), U8(kHealthBars[i]), 3);
+        EngineModeInvalidateCode(kHealthBars[i], 3);   // engine mode: stale cached decodes
     }
     g_barsBlanked = on ? 1 : 0;
 }
 
 static void __fastcall Hk_HudClock(uint32_t hud, uint32_t edx) {
-    ((FnHudClock)(uintptr_t)kHudClock)(hud, edx);
+    GCALL(Fastcall, FnHudClock, kHudClock, hud, edx);
     if (!g_applied) return;
     uint32_t m = Master();
     if (!m || m < 0x04000000u || m >= 0x10000000u) return;
@@ -569,14 +571,14 @@ static void __fastcall Hk_HudClock(uint32_t hud, uint32_t edx) {
         // still inside the player's own panel at every player index.  x is a CENTRE anchor:
         // the retail clock draws at 0.5 and lands in the middle of the screen.
         float r[6] = { 0, 0, 0, 0, 0, 0 };
-        ((FnPanelRect)(uintptr_t)kPanelRect)(r, 1, *U8(f + kPlayerNum));
+        GCALL(Cdecl, FnPanelRect, kPanelRect, r, 1, *U8(f + kPlayerNum));
         char buf[16];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%u", *U8(f + kScoreOff));
         *(float*)(uintptr_t)(hud + 0x14) = 0.06f;                         // text scale
         *(uint32_t*)(uintptr_t)(hud + 0x18) = (uint32_t)(uintptr_t)kWhite;
         // BELOW the bar with real daylight between them. r[2]/r[3] are the bar's top and
         // bottom edges, so anchoring off r[3] keeps the gap correct at any resolution.
-        ((FnHudText)(uintptr_t)kHudText)(hud + 0x10, (r[0] + r[1]) * 0.5f, r[3] + 0.075f, buf);
+        GCALL(Cdecl, FnHudText, kHudText, hud + 0x10, (r[0] + r[1]) * 0.5f, r[3] + 0.075f, buf);
     }
 }
 
@@ -611,13 +613,13 @@ int InstallMeatRush() {
     free(e);
 
     int ok = 0;
-    if (PatchCallSite(kLoadArenaCS, (const void*)&Hk_LoadArena, "meat: arena item tables")) ++ok;
-    if (PatchCallSite(kPropSpawnCS, (const void*)&Hk_PropSpawner, "meat: category-0 props")) ++ok;
-    if (PatchCallSite(kTryTakeCS,   (const void*)&Hk_TryTake,    "meat: pickup (anim event)")) ++ok;
-    if (PatchCallSite(kTakeEatCS,   (const void*)&Hk_TakeEat,    "meat: pickup (contact)")) ++ok;
-    if (PatchCallSite(kHudClockCS,  (const void*)&Hk_HudClock,   "meat: score HUD")) ++ok;
+    if (PatchCallSite(kLoadArenaCS, HOOK_FC(Hk_LoadArena), "meat: arena item tables")) ++ok;
+    if (PatchCallSite(kPropSpawnCS, HOOK_FC(Hk_PropSpawner), "meat: category-0 props")) ++ok;
+    if (PatchCallSite(kTryTakeCS,   HOOK_FC(Hk_TryTake),    "meat: pickup (anim event)")) ++ok;
+    if (PatchCallSite(kTakeEatCS,   HOOK_FC(Hk_TakeEat),    "meat: pickup (contact)")) ++ok;
+    if (PatchCallSite(kHudClockCS,  HOOK_FC(Hk_HudClock),   "meat: score HUD")) ++ok;
     for (int i = 0; i < 3; ++i)
-        if (PatchCallSite(kSmashCS[i], (const void*)&Hk_SmashItem, "meat: keep meat on a hit")) ++ok;
+        if (PatchCallSite(kSmashCS[i], HOOK_FC(Hk_SmashItem), "meat: keep meat on a hit")) ++ok;
 
     // Sanity: the patch sites must still hold the bytes the RE recorded, or the addresses
     // are stale and the mode would corrupt the item scheduler instead of steering it.

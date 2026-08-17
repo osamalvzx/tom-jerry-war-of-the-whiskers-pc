@@ -35,6 +35,7 @@
 //     sub-screen and needs no extra hook.
 #include "hybrid/meat_rush.h"
 #include "hybrid/xdk_patch.h"
+#include "hybrid/guest_call.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -48,14 +49,17 @@ using FnThisU32 = void    (__fastcall*)(uint32_t self, uint32_t, uint32_t);
 using FnThis2   = void    (__fastcall*)(uint32_t self, uint32_t, uint32_t, uint32_t);
 using FnInputT  = uint8_t (__fastcall*)(uint32_t self, uint32_t, uint32_t id, uint32_t pad);
 
-static const FnThis    ItemCtor    = (FnThis)   0x1A340;
-static const FnThisU32 SetLabel    = (FnThisU32)0x19E70;
-static const FnThisU32 SetValue    = (FnThisU32)0x19E80;
-static const FnThisU32 SetAlign    = (FnThisU32)0x19E90;
-static const FnThisU32 SetScale    = (FnThisU32)0x1A320;
-static const FnThisU32 AppendItem  = (FnThisU32)0x1D030;
-static const FnThis2   SetSelected = (FnThis2)  0x1D230;
-static const FnInputT  InputTest   = (FnInputT) 0x13470;
+// Host->guest seam (guest_call.h): resolved through GuestFnPtr at EVERY call -- engine
+// mode arms after all Install*() have run, so a static-init value would freeze the raw
+// native address. Native mode: the raw address, exactly as shipped.
+#define ItemCtor(...)    GCALL(Fastcall, FnThis,    0x1A340, __VA_ARGS__)
+#define SetLabel(...)    GCALL(Fastcall, FnThisU32, 0x19E70, __VA_ARGS__)
+#define SetValue(...)    GCALL(Fastcall, FnThisU32, 0x19E80, __VA_ARGS__)
+#define SetAlign(...)    GCALL(Fastcall, FnThisU32, 0x19E90, __VA_ARGS__)
+#define SetScale(...)    GCALL(Fastcall, FnThisU32, 0x1A320, __VA_ARGS__)
+#define AppendItem(...)  GCALL(Fastcall, FnThisU32, 0x1D030, __VA_ARGS__)
+#define SetSelected(...) GCALL(Fastcall, FnThis2,   0x1D230, __VA_ARGS__)
+#define InputTest(...)   GCALL(Fastcall, FnInputT,  0x13470, __VA_ARGS__)
 
 static const uint32_t kMasterPtr  = 0x15C470C;
 static const uint32_t kMultiBuild = 0x2C570;   // screen 14 (dead) -- all three unique
@@ -217,10 +221,10 @@ int InstallMeatMenu() {
     if (g_installed) return 0;
     g_installed = true;
     int n = 0;
-    n += PatchJump(kMultiBuild, (void*)&Hk_MultiBuild,  "meat:multi.build");
-    n += PatchJump(kMultiUpd,   (void*)&Hk_MultiUpdate, "meat:multi.update");
-    n += PatchJump(kMultiEnter, (void*)&Hk_MultiEnter,  "meat:multi.enter");
-    n += PatchCallSite(kScr11Title, (const void*)&Hk_Scr11Title, "meat:setup title");
+    n += PatchJump(kMultiBuild, HOOK_FC(Hk_MultiBuild),  "meat:multi.build");
+    n += PatchJump(kMultiUpd,   HOOK_FC(Hk_MultiUpdate), "meat:multi.update");
+    n += PatchJump(kMultiEnter, HOOK_FC(Hk_MultiEnter),  "meat:multi.enter");
+    n += PatchCallSite(kScr11Title, HOOK_FC(Hk_Scr11Title), "meat:setup title");
 
     DWORD old = 0;
     // Guarded byte check: if the site is not what the RE recorded, leave it alone rather than

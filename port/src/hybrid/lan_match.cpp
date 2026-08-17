@@ -25,6 +25,7 @@
 #include "lan_match.h"
 #include "net_lan.h"
 #include "hybrid/meat_rush.h"
+#include "hybrid/guest_call.h"
 #include "net_sync.h"
 #include "xdk_patch.h"
 
@@ -63,7 +64,8 @@ uint32_t LanScreen(int id) {
     if (!fe || id < 0 || id > 21) return 0;
     return *(uint32_t*)(uintptr_t)(fe + 4 + (uint32_t)id * 4);
 }
-static char* Text(uint16_t idx) { return ((char*(__cdecl*)(uint32_t))(uintptr_t)kGetText)(idx); }
+typedef char* (__cdecl* FnGetTextC)(uint32_t idx);
+static char* Text(uint16_t idx) { return GCALL(Cdecl, FnGetTextC, kGetText, idx); }
 // ARENA ID -> NAME STRING IS NOT 0x8F + id. The name table at string 0x8F..0x9B is in a
 // DIFFERENT ORDER from the arena ids, so labelling by `0x8F + id` named most arenas wrongly
 // and the player picked one thing and got another ("HELL" was id 9, which actually loads
@@ -255,6 +257,15 @@ __declspec(naked) static void Hk_RoundEnd() {
         jmp dword ptr [g_roundEndRet]
     }
 }
+// Engine mode must NOT reach the naked wrapper above through the host-call escape: this
+// is a mid-function jmp-in/jmp-out hook, so [esp] is the round-over function's live data
+// (a heap pointer), not a return address — the escape's displacement handed the guest a
+// thunk address as its pointer and it crashed dereferencing it (session 24, frame
+// 10,645). The registered semantic below is what the wrapper does, minus the register
+// theater the interpreter's CpuState makes unnecessary.
+static void __cdecl RoundEndEngine(tj::engine::CpuState& s) {
+    RoundEndC((int)s.r[tj::engine::EAX]);
+}
 
 // --- FIGHT SETTINGS over LAN (stage 5) ----------------------------------------
 // Deliberately not a clone: the player already knows this screen pixel-for-pixel because it
@@ -262,13 +273,13 @@ __declspec(naked) static void Hk_RoundEnd() {
 // = OPTIONS; while the lobby owns the screen we reroute that to 15 = the LAN lobby and
 // capture what the player chose.
 static bool g_settingsOpen = false;
-static FnUpdate Orig_FightUpdate = nullptr;
+static uint32_t Orig_FightUpdate = 0;   // guest-window trampoline VA
 
 void LanOpenFightSettings() { g_settingsOpen = true; }
 bool LanFightSettingsOpen() { return g_settingsOpen; }
 
 static uint32_t __fastcall Hk_FightUpdate(uint32_t self, uint32_t) {
-    uint32_t r = Orig_FightUpdate(self, 0);
+    uint32_t r = GCALL(Fastcall, FnUpdate, Orig_FightUpdate, self, 0);
     if (!g_settingsOpen || r != 6) return r;
     g_settingsOpen = false;
     if (LanIsHost()) {
@@ -299,7 +310,7 @@ static uint32_t __fastcall Hk_FightUpdate(uint32_t self, uint32_t) {
 // non-zero, which is state the QUICK GAME path would have left behind and the lobby has not.
 static const uint32_t kLevelUpdate = 0x22420;
 static bool     g_arenaPickOpen = false;
-static FnUpdate Orig_LevelUpdate = nullptr;
+static uint32_t Orig_LevelUpdate = 0;
 
 void LanOpenArenaSelect() {
     uint32_t fe = LanFeMgr();
@@ -329,7 +340,7 @@ void LanOpenArenaSelect() {
 bool LanArenaSelectOpen() { return g_arenaPickOpen; }
 
 static uint32_t __fastcall Hk_LevelUpdate(uint32_t self, uint32_t) {
-    uint32_t r = Orig_LevelUpdate(self, 0);
+    uint32_t r = GCALL(Fastcall, FnUpdate, Orig_LevelUpdate, self, 0);
     if (!g_arenaPickOpen || r == 0x10) return r;   // 0x10 = still on the carousel
     g_arenaPickOpen = false;
     uint32_t fe = LanFeMgr();
@@ -390,7 +401,7 @@ bool LanMatchLaunchIfPending() {
     }
     *(uint8_t*)(uintptr_t)(s11 + 0xA0) = c.teamMode < 3 ? c.teamMode : 0;
 
-    ((FnThis)(uintptr_t)kQuickCommit)(s11, 0);   // the game repacks our slots itself
+    GCALL(Fastcall, FnThis, kQuickCommit, s11, 0);  // the game repacks our slots itself
 
     // UNLOCK WHAT THE LOBBY CHOSE, do not remap it. Each PC has its own save, so the arena
     // the host picked may be locked on the client -- and a peer that quietly substituted a
@@ -486,15 +497,7 @@ void LanMatchFrameTick(int frame) {
 }
 
 // --- install ------------------------------------------------------------------
-static void* MakeTramp(uint32_t va, int len) {
-    uint8_t* t = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!t) return nullptr;
-    memcpy(t, (const void*)(uintptr_t)va, len);
-    t[len] = 0xE9;
-    *(int32_t*)(t + len + 1) = (int32_t)(va + len) - (int32_t)((uintptr_t)t + len + 5);
-    FlushInstructionCache(GetCurrentProcess(), t, 64);
-    return t;
-}
+// (call-through trampolines now come from xdk_patch's guest-window pad — MakeGuestTramp)
 
 // Every site verifies its retail bytes before it is patched, so future XBE or build drift
 // fails visibly instead of silently corrupting the simulation.
@@ -513,32 +516,35 @@ int InstallLanMatch() {
     int n = 0;
     static const uint8_t kRoundEndBytes[] = { 0xC6, 0x81, 0x7D, 0x02, 0x00, 0x00, 0x01 };
     if (Expect(kRoundEnd, kRoundEndBytes, 7, "rounds")) {
-        if (PatchJump(kRoundEnd, (void*)&Hk_RoundEnd, "lan:rounds")) {
+        // HOOK_RAW: naked jmp-in/jmp-out continuation — engine mode services it via the
+        // registered jmp-hook below, never the dispatch table or the call-shaped escape.
+        if (PatchJump(kRoundEnd, HOOK_RAW(Hk_RoundEnd), "lan:rounds")) {
             DWORD old;
             VirtualProtect((void*)(uintptr_t)kRoundEnd, 8, PAGE_EXECUTE_READWRITE, &old);
             ((uint8_t*)(uintptr_t)kRoundEnd)[5] = 0x90;      // pad the 7-byte site
             ((uint8_t*)(uintptr_t)kRoundEnd)[6] = 0x90;
             VirtualProtect((void*)(uintptr_t)kRoundEnd, 8, old, &old);
             FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)kRoundEnd, 8);
+            EngineModeRegisterJmpHook((const void*)&Hk_RoundEnd, kRoundEndRet, &RoundEndEngine);
             ++n;
         }
     }
     static const uint8_t kFightBytes[] = { 0xA1, 0x0C, 0x47, 0x5C, 0x01 };
     if (Expect(kFightUpdate, kFightBytes, 5, "fightsettings")) {
-        Orig_FightUpdate = (FnUpdate)MakeTramp(kFightUpdate, 5);
-        if (Orig_FightUpdate && PatchJump(kFightUpdate, (void*)&Hk_FightUpdate, "lan:fightsettings")) ++n;
+        Orig_FightUpdate = MakeGuestTramp(kFightUpdate, 5, "lan:tr.fight");
+        if (Orig_FightUpdate && PatchJump(kFightUpdate, HOOK_FC(Hk_FightUpdate), "lan:fightsettings")) ++n;
     }
     static const uint8_t kLevelBytes[] = { 0x83, 0xEC, 0x10, 0xA1, 0x0C, 0x47, 0x5C, 0x01 };
     if (Expect(kLevelUpdate, kLevelBytes, 8, "levelselect")) {
-        Orig_LevelUpdate = (FnUpdate)MakeTramp(kLevelUpdate, 8);
-        if (Orig_LevelUpdate && PatchJump(kLevelUpdate, (void*)&Hk_LevelUpdate, "lan:levelselect")) ++n;
+        Orig_LevelUpdate = MakeGuestTramp(kLevelUpdate, 8, "lan:tr.level");
+        if (Orig_LevelUpdate && PatchJump(kLevelUpdate, HOOK_FC(Hk_LevelUpdate), "lan:levelselect")) ++n;
     }
     static const uint8_t kNameBytes[] = { 0x8A, 0x81, 0x21, 0x70, 0x00, 0x00 };
     if (Expect(kNameFn, kNameBytes, 6, "playername") &&
-        PatchJump(kNameFn, (void*)&Hk_PlayerName, "lan:playername")) ++n;
+        PatchJump(kNameFn, HOOK_FC(Hk_PlayerName), "lan:playername")) ++n;
     static const uint8_t kTeamBytes[] = { 0x8A, 0x81, 0x22, 0x70, 0x00, 0x00 };
     if (Expect(kTeamNameFn, kTeamBytes, 6, "teamname") &&
-        PatchJump(kTeamNameFn, (void*)&Hk_TeamName, "lan:teamname")) ++n;
+        PatchJump(kTeamNameFn, HOOK_FC(Hk_TeamName), "lan:teamname")) ++n;
     printf("[lan] match hooks installed (%d/5)\n", n);
     return n;
 }

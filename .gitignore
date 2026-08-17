@@ -28,6 +28,7 @@ re/
 # Build output and local artifacts
 # ---------------------------------------------------------------------------
 port/build/
+port/build-arm64/
 *.obj
 *.lib
 *.exp
@@ -55,8 +56,10 @@ portable.txt
 # next, including process notes and reverse-engineering scratch. Not public documentation.
 PROJECT_STATUS.md
 NEXT_SESSION.md
+NEXT_SESSION_ANDROID.md
 port/MEAT_RUSH_PLAN.md
 port/LAN_PLAN.md
+port/ANDROID_PLAN.md
 port/PORTING_LOG.md
 port/RUNTIME.md
 

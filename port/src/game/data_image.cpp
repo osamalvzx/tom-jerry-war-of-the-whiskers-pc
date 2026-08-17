@@ -62,6 +62,30 @@ bool LoadTextImage(const char* binPath) {
     return true;
 }
 
+// Variant for the engine sweep (eng_sweep): the data image is allocated with
+// MEM_WRITE_WATCH so guest writes to globals can be enumerated with GetWriteWatch
+// and restored between differential runs. Behavior is otherwise identical.
+bool MapOriginalImagesWW(const char* dataBin, const char* textBin) {
+    g_dataImage = (uint8_t*)VirtualAlloc(nullptr, kDataImageSize,
+                                         MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                                         PAGE_READWRITE);
+    if (!g_dataImage) return false;
+    g_textImage = (uint8_t*)VirtualAlloc(nullptr, kTextSize,
+                                         MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!g_textImage) return false;
+    size_t sz = 0;
+    uint8_t* t = ReadFile(textBin, &sz);
+    if (!t) return false;
+    memcpy(g_textImage, t, sz > kTextSize ? kTextSize : sz);
+    free(t);
+    FlushInstructionCache(GetCurrentProcess(), g_textImage, kTextSize);
+    uint8_t* d = ReadFile(dataBin, &sz);
+    if (!d) return false;
+    memcpy(g_dataImage, d, sz > kDataInitSize ? kDataInitSize : sz);
+    free(d);
+    return true;
+}
+
 bool MapOriginalImages(const char* dataBin, const char* textBin) {
     // On this OS the main-thread stack unavoidably occupies the .rdata VA (0xEE000),
     // so the data segment cannot be placed at its original address in-process. Instead

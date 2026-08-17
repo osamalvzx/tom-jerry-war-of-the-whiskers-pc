@@ -26,6 +26,7 @@
 #include "net_lan.h"
 #include "net_sync.h"
 #include "xdk_patch.h"
+#include "hybrid/guest_call.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -41,26 +42,29 @@ using FnThisU32    = void     (__fastcall*)(uint32_t self, uint32_t, uint32_t);
 using FnThisU32U32 = uint8_t  (__fastcall*)(uint32_t self, uint32_t, uint32_t, uint32_t);
 using FnSetSel     = void     (__fastcall*)(uint32_t self, uint32_t, uint32_t it, uint32_t cur);
 
-static const FnThis       ItemCtor   = (FnThis)      0x1A340;   // MenuOptionItem ctor
-static const FnThisU32    SetLabel   = (FnThisU32)   0x19E70;   // (u16) -> item+0x7A
-static const FnThisU32    SetValue   = (FnThisU32)   0x19E80;   // (u8; 0x24 = none)
-static const FnThisU32    SetAlign   = (FnThisU32)   0x19E90;   // -> item+0x70
-static const FnThisU32    AppendItem = (FnThisU32)   0x1D030;   // Screen::AppendItem
-static const FnSetSel     SetSelected= (FnSetSel)    0x1D230;
-static const FnThisU32    SetBusy    = (FnThisU32)   0x1DA60;   // FE_MGR+0x1B0 = 1
-static const FnThisU32U32 InputTest  = (FnThisU32U32)0x13470;   // (id, pad) -> pressed
-static const FnThisU32    PlaySfx    = (FnThisU32)   0x705E0;
-static const FnThis       TickItems  = (FnThis)      0x1D2C0;   // vtable+8 on every item
+// Host->guest seam (guest_call.h): each name resolves through GuestFnPtr at EVERY call
+// -- engine mode arms only after all Install*() have run, so a static-init-time value
+// would freeze the raw native address. Native mode: the raw address, as shipped.
+#define ItemCtor(...)    GCALL(Fastcall, FnThis,       0x1A340, __VA_ARGS__)  // MenuOptionItem ctor
+#define SetLabel(...)    GCALL(Fastcall, FnThisU32,    0x19E70, __VA_ARGS__)  // (u16) -> item+0x7A
+#define SetValue(...)    GCALL(Fastcall, FnThisU32,    0x19E80, __VA_ARGS__)  // (u8; 0x24 = none)
+#define SetAlign(...)    GCALL(Fastcall, FnThisU32,    0x19E90, __VA_ARGS__)  // -> item+0x70
+#define AppendItem(...)  GCALL(Fastcall, FnThisU32,    0x1D030, __VA_ARGS__)  // Screen::AppendItem
+#define SetSelected(...) GCALL(Fastcall, FnSetSel,     0x1D230, __VA_ARGS__)
+#define SetBusy(...)     GCALL(Fastcall, FnThisU32,    0x1DA60, __VA_ARGS__)  // FE_MGR+0x1B0 = 1
+#define InputTest(...)   GCALL(Fastcall, FnThisU32U32, 0x13470, __VA_ARGS__)  // (id, pad) -> pressed
+#define PlaySfx(...)     GCALL(Fastcall, FnThisU32,    0x705E0, __VA_ARGS__)
+#define TickItems(...)   GCALL(Fastcall, FnThis,       0x1D2C0, __VA_ARGS__)  // vtable+8 on every item
 
 // The retail CHARACTER CARD widget (0x8D8 bytes). Screens 5 and 15 each embed four of them
 // at self+0x20 and their CUT retail Build (0x2A300 / 0x294A0 -- the two functions this file
 // replaces) drove them exactly like this: load, mark, append. See the lobby below.
 using FnCardXY = void (__fastcall*)(uint32_t self, uint32_t, float sx, float sy);
-static const FnThis    CardLoad     = (FnThis)   0x1B580;   // bind the 11 character sprites
-static const FnCardXY  CardSetScale = (FnCardXY) 0x1B870;
-static const FnThisU32 CardSetChar  = (FnThisU32)0x1BB10;   // -> card+0x8D5 (fade target)
-static const FnThisU32 CardSetState = (FnThisU32)0x1BB30;   // 1 = the "chosen" pulse
-static const FnThisU32 CardSetStep  = (FnThisU32)0x1BBB0;   // -> card+0x8D6, fade speed
+#define CardLoad(...)     GCALL(Fastcall, FnThis,    0x1B580, __VA_ARGS__)  // bind the 11 character sprites
+#define CardSetScale(...) GCALL(Fastcall, FnCardXY,  0x1B870, __VA_ARGS__)
+#define CardSetChar(...)  GCALL(Fastcall, FnThisU32, 0x1BB10, __VA_ARGS__)  // -> card+0x8D5 (fade target)
+#define CardSetState(...) GCALL(Fastcall, FnThisU32, 0x1BB30, __VA_ARGS__)  // 1 = the "chosen" pulse
+#define CardSetStep(...)  GCALL(Fastcall, FnThisU32, 0x1BBB0, __VA_ARGS__)  // -> card+0x8D6, fade speed
 
 // Input ids confirmed in use by the retail screens we mirror (screen 7's Update maps 6 ->
 // "next item" and 5 -> "previous item"; the VIDEO screen uses 3/4 for left/right and the
@@ -185,7 +189,7 @@ static void TxtAppend(uint16_t slot, const char* fmt, ...) {
 // The font pointer is the one the item renderer measures with: the base item ctor 0x19E10
 // sets item+0x74 = *(u32*)(master+0x4D0) + 0x91C and FUN_00019EB0 passes **(u32**)(item+0x74).
 using FnTextWidth = float (__cdecl*)(uint32_t font, const char* s, float scale);
-static const FnTextWidth MeasureText = (FnTextWidth)0x16680;
+#define MeasureText(...) GCALL(Cdecl, FnTextWidth, 0x16680, __VA_ARGS__)
 
 static uint32_t TextFont() {
     uint32_t m = LanMaster();
@@ -229,7 +233,7 @@ static const float kScaleLadder[] = { 0.055f, 0.040f, 0.037f, 0.035f, 0.032f, 0.
 // uses exactly two blocks and FUN_00019D30 to apply them.
 static const uint32_t kColOrange = 0x169F54;   // (249,101,30,127)  titles, captions, hints
 static const uint32_t kColGold   = 0x169F64;   // (255,173,26,127)  values the player changes
-static const FnThisU32 SetColour = (FnThisU32)0x19D30;
+#define SetColour(...) GCALL(Fastcall, FnThisU32, 0x19D30, __VA_ARGS__)
 
 // THE D-PAD ESCAPE DRAWS NOTHING HERE. "\x08D" is charged DOUBLE width by FUN_00016680 (it is
 // in the D/O/S/T/X set) and the space is duly reserved, but no glyph appears -- under either
@@ -837,8 +841,8 @@ static bool g_lCardsLive = false;      // Build got far enough to bind and appen
 // The costume the swatch resolves comes from the SAVE blob, so the launch path force-fills
 // that table to the static ceiling (see lan_match.cpp) -- otherwise a costume the local save
 // has not earned resolves to the wrong sprite.
-static const FnThis    FighterCtor    = (FnThis)   0x1B300;
-static const FnThisU32 FighterSetSlot = (FnThisU32)0x1B020;
+#define FighterCtor(...)    GCALL(Fastcall, FnThis,    0x1B300, __VA_ARGS__)
+#define FighterSetSlot(...) GCALL(Fastcall, FnThisU32, 0x1B020, __VA_ARGS__)
 static uint8_t g_swatch[4][0x724];
 static bool    g_swatchLive = false;
 // Offset from the portrait's centre so the badge sits on its lower-right CORNER rather than
@@ -874,7 +878,7 @@ static const float kSwatchScale = 0.42f;
 // material 0. Passing a name here gets you the wrong picture with no error.
 using FnDraw2D = void (__cdecl*)(uint32_t scene, uint32_t matIndex,
                                  float x0, float y0, float x1, float y1, const uint32_t* rgba);
-static const FnDraw2D Draw2D = (FnDraw2D)0x797B0;
+#define Draw2D(...) GCALL(Cdecl, FnDraw2D, 0x797B0, __VA_ARGS__)
 // EVERY RECTANGLE BELOW IS MEASURED FROM LEVEL.XMF's OWN SUBMESH BOUNDING BOXES. The first
 // attempt guessed that the two foreground props tiled the card's halves; they do not, and that
 // guess was wrong on all thirteen arenas. The projection is ORTHOGRAPHIC -- retail parks the
@@ -932,7 +936,7 @@ static const CardRect kRectTt[13] = {
 struct Blit2D { const void* mat; float u0, v0, u1, v1; };
 using FnDraw2DUV = void (__cdecl*)(Blit2D* desc, float x0, float y0, float x1, float y1,
                                    const uint32_t* rgba);
-static const FnDraw2DUV Draw2DUV = (FnDraw2DUV)0x79260;
+#define Draw2DUV(...) GCALL(Cdecl, FnDraw2DUV, 0x79260, __VA_ARGS__)
 
 static void CardBlit(uint32_t scene, uint16_t mat, const CardRect& r,
                      float X0, float Y0, float X1, float Y1, const uint32_t* rgba) {
@@ -981,10 +985,15 @@ static void __fastcall PicRender(uint32_t self, uint32_t) {
 static uint32_t g_picVtbl[4];
 static uint8_t  g_picObj[0x68];
 static uint32_t MakeArenaPic() {
-    g_picVtbl[0] = (uint32_t)(uintptr_t)&PicNop;      // dtor -- never runs, DLL storage
-    g_picVtbl[1] = (uint32_t)(uintptr_t)&PicRender;   // what Screen::Render calls
-    g_picVtbl[2] = (uint32_t)(uintptr_t)&PicNop;      // item tick
-    g_picVtbl[3] = (uint32_t)(uintptr_t)&PicNop;
+    // Stage-5 dispatch (dispatch.h): the widget's vtable entries are guest->host
+    // boundaries — guest Screen::Render calls through them. Register and store keys
+    // (identical words on the x86 host). NOTE for the ARM sweep: g_picVtbl/g_picObj
+    // themselves are HOST statics whose addresses live in guest-walked lists — they
+    // must relocate below 4 GB with the kernel VAR exports.
+    g_picVtbl[0] = DispatchRegister(HOOK_FC(PicNop),    "lan:pic.nop");   // dtor -- never runs
+    g_picVtbl[1] = DispatchRegister(HOOK_FC(PicRender), "lan:pic.render");// Screen::Render
+    g_picVtbl[2] = g_picVtbl[0];                                          // item tick
+    g_picVtbl[3] = g_picVtbl[0];
     memset(g_picObj, 0, sizeof g_picObj);
     uint32_t it = (uint32_t)(uintptr_t)g_picObj;
     *(uint32_t*)(uintptr_t)(it + 0x00) = (uint32_t)(uintptr_t)g_picVtbl;
@@ -1617,12 +1626,12 @@ extern "C" void LanTextCapturePush(int ch) {
 
 int InstallLanUi() {
     int n = 0;
-    n += PatchJump(0x2A300, (void*)&Hk_BrowseBuild,  "lan:browse.build")  ? 1 : 0;
-    n += PatchJump(0x2A4F0, (void*)&Hk_BrowseUpdate, "lan:browse.update") ? 1 : 0;
-    n += PatchJump(0x2A020, (void*)&Hk_BrowseEnter,  "lan:browse.enter")  ? 1 : 0;
-    n += PatchJump(0x294A0, (void*)&Hk_LobbyBuild,   "lan:lobby.build")   ? 1 : 0;
-    n += PatchJump(0x29690, (void*)&Hk_LobbyUpdate,  "lan:lobby.update")  ? 1 : 0;
-    n += PatchJump(0x291A0, (void*)&Hk_LobbyEnter,   "lan:lobby.enter")   ? 1 : 0;
+    n += PatchJump(0x2A300, HOOK_FC(Hk_BrowseBuild),  "lan:browse.build")  ? 1 : 0;
+    n += PatchJump(0x2A4F0, HOOK_FC(Hk_BrowseUpdate), "lan:browse.update") ? 1 : 0;
+    n += PatchJump(0x2A020, HOOK_FC(Hk_BrowseEnter),  "lan:browse.enter")  ? 1 : 0;
+    n += PatchJump(0x294A0, HOOK_FC(Hk_LobbyBuild),   "lan:lobby.build")   ? 1 : 0;
+    n += PatchJump(0x29690, HOOK_FC(Hk_LobbyUpdate),  "lan:lobby.update")  ? 1 : 0;
+    n += PatchJump(0x291A0, HOOK_FC(Hk_LobbyEnter),   "lan:lobby.enter")   ? 1 : 0;
     for (int i = 0; i < kTextN; ++i) g_txt[i][0] = 0;
     Txt(T_TITLE5, "LAN GAME");
     printf("[lan] UI installed (%d/6 screen hooks)\n", n);

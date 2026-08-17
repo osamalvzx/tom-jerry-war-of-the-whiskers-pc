@@ -30,6 +30,7 @@
 // on this page (ids 7/8), so the paused-frame RNG census is unchanged.
 #include "hybrid/xdk_patch.h"
 #include "hybrid/net_sync.h"
+#include "hybrid/guest_call.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstdint>
@@ -51,26 +52,30 @@ using FnDraw2D     = void     (__cdecl*)(uint32_t scene, uint32_t mat, float x0,
                                          float x1, float y1, const void* rgba);
 using FnDrawText   = void     (__cdecl*)(uint32_t style, float x, float y, const char* fmt);
 
-static const FnThisU32    SetLabel   = (FnThisU32)   0x19E70;   // item+0x7A (u16 string idx)
-static const FnThisU32    SetValue   = (FnThisU32)   0x19E80;   // item value string (0x24 none)
-static const FnThisU32    SetAlign   = (FnThisU32)   0x19E90;   // item+0x70 align bitfield
-static const FnThisU32    SetScale   = (FnThisU32)   0x1A320;   // item+0x68 (raw float bits)
-static const FnThis       ItemCtor   = (FnThis)      0x1A340;   // MenuOptionItem ctor (0x84 B)
-static const FnThisU32    AppendItem = (FnThisU32)   0x1D030;   // Screen::AppendItem
-static const FnThis2      SetSelected= (FnThis2)     0x1D230;   // (item, cursor)
-static const FnThisU32    SetBusy    = (FnThisU32)   0x1DA60;   // FE_MGR transition helpers
-static const FnPageInput  IsBusy     = (FnPageInput) 0x1DA70;
-static const FnThisU32U32 InputTest  = (FnThisU32U32)0x13470;   // FE input (id, pad)
-static const FnInputTest1 PauseInput = (FnInputTest1)0x5C3E0;   // pause-badge input (id)
-static const FnThisU32    FeSfxRaw   = (FnThisU32)   0x705E0;   // frontend one-shot UI sound
-static const FnThis2      SfxPlay    = (FnThis2)     0x70780;   // in-match UI sound (handle,id)
-static const FnThis       SfxRelease = (FnThis)      0x72090;
-static const FnThis2      SoundSet   = (FnThis2)     0x6FDA0;   // (effects, music) raw bits
-static const FnSprCtor    SpriteCtor = (FnSprCtor)   0x19D50;   // textured-quad sprite (0x94 B)
-static const FnThis2      SpriteBind = (FnThis2)     0x19DC0;   // (spriteSet, nameVA)
-static const FnThis2      SpriteScale= (FnThis2)     0x19AC0;   // on sprite+0x68, raw bits
-static const FnDraw2D     Draw2D     = (FnDraw2D)    0x797B0;   // scene, mat, x0,y0,x1,y1, rgba
-static const FnDrawText   DrawText   = (FnDrawText)  0x167F0;   // style, x, y, fmt
+// Host->guest seam (guest_call.h): each name goes through GCALL at EVERY call — engine
+// mode arms only after all Install*() have run, so a static-init-time value would
+// freeze the raw native address. Native mode: the raw typed call, as shipped.
+#define SetLabel(...)    GCALL(Fastcall, FnThisU32,    0x19E70, __VA_ARGS__)  // item+0x7A (u16 string idx)
+#define SetValue(...)    GCALL(Fastcall, FnThisU32,    0x19E80, __VA_ARGS__)  // item value string (0x24 none)
+#define SetAlign(...)    GCALL(Fastcall, FnThisU32,    0x19E90, __VA_ARGS__)  // item+0x70 align bitfield
+#define SetScale(...)    GCALL(Fastcall, FnThisU32,    0x1A320, __VA_ARGS__)  // item+0x68 (raw float bits)
+#define ItemCtor(...)    GCALL(Fastcall, FnThis,       0x1A340, __VA_ARGS__)  // MenuOptionItem ctor (0x84 B)
+#define AppendItem(...)  GCALL(Fastcall, FnThisU32,    0x1D030, __VA_ARGS__)  // Screen::AppendItem
+#define SetSelected(...) GCALL(Fastcall, FnThis2,      0x1D230, __VA_ARGS__)  // (item, cursor)
+#define SetBusy(...)     GCALL(Fastcall, FnThisU32,    0x1DA60, __VA_ARGS__)  // FE_MGR transition helpers
+#define IsBusy(...)      GCALL(Fastcall, FnPageInput,  0x1DA70, __VA_ARGS__)
+#define InputTest(...)   GCALL(Fastcall, FnThisU32U32, 0x13470, __VA_ARGS__)  // FE input (id, pad)
+#define PauseInput(...)  GCALL(Fastcall, FnInputTest1, 0x5C3E0, __VA_ARGS__)  // pause-badge input (id)
+#define FeSfxRaw(...)    GCALL(Fastcall, FnThisU32,    0x705E0, __VA_ARGS__)  // frontend one-shot UI sound
+#define SfxPlay(...)     GCALL(Fastcall, FnThis2,      0x70780, __VA_ARGS__)  // in-match UI sound (handle,id)
+#define SfxRelease(...)  GCALL(Fastcall, FnThis,       0x72090, __VA_ARGS__)
+#define SoundSet(...)    GCALL(Fastcall, FnThis2,      0x6FDA0, __VA_ARGS__)  // (effects, music) raw bits
+#define SpriteCtor(...)  GCALL(Fastcall, FnSprCtor,    0x19D50, __VA_ARGS__)  // textured-quad sprite (0x94 B)
+#define SpriteBind(...)  GCALL(Fastcall, FnThis2,      0x19DC0, __VA_ARGS__)  // (spriteSet, nameVA)
+#define SpriteScale(...) GCALL(Fastcall, FnThis2,      0x19AC0, __VA_ARGS__)  // on sprite+0x68, raw bits
+#define Draw2D(...)      GCALL(Cdecl,    FnDraw2D,     0x797B0, __VA_ARGS__)  // scene, mat, x0,y0,x1,y1, rgba
+#undef  DrawText    // winuser.h's DrawTextA macro -- here the name is the game's own call
+#define DrawText(...)    GCALL(Cdecl,    FnDrawText,   0x167F0, __VA_ARGS__)  // style, x, y, fmt
 
 static const uint32_t kSprGroove = 0xEFE28;      // "SGRO"
 static const uint32_t kSprKnob   = 0xEFE20;      // "SBAR"
@@ -165,16 +170,7 @@ const char* AudioCustomText(uint16_t idx) {
 }
 
 // ---- minimal trampoline (prologue lengths hand-verified; no relative branches) ----
-static void* MakeTramp(uint32_t va, int prologueLen) {
-    uint8_t* t = (uint8_t*)VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE,
-                                        PAGE_EXECUTE_READWRITE);
-    if (!t) return nullptr;
-    memcpy(t, (const void*)(uintptr_t)va, prologueLen);
-    t[prologueLen] = 0xE9;
-    *(int32_t*)(t + prologueLen + 1) =
-        (int32_t)(va + prologueLen) - (int32_t)((uintptr_t)t + prologueLen + 5);
-    return t;
-}
+// (call-through trampolines now come from xdk_patch's guest-window pad — MakeGuestTramp)
 
 // =============================================================================
 //  FRONTEND AUDIO SCREEN -- FE id 8, 0x4C8 bytes, vtable 0xEF0CC
@@ -239,9 +235,9 @@ static float FeItemWidth(uint32_t item, float scale) {
     uint32_t holder = *(uint32_t*)(uintptr_t)(item + 0x74);
     if (!holder) return 0.0f;
     uint32_t font = *(uint32_t*)(uintptr_t)holder;
-    const char* s = ((FnGetText)0x19910)(*(uint16_t*)(uintptr_t)(item + 0x7A));
+    const char* s = GCALL(Cdecl, FnGetText, 0x19910, *(uint16_t*)(uintptr_t)(item + 0x7A));
     if (!font || !s || !*s) return 0.0f;
-    return ((FnTextWidth)0x16680)(font, s, scale);
+    return GCALL(Cdecl, FnTextWidth, 0x16680, font, s, scale);
 }
 
 // A sprite scale re-measures the bound material, so an UNBOUND sprite (+0x68 sprite-set
@@ -263,11 +259,11 @@ static void FeSelect(uint32_t self, int row) {
 }
 
 // --- Build (FUN_00028390) post-hook -----------------------------------------
-static FnThis Orig_FeBuild = nullptr;
+static uint32_t Orig_FeBuild = 0;   // guest-window trampoline VA (GCALL it)
 static void __fastcall Hk_FeBuild(uint32_t self, uint32_t edx) {
     (void)edx;
     uint32_t fe = FeMgr();
-    if (!fe) { Orig_FeBuild(self, 0); return; }
+    if (!fe) { GCALL(Fastcall, FnThis, Orig_FeBuild, self, 0); return; }
     uint32_t sprSet = fe + 0x3B8;
 
     // THE SECOND GROOVE/KNOB PAIR MUST EXIST BEFORE THE RETAIL BUILD RUNS. Retail's Build
@@ -290,7 +286,7 @@ static void __fastcall Hk_FeBuild(uint32_t self, uint32_t edx) {
     SpriteBind((uint32_t)(uintptr_t)g_feGroove2, 0, sprSet, kSprGroove);
     SpriteBind((uint32_t)(uintptr_t)g_feKnob2,   0, sprSet, kSprKnob);
 
-    Orig_FeBuild(self, 0);
+    GCALL(Fastcall, FnThis, Orig_FeBuild, self, 0);
 
     // Title.
     *(float*)(uintptr_t)(self + 0x20 + 0x44) = kFeTitleY;
@@ -498,7 +494,7 @@ static float g_pzDir[2]   = { 1.0f, 1.0f };
 static float PauseLabelScale(uint32_t hud, const char* s) {
     uint32_t font = *(uint32_t*)(uintptr_t)(hud + 0x10);
     if (!font || !s || !*s) return kPzLabelSc;
-    float w = ((FnTextWidth)0x16680)(font, s, kPzLabelSc);
+    float w = GCALL(Cdecl, FnTextWidth, 0x16680, font, s, kPzLabelSc);
     float avail = kPzLabelR - kPzLabelMinX;
     return (w > avail && w > 0.0f) ? kPzLabelSc * (avail / w) : kPzLabelSc;
 }
@@ -515,16 +511,16 @@ static void PauseSfx(uint32_t id) {
 }
 
 // --- builder (FUN_0005C1B0) post-hook: page 1 becomes three rows -------------
-static FnPageBuild Orig_PauseBuild = nullptr;
+static uint32_t Orig_PauseBuild = 0;
 static void __fastcall Hk_PauseBuild(uint32_t hud, uint32_t edx, uint32_t page) {
     (void)edx;
-    Orig_PauseBuild(hud, 0, page);
+    GCALL(Fastcall, FnPageBuild, Orig_PauseBuild, hud, 0, page);
     if ((uint8_t)page != 1) return;
-    FnGetText GetText = (FnGetText)0x19910;           // fe_menu replaced this; still cdecl(idx)
     const uint32_t kRowStr[3] = { kStrMusic, kStrEffects, kStrConfirm };
     for (int r = 0; r < 3; ++r) {
         char* dst = (char*)(uintptr_t)(hud + 0x75F + (uint32_t)r * 0x19);
-        const char* s = GetText(kRowStr[r]);
+        // 0x19910: fe_menu replaced this; still cdecl(idx)
+        const char* s = GCALL(Cdecl, FnGetText, 0x19910, kRowStr[r]);
         strncpy_s(dst, 0x19, s ? s : "", _TRUNCATE);
         *(float*)(uintptr_t)(hud + 0x7B4 + (uint32_t)r * 4) = kPzRowY[r];
         *(float*)(uintptr_t)(hud + 0x7C0 + (uint32_t)r * 4) = kPzHalfW[r];
@@ -602,7 +598,7 @@ static uint8_t __fastcall Hk_PauseAudio(uint32_t hud, uint32_t edx) {
 // the retail slider AND re-enables the selection bar (retail hides it on the slider row
 // because that row has no text); zeroing the row count for the duration suppresses the
 // centred text loop, because these rows are label-left / groove-right, not centred.
-static FnThis Orig_PauseRender = nullptr;
+static uint32_t Orig_PauseRender = 0;
 static void DrawRowText(uint32_t hud, const char* s, float x, float y, float scale, uint16_t align) {
     *(float*)(uintptr_t)(hud + 0x14)    = scale;
     *(uint16_t*)(uintptr_t)(hud + 0x1C) = align;
@@ -610,13 +606,13 @@ static void DrawRowText(uint32_t hud, const char* s, float x, float y, float sca
 }
 static void __fastcall Hk_PauseRender(uint32_t hud, uint32_t edx) {
     (void)edx;
-    if (*(uint8_t*)(uintptr_t)(hud + 0x75C) != 1) { Orig_PauseRender(hud, 0); return; }
+    if (*(uint8_t*)(uintptr_t)(hud + 0x75C) != 1) { GCALL(Fastcall, FnThis, Orig_PauseRender, hud, 0); return; }
 
     uint8_t rows = *(uint8_t*)(uintptr_t)(hud + 0x75D);
     uint16_t align0 = *(uint16_t*)(uintptr_t)(hud + 0x1C);
     *(uint8_t*)(uintptr_t)(hud + 0x75C) = 3;
     *(uint8_t*)(uintptr_t)(hud + 0x75D) = 0;
-    Orig_PauseRender(hud, 0);
+    GCALL(Fastcall, FnThis, Orig_PauseRender, hud, 0);
     *(uint8_t*)(uintptr_t)(hud + 0x75C) = 1;
     *(uint8_t*)(uintptr_t)(hud + 0x75D) = rows;
 
@@ -654,20 +650,20 @@ int InstallAudioUi() {
     //   0x28390  51 53 55 56 8B F1        push ecx/ebx/ebp/esi + mov esi,ecx      = 6
     //   0x5C1B0  8A 44 24 04 53           mov al,[esp+4] + push ebx               = 5
     //   0x5BDF0  83 EC 14 55 56           sub esp,0x14 + push ebp + push esi      = 5
-    Orig_FeBuild     = (FnThis)     MakeTramp(0x28390, 6);
-    Orig_PauseBuild  = (FnPageBuild)MakeTramp(0x5C1B0, 5);
-    Orig_PauseRender = (FnThis)     MakeTramp(0x5BDF0, 5);
+    Orig_FeBuild     = MakeGuestTramp(0x28390, 6, "aud:tr.febuild");
+    Orig_PauseBuild  = MakeGuestTramp(0x5C1B0, 5, "aud:tr.pausebuild");
+    Orig_PauseRender = MakeGuestTramp(0x5BDF0, 5, "aud:tr.pauserender");
     if (!Orig_FeBuild || !Orig_PauseBuild || !Orig_PauseRender) {
         printf("[aud] trampoline alloc failed -- audio sliders skipped\n");
         return 0;
     }
     int n = 0;
-    n += PatchJump(0x28390, (void*)&Hk_FeBuild,     "AUD_FeBuild");
-    n += PatchJump(0x281F0, (void*)&Hk_FeEnter,     "AUD_FeEnter");
-    n += PatchJump(0x28650, (void*)&Hk_FeUpdate,    "AUD_FeUpdate");
-    n += PatchJump(0x5C1B0, (void*)&Hk_PauseBuild,  "AUD_PauseBuild");
-    n += PatchJump(0x5C450, (void*)&Hk_PauseAudio,  "AUD_PauseAudio");
-    n += PatchJump(0x5BDF0, (void*)&Hk_PauseRender, "AUD_PauseRender");
+    n += PatchJump(0x28390, HOOK_FC(Hk_FeBuild),     "AUD_FeBuild");
+    n += PatchJump(0x281F0, HOOK_FC(Hk_FeEnter),     "AUD_FeEnter");
+    n += PatchJump(0x28650, HOOK_FC(Hk_FeUpdate),    "AUD_FeUpdate");
+    n += PatchJump(0x5C1B0, HOOK_FC(Hk_PauseBuild),  "AUD_PauseBuild");
+    n += PatchJump(0x5C450, HOOK_FC(Hk_PauseAudio),  "AUD_PauseAudio");
+    n += PatchJump(0x5BDF0, HOOK_FC(Hk_PauseRender), "AUD_PauseRender");
     printf("[aud] two independent audio sliders installed (%d patches)\n", n);
     return n;
 }
