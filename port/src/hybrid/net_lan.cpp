@@ -30,16 +30,90 @@
 #include "hybrid/meat_rush.h"
 #include "net_sync.h"
 
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#else
+// POSIX/Android (Stage 7): the same transport over BSD sockets. Every packet is built from
+// the same #pragma pack(1) structs and the same protocol constants, so the WIRE BYTES are
+// identical to the Windows build -- an Android peer and a PC peer speak the same protocol 6.
+#include "hybrid/host_compat.h"      // the Win32 subset (CreateFileA, GetTickCount, *_s CRT)
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <strings.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
 #include <cmath>
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
+#else
+// ---------------------------------------------------------------- winsock -> BSD shims
+// Local by design (host_compat.h stays socket-free): exactly the Winsock surface this file
+// uses, mapped 1:1 so the call sites below compile unchanged. Nothing here can change a
+// wire byte.
+typedef int SOCKET;
+static const SOCKET INVALID_SOCKET = -1;
+static inline int closesocket(SOCKET s) { return ::close(s); }
+static inline int WSAGetLastError() { return errno; }
+// Only ever called with FIONBIO; BSD spells that fcntl(O_NONBLOCK).
+static inline int ioctlsocket(SOCKET s, long /*cmd == FIONBIO*/, u_long* enable) {
+    int fl = ::fcntl(s, F_GETFL, 0);
+    if (fl < 0) return -1;
+    return ::fcntl(s, F_SETFL, *enable ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
+}
+// host_compat.h carries the INT reader the settings screens use; the LAN player name needs
+// the STRING reader. Parses the same [section] key=value shape host_compat.cpp's
+// WritePrivateProfileStringA writes (section/key case-insensitive, value trimmed).
+static DWORD GetPrivateProfileStringA(const char* section, const char* key, const char* def,
+                                      char* out, DWORD cap, const char* path) {
+    if (!out || !cap) return 0;
+    strncpy_s(out, cap, def ? def : "", _TRUNCATE);
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "r") != 0 || !f) return (DWORD)strlen(out);
+    char line[512];
+    bool inSec = false;
+    while (fgets(line, sizeof line, f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '[') {
+            char* e = strchr(p, ']');
+            inSec = e && (size_t)(e - p - 1) == strlen(section) &&
+                    strncasecmp(p + 1, section, (size_t)(e - p - 1)) == 0;
+            continue;
+        }
+        if (!inSec) continue;
+        char* eq = strchr(p, '=');
+        if (!eq) continue;
+        size_t kl = (size_t)(eq - p);
+        while (kl && (p[kl - 1] == ' ' || p[kl - 1] == '\t')) --kl;
+        if (kl != strlen(key) || strncasecmp(p, key, kl) != 0) continue;
+        char* v = eq + 1;
+        while (*v == ' ' || *v == '\t') ++v;
+        size_t vl = strlen(v);
+        while (vl && (v[vl - 1] == '\n' || v[vl - 1] == '\r' || v[vl - 1] == ' ')) --vl;
+        if (vl >= cap) vl = cap - 1;
+        memcpy(out, v, vl);
+        out[vl] = 0;
+        break;
+    }
+    fclose(f);
+    return (DWORD)strlen(out);
+}
+#endif
 
 namespace tj::hybrid {
 
@@ -129,7 +203,9 @@ struct PktBye   { Hdr h; uint32_t sessionId; uint8_t slot, reason, rsv[2]; };
 // ---------------------------------------------------------------- state
 static SOCKET   g_sock = INVALID_SOCKET;
 static int      g_port = 0;
+#ifdef _WIN32
 static bool     g_wsaUp = false;
+#endif
 
 static bool     g_armed = false;             // lockstep running
 static bool     g_isHost = false;
@@ -413,6 +489,7 @@ static void RefreshBroadcastList() {
     if (g_bcastN && now - g_bcastAt < 10000) return;
     g_bcastAt = now;
     g_bcastN = 0;
+#ifdef _WIN32
     INTERFACE_INFO info[16]; DWORD got = 0;
     if (WSAIoctl(g_sock, SIO_GET_INTERFACE_LIST, nullptr, 0, info, sizeof info, &got,
                  nullptr, nullptr) == 0) {
@@ -425,6 +502,23 @@ static void RefreshBroadcastList() {
             g_bcast[g_bcastN++] = (a & m) | ~m;
         }
     }
+#else
+    // getifaddrs is the BSD spelling of SIO_GET_INTERFACE_LIST: same filter (up, not
+    // loopback, has an IPv4 address + mask), same directed-broadcast arithmetic.
+    ifaddrs* list = nullptr;
+    if (getifaddrs(&list) == 0) {
+        for (ifaddrs* it = list; it && g_bcastN < 8; it = it->ifa_next) {
+            if (!it->ifa_addr || it->ifa_addr->sa_family != AF_INET || !it->ifa_netmask)
+                continue;
+            if (!(it->ifa_flags & IFF_UP) || (it->ifa_flags & IFF_LOOPBACK)) continue;
+            uint32_t a = ((const sockaddr_in*)(const void*)it->ifa_addr)->sin_addr.s_addr;
+            uint32_t m = ((const sockaddr_in*)(const void*)it->ifa_netmask)->sin_addr.s_addr;
+            if (!a || !m) continue;
+            g_bcast[g_bcastN++] = (a & m) | ~m;
+        }
+        freeifaddrs(list);
+    }
+#endif
     static int announced = 0;
     if (!announced++) {
         printf("[lan] broadcasting on %d subnet(s):", g_bcastN);
@@ -501,22 +595,28 @@ bool NetArmed() { return g_armed; }
 // ---------------------------------------------------------------- socket
 static bool OpenSocket() {
     if (g_sock != INVALID_SOCKET) return true;
+#ifdef _WIN32
     if (!g_wsaUp) {
         WSADATA wsa;
         if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Status("WINSOCK FAILED"); return false; }
         g_wsaUp = true;
     }
+#endif
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_sock == INVALID_SOCKET) { Status("SOCKET FAILED (%d)", WSAGetLastError()); return false; }
     u_long nb = 1; ioctlsocket(g_sock, FIONBIO, &nb);
     BOOL yes = TRUE;
     setsockopt(g_sock, SOL_SOCKET, SO_BROADCAST, (const char*)&yes, sizeof yes);
+#ifdef _WIN32
     // A UDP peer that receives an ICMP port-unreachable (nobody listening on one of the
     // swept broadcast ports) otherwise gets WSAECONNRESET on the NEXT recvfrom and looks
     // like a dead socket.
     DWORD off = 0; DWORD ret = 0;
     WSAIoctl(g_sock, _WSAIOW(IOC_VENDOR, 12) /*SIO_UDP_CONNRESET*/, &off, sizeof off,
              nullptr, 0, &ret, nullptr, nullptr);
+#endif
+    // (No POSIX half: Linux only surfaces ICMP unreachables on CONNECTED sockets, and this
+    // socket never connect()s -- the failure mode SIO_UDP_CONNRESET disables cannot occur.)
 
     for (int i = 0; i < kPortSpan; ++i) {
         sockaddr_in me{}; me.sin_family = AF_INET;
@@ -954,7 +1054,11 @@ static void PumpRecv() {
     if (g_sock == INVALID_SOCKET) return;
     uint8_t buf[1024];
     for (int guard = 0; guard < 512; ++guard) {
+#ifdef _WIN32
         sockaddr_in from{}; int flen = sizeof from;
+#else
+        sockaddr_in from{}; socklen_t flen = sizeof from;
+#endif
         int r = recvfrom(g_sock, (char*)buf, sizeof buf, 0, (sockaddr*)&from, &flen);
         if (r <= 0) break;
         if (r < (int)sizeof(Hdr)) continue;
@@ -1283,10 +1387,19 @@ const char* LanNakText() {
 }
 const char* LanGetName() { return g_myName; }
 
+#ifndef _WIN32
+const char* UserDataDir();           // file_io.cpp -- the writable settings/save dir
+#endif
 static void IniPathLan(char* buf, size_t n) {
+#ifdef _WIN32
     GetModuleFileNameA(nullptr, buf, (DWORD)n);
     char* s = strrchr(buf, '\\'); if (s) s[1] = 0;
     strcat_s(buf, n, "tomjerry.ini");
+#else
+    // The exe dir is Android's read-only native-lib dir, so the name lives in the same
+    // tomjerry.ini every other settings screen uses (audio_ui/fe_menu: UserDataDir()).
+    _snprintf_s(buf, n, _TRUNCATE, "%s\\tomjerry.ini", UserDataDir());
+#endif
 }
 void LanSetName(const char* name) {
     SanitizeName(g_myName, sizeof g_myName, name);
@@ -1317,7 +1430,12 @@ static void LoadName() {
     char v[32] = "";
     GetPrivateProfileStringA("Player", "Name", "", v, sizeof v, ini);
     if (!v[0]) {
+#ifdef _WIN32
         DWORD n = sizeof v; GetComputerNameA(v, &n);
+#else
+        if (gethostname(v, sizeof v) == 0) v[sizeof v - 1] = 0;
+        else v[0] = 0;                       // SanitizeName falls back to "PLAYER"
+#endif
     }
     SanitizeName(g_myName, sizeof g_myName, v);
 }

@@ -91,7 +91,6 @@ set(HYB_GAME_SRC
     ${HYB}/startup.cpp
     ${HYB}/engine_mode.cpp
     ${HYB}/net_sync.cpp
-    ${HYB}/net_lan_null.cpp
     ${HYB}/lan_match.cpp
     ${HYB}/lan_ui.cpp
     ${HYB}/fe_menu.cpp
@@ -109,6 +108,7 @@ add_executable(tj_headless
     ${HYB}/headless_main.cpp
     ${RT}/gfx/null_gfx.cpp
     ${RT}/snd/null_snd.cpp
+    ${HYB}/net_lan_null.cpp
     ${HYB_GAME_SRC})
 target_include_directories(tj_headless PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # DYNAMIC PIE, deliberately — the shape PROVEN on the device (eng_call_smoke): Android
@@ -149,6 +149,7 @@ add_executable(tjgame
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/android/game_main.cpp
     ${RT}/gfx/ipc_gfx.cpp
     ${RT}/snd/mix_snd.cpp
+    ${HYB}/net_lan.cpp
     ${HYB_GAME_SRC})
 set_target_properties(tjgame PROPERTIES OUTPUT_NAME "libtjgame.so" SUFFIX "")
 target_include_directories(tjgame PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
@@ -168,3 +169,29 @@ target_link_libraries(tjapp PRIVATE GLESv3 EGL android log aaudio)
 # native_app_glue provides ANativeActivity_onCreate; the linker must keep it (nothing in the
 # .so references it directly — the framework loads it by name).
 target_link_options(tjapp PRIVATE -u ANativeActivity_onCreate)
+
+# =====================================================================================
+# DIAGNOSTIC RIG (session 29, MEAT-HUD-missing investigation) — NOT shipped in the APK.
+#
+# tjgame_static: the game SUBPROCESS (game_main.cpp + ipc_gfx.cpp — the exact tjgame
+# sources) in the qemu-runnable shape: static (qemu-user can't load bionic's dynamic
+# linker) with the image based at 0xF0000000 — the same relationship tj_headless_static
+# has to tj_headless (see that target's comment for why a plain -static base of 0x200000
+# would sit INSIDE the guest window). Run under qemu-aarch64-static -B 0x2000000000 with
+# TJ_MMAP_TRUST_FIXED=1, spawned by ipc_replay_host below.
+add_executable(tjgame_static $<TARGET_PROPERTY:tjgame,SOURCES>)
+target_include_directories(tjgame_static PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_options(tjgame_static PRIVATE -static "-Wl,--image-base=0xF0000000")
+target_link_libraries(tjgame_static PRIVATE tj_engine tj_softfloat)
+
+# ipc_replay_host: the "fake app" — creates the shared region exactly like
+# native_main.cpp, fork/execs the game (tjgame_static through its own qemu), consumes
+# the ring exactly like native_main's ReplayRing, but replays into the NULL recorder
+# (null_gfx.cpp) whose TJ_DRAWLOG lines are directly comparable to a tj_headless_static
+# reference run. Links the harness + null_gfx ONLY — no hybrid layer, no engine. Static
+# so the same qemu runs it (no -B needed; it maps nothing fixed).
+add_executable(ipc_replay_host
+    ${CMAKE_CURRENT_SOURCE_DIR}/../tests/ipc_replay_host.cpp
+    ${RT}/gfx/null_gfx.cpp)
+target_include_directories(ipc_replay_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_options(ipc_replay_host PRIVATE -static)

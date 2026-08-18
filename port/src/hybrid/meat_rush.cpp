@@ -123,6 +123,12 @@ static const uint32_t kHudText     = 0x167F0;    // __cdecl(ctx, float x, float 
 static const uint32_t kPanelRect   = 0x5A900;    // __cdecl(float out[6], u8 elem, u8 playerIdx)
 static const uint32_t kHudClockCS  = 0x5E976;    // `call 0x5BC30` -- once per in-match frame
 static const uint32_t kHudClock    = 0x5BC30;    // __thiscall(HUD), no args
+// The in-match HUD renderer (FUN_0005e8a0) FORKS on layout: per-PLAYER panels (free-for-
+// all; the path kHudClockCS covers) vs per-TEAM panels (any non-FFA layout -- 1v1 vs CPU
+// included), which draws its clock through a SEPARATE call site. Session-29 diagnosis:
+// only path A was patched, so offline 1v1 MEAT RUSH showed no scores on ANY platform.
+static const uint32_t kHudClockBCS = 0x5EA23;    // path B: `call 0x5E6E0`
+static const uint32_t kHudClockB   = 0x5E6E0;    // same shape: __fastcall(HUD)
 // Health bars: one function in the per-fighter layout the quick-game/LAN flow uses, three in
 // the per-team layout.  Blanked to `ret 4` while the mode is on.
 static const uint32_t kHealthBars[4] = { 0x5B090, 0x5D600, 0x5D1F0, 0x5DA40 };
@@ -557,8 +563,9 @@ static void BlankHealthBars(bool on) {
     g_barsBlanked = on ? 1 : 0;
 }
 
-static void __fastcall Hk_HudClock(uint32_t hud, uint32_t edx) {
-    GCALL(Fastcall, FnHudClock, kHudClock, hud, edx);
+// The per-fighter score text, shared by BOTH HUD-layout paths (panel rects come from the
+// player's own panel either way -- kPanelRect is per-player, not per-path).
+static void DrawMeatScores(uint32_t hud) {
     if (!g_applied) return;
     uint32_t m = Master();
     if (!m || m < 0x04000000u || m >= 0x10000000u) return;
@@ -588,6 +595,16 @@ static void __fastcall Hk_HudClock(uint32_t hud, uint32_t edx) {
         // bottom edges, so anchoring off r[3] keeps the gap correct at any resolution.
         GCALL(Cdecl, FnHudText, kHudText, hud + 0x10, (r[0] + r[1]) * 0.5f, r[3] + 0.075f, buf);
     }
+}
+
+static void __fastcall Hk_HudClock(uint32_t hud, uint32_t edx) {
+    GCALL(Fastcall, FnHudClock, kHudClock, hud, edx);
+    DrawMeatScores(hud);
+}
+// Path B (per-TEAM panels): the layout every offline 1v1 takes. Same shape, own clock fn.
+static void __fastcall Hk_HudClockB(uint32_t hud, uint32_t edx) {
+    GCALL(Fastcall, FnHudClock, kHudClockB, hud, edx);
+    DrawMeatScores(hud);
 }
 
 // ---- install -----------------------------------------------------------------
@@ -626,6 +643,7 @@ int InstallMeatRush() {
     if (PatchCallSite(kTryTakeCS,   HOOK_FC(Hk_TryTake),    "meat: pickup (anim event)")) ++ok;
     if (PatchCallSite(kTakeEatCS,   HOOK_FC(Hk_TakeEat),    "meat: pickup (contact)")) ++ok;
     if (PatchCallSite(kHudClockCS,  HOOK_FC(Hk_HudClock),   "meat: score HUD")) ++ok;
+    if (PatchCallSite(kHudClockBCS, HOOK_FC(Hk_HudClockB),  "meat: score HUD (team layout)")) ++ok;
     for (int i = 0; i < 3; ++i)
         if (PatchCallSite(kSmashCS[i], HOOK_FC(Hk_SmashItem), "meat: keep meat on a hit")) ++ok;
 
@@ -637,7 +655,7 @@ int InstallMeatRush() {
         printf("[meat] WARNING: 0x%05X is not the `cmp bl,1` immediate\n", kCapImm);
 
     uint32_t tmpl = FindKitchenMeatClass();
-    printf("[meat] installed (%d/8 hooks), template class %08X, target %u\n",
+    printf("[meat] installed (%d/9 hooks), template class %08X, target %u\n",
            ok, tmpl, g_maxMeat);
     return ok == 5 ? 0 : 1;
 }
