@@ -3,11 +3,14 @@
 # zipalign + apksigner (debug keystore). Produces a signed, installable debug APK.
 #
 #   port/tools/build_apk.ps1                 build + package -> port/build-apk/WOTW.apk
-#   port/tools/build_apk.ps1 -Install        also `adb install -r` it
+#   port/tools/build_apk.ps1 -Install        also `adb install -r` it + push game assets
+#   port/tools/build_apk.ps1 -Install -SkipAssets   re-install without re-pushing assets
 #   port/tools/build_apk.ps1 -Adb ip:port    connect wireless adb first, then (with -Install)
 #
-# Output: port/build-apk/WOTW.apk
-param([switch]$Install, [string]$Adb = "", [switch]$SkipNative)
+# Output: port/build-apk/WOTW.apk. With -Install, the game data in extracted/ is pushed to
+# the app's external files dir (/sdcard/Android/data/com.wotw.port/files/extracted) — the
+# stand-in until the SAF ISO picker + on-device extraction land.
+param([switch]$Install, [string]$Adb = "", [switch]$SkipNative, [switch]$SkipAssets)
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path (Split-Path $PSScriptRoot)          # port/tools -> project root
@@ -69,9 +72,19 @@ Write-Host "== verifying =="
 & $aapt2 dump badging "$build\WOTW.apk" | Select-String "package:|application-label:|native-code|sdkVersion|uses-feature"
 Write-Host "APK: $build\WOTW.apk"
 
-# 5) optional install -----------------------------------------------------------------------
+# 5) optional install + game assets ---------------------------------------------------------
 if ($Install) {
     $adbExe = "$sdk\platform-tools\adb.exe"
     if ($Adb -ne "") { & $adbExe connect $Adb }
     & $adbExe install -r "$build\WOTW.apk"
+    if (-not $SkipAssets) {
+        # Push the game data to the app's external files dir. Stand-in for the SAF picker +
+        # on-device extraction (still no disc data in the APK — this is the user's own copy).
+        $extDir = "/sdcard/Android/data/com.wotw.port/files"
+        Write-Host "== pushing game assets to $extDir/extracted (~223 MB) =="
+        & $adbExe shell mkdir -p "$extDir"
+        & $adbExe push "$root\extracted" "$extDir/extracted"
+    }
+    Write-Host "launching..."
+    & $adbExe shell am start -n com.wotw.port/android.app.NativeActivity
 }

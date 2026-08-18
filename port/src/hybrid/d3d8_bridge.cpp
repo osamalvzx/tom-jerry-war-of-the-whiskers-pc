@@ -34,6 +34,13 @@ static tj::gfx::Device g_dev;
 static bool        g_devReady = false;
 static void        StartInputThread();   // defined with the input bridge below
 
+#ifndef _WIN32
+// The Android app hands us the ANativeWindow before boot; EnsureDisplay passes it to the
+// GLES3 Device (owns EGL). Null on the qemu/headless leg -> the null recorder device.
+static void* g_platformWindow = nullptr;
+void SetPlatformWindow(void* w) { g_platformWindow = w; }
+#endif
+
 // Display mode: 0 = windowed, 1 = borderless (window covers the monitor, DXGI
 // stretches the fixed-size backbuffer), 2 = exclusive DXGI fullscreen (real mode
 // switch to the game resolution). DXGI's own Alt+Enter handling is disabled at device
@@ -119,11 +126,14 @@ bool EnsureDisplay(int width, int height, int sampleCount) {
     (void)sampleCount;
     StartInputThread();     // initializes the pad lock (no poll thread headless)
     tj::gfx::PresentParams hp;
-    hp.backWidth = width; hp.backHeight = height; hp.vsync = false; hp.sampleCount = 1;
-    if (!g_dev.Create(nullptr, hp)) { printf("[d3d8] null Device::Create failed\n"); return false; }
+    hp.backWidth = width; hp.backHeight = height; hp.vsync = true; hp.sampleCount = 1;
+    // g_platformWindow: the ANativeWindow on Android (real GLES3 device); null on the
+    // qemu/headless leg (the null recorder). Same call, backend chosen by which gfx TU links.
+    if (!g_dev.Create(reinterpret_cast<HWND>(g_platformWindow), hp)) {
+        printf("[d3d8] Device::Create failed (window=%p)\n", g_platformWindow); return false; }
     SetBackbufferSize(width, height);
     g_devReady = true;
-    printf("[d3d8] headless display ready: %dx%d (null recorder)\n", width, height);
+    printf("[d3d8] display ready: %dx%d (window=%p)\n", width, height, g_platformWindow);
     return true;
 #else
     StartInputThread();     // pristine-process moment: XInput must lazily init NOW
@@ -2049,7 +2059,43 @@ static void ParseInputScript() {
     free(e);
 }
 #ifndef _WIN32
-static void MergeKeyboard(tj::input::XboxGamepad&) {}   // headless: script only
+// Android input feeds PORT 0 ONLY (the touch-overlay rule: never let one input source drive
+// all four fighters). native_main translates gamepad/touch events into AndroidSetPad; the
+// game reads it here, merged exactly like the Windows keyboard path. On the qemu/headless leg
+// AndroidSetPad is never called, so g_androidActive stays false and this is a no-op (script
+// only), keeping the S5c determinism legs untouched.
+static CRITICAL_SECTION g_androidPadLock;
+static bool g_androidPadInit = false;
+static bool g_androidActive = false;
+static tj::input::XboxGamepad g_androidPad{};
+static void AndroidPadEnsureInit() {
+    if (!g_androidPadInit) { InitializeCriticalSection(&g_androidPadLock); g_androidPadInit = true; }
+}
+extern "C" void AndroidSetPad(uint16_t buttons, const uint8_t* analog8,
+                              int16_t lx, int16_t ly, int16_t rx, int16_t ry) {
+    AndroidPadEnsureInit();
+    EnterCriticalSection(&g_androidPadLock);
+    g_androidActive = true;
+    g_androidPad.wButtons = buttons;
+    if (analog8) memcpy(g_androidPad.bAnalogButtons, analog8, 8);
+    g_androidPad.sThumbLX = lx; g_androidPad.sThumbLY = ly;
+    g_androidPad.sThumbRX = rx; g_androidPad.sThumbRY = ry;
+    LeaveCriticalSection(&g_androidPadLock);
+}
+static void MergeKeyboard(tj::input::XboxGamepad& gp) {
+    if (!g_androidActive) return;               // qemu/headless: never activated -> script only
+    AndroidPadEnsureInit();
+    EnterCriticalSection(&g_androidPadLock);
+    gp.wButtons |= g_androidPad.wButtons;
+    for (int i = 0; i < 8; ++i)
+        if (g_androidPad.bAnalogButtons[i] > gp.bAnalogButtons[i])
+            gp.bAnalogButtons[i] = g_androidPad.bAnalogButtons[i];
+    if (g_androidPad.sThumbLX) gp.sThumbLX = g_androidPad.sThumbLX;
+    if (g_androidPad.sThumbLY) gp.sThumbLY = g_androidPad.sThumbLY;
+    if (g_androidPad.sThumbRX) gp.sThumbRX = g_androidPad.sThumbRX;
+    if (g_androidPad.sThumbRY) gp.sThumbRY = g_androidPad.sThumbRY;
+    LeaveCriticalSection(&g_androidPadLock);
+}
 #else
 static bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 static void MergeKeyboard(tj::input::XboxGamepad& gp) {

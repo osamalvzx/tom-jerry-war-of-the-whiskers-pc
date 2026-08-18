@@ -72,9 +72,13 @@ target_link_libraries(eng_call_smoke PRIVATE tj_engine tj_softfloat)
 # Windows EXACT leg is Gate S5c; TJ_DRAWLOG streams are Gate S5d.
 set(HYB ${CMAKE_CURRENT_SOURCE_DIR}/../src/hybrid)
 set(RT  ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime)
-add_executable(tj_headless
-    ${HYB}/headless_main.cpp
+# The whole hybrid game layer + game bring-up, SHARED by the headless binary and the Android
+# app. The two differ only in the ENTRY (headless_main vs android/native_main), the GFX
+# BACKEND (null_gfx recorder vs gles_gfx), and (app only) native_app_glue. Everything else —
+# including hybrid_boot.cpp, the boot sequence Gate S5c proved — is identical.
+set(HYB_GAME_SRC
     ${HYB}/host_compat.cpp
+    ${HYB}/hybrid_boot.cpp
     ${HYB}/dispatch.cpp
     ${HYB}/xdk_patch.cpp
     ${HYB}/kernel.cpp
@@ -98,11 +102,14 @@ add_executable(tj_headless
     ${HYB}/dsound_bridge.cpp
     ${HYB}/d3d8_bridge.cpp
     ${HYB}/prof.cpp
-    ${RT}/gfx/null_gfx.cpp
     ${RT}/snd/null_snd.cpp
     ${RT}/snd/xadpcm.cpp
     ${RT}/snd/wav_dump.cpp
     ${RT}/assets/xmf_texture.cpp)
+add_executable(tj_headless
+    ${HYB}/headless_main.cpp
+    ${RT}/gfx/null_gfx.cpp
+    ${HYB_GAME_SRC})
 target_include_directories(tj_headless PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # DYNAMIC PIE, deliberately — the shape PROVEN on the device (eng_call_smoke): Android
 # loads PIE high, far above the guest window, and the kernel honors
@@ -129,18 +136,19 @@ add_library(tj_gles STATIC ${RT}/gfx/gles_gfx.cpp)
 target_include_directories(tj_gles PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(tj_gles PRIVATE GLESv3 EGL android)
 
-# --- Stage 6: libtjapp.so — the APK's native activity. FIRST MILESTONE: NativeActivity +
-# the GLES3 backend presenting an animated clear on the device surface (proves EGL/GLES3 on
-# hardware + the whole scripted APK pipeline). The game loop / SAF / audio / input wire in
-# on top of this. Packaged by port/tools/build_apk.ps1.
+# --- Stage 6: libtjapp.so — THE GAME ON THE PHONE. The full hybrid game layer (HYB_GAME_SRC,
+# the exact code Gate S5c proved) + the GLES3 backend (gles_gfx) + the Android entry
+# (native_main: game boot thread + gamepad/touch input on port 0). Packaged by
+# port/tools/build_apk.ps1. Renders the real game to the device surface.
 add_library(tjapp SHARED
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/android/native_main.cpp
     ${RT}/gfx/gles_gfx.cpp
+    ${HYB_GAME_SRC}
     ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
 target_include_directories(tjapp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
     ${ANDROID_NDK}/sources/android/native_app_glue)
-target_link_libraries(tjapp PRIVATE GLESv3 EGL android log)
+target_link_libraries(tjapp PRIVATE tj_engine tj_softfloat GLESv3 EGL android log)
 # native_app_glue provides ANativeActivity_onCreate; the linker must keep it (nothing in the
 # .so references it directly — the framework loads it by name).
 target_link_options(tjapp PRIVATE -u ANativeActivity_onCreate)
