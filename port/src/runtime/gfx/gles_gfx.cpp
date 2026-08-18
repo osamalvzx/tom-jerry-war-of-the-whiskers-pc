@@ -39,10 +39,11 @@ namespace {
 // mul(float4(pos,1), gWVP) on a row_major matrix. `p.z = 2p.z - p.w` maps D3D depth to GL.
 const char* kColorVS = R"(#version 300 es
 uniform mat4 gWVP;
+uniform int gFlip;
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec4 aCol;
 out vec4 vCol;
-void main(){ vec4 p = vec4(aPos,1.0) * gWVP; p.z = 2.0*p.z - p.w; gl_Position = p; vCol = aCol.bgra; })";
+void main(){ vec4 p = vec4(aPos,1.0) * gWVP; p.z = 2.0*p.z - p.w; if (gFlip != 0) p.y = -p.y; gl_Position = p; vCol = aCol.bgra; })";
 const char* kColorFS = R"(#version 300 es
 precision highp float;
 in vec4 vCol; out vec4 oCol;
@@ -50,11 +51,12 @@ void main(){ oCol = vCol; })";
 
 const char* kTexVS = R"(#version 300 es
 uniform mat4 gWVP;
+uniform int gFlip;
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec2 aUV;
 layout(location=2) in vec4 aCol;
 out vec2 vUV; out vec4 vCol;
-void main(){ vec4 p = vec4(aPos,1.0) * gWVP; p.z = 2.0*p.z - p.w; gl_Position = p; vUV = aUV; vCol = aCol.bgra; })";
+void main(){ vec4 p = vec4(aPos,1.0) * gWVP; p.z = 2.0*p.z - p.w; if (gFlip != 0) p.y = -p.y; gl_Position = p; vUV = aUV; vCol = aCol.bgra; })";
 const char* kTexFS = R"(#version 300 es
 precision highp float;
 uniform sampler2D gTex;
@@ -65,12 +67,13 @@ void main(){ oCol = texture(gTex, vUV) * vCol; })";
 //   rgb = t0(uv0)*vcol + t2(uv1)*t1(uv0) + t3(uv1)*t1(uv0)*0.5 ,  a = t0.a*vcol.a
 const char* kShinyVS = R"(#version 300 es
 uniform mat4 gWVP;
+uniform int gFlip;
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec2 aUV0;
 layout(location=2) in vec2 aUV1;
 layout(location=3) in vec4 aCol;
 out vec2 vUV0; out vec2 vUV1; out vec4 vCol;
-void main(){ vec4 p = vec4(aPos,1.0) * gWVP; p.z = 2.0*p.z - p.w; gl_Position = p; vUV0=aUV0; vUV1=aUV1; vCol=aCol.bgra; })";
+void main(){ vec4 p = vec4(aPos,1.0) * gWVP; p.z = 2.0*p.z - p.w; if (gFlip != 0) p.y = -p.y; gl_Position = p; vUV0=aUV0; vUV1=aUV1; vCol=aCol.bgra; })";
 const char* kShinyFS = R"(#version 300 es
 precision highp float;
 uniform sampler2D gT0, gT1, gT2, gT3;
@@ -105,10 +108,14 @@ GLuint Link(const char* vs, const char* fs) {
 
 // The app sets the real display size once (no in-game resolution menu on Android).
 int g_dispW = 1280, g_dispH = 720;
+// The game's render size (16:9-clamped by the app). When set, backbuffer rendering is
+// confined to a centered present rect of this size — pillarboxed on wider panels.
+int g_gameW = 0, g_gameH = 0;
 
 } // namespace
 
 void SetAndroidDisplaySize(int w, int h) { if (w > 0 && h > 0) { g_dispW = w; g_dispH = h; } }
+void GlesSetGameSize(int w, int h) { if (w > 0 && h > 0) { g_gameW = w; g_gameH = h; } }
 
 int EnumDisplayModes(DisplayMode* out, int maxOut) {
     if (out && maxOut >= 1) out[0] = { g_dispW, g_dispH, 60 };
@@ -122,11 +129,21 @@ struct Device::Impl {
     EGLDisplay dpy = EGL_NO_DISPLAY;
     EGLContext ctx = EGL_NO_CONTEXT;
     EGLSurface surf = EGL_NO_SURFACE;
+    EGLConfig  cfg = nullptr;          // kept for window-surface recreation (app lifecycle)
     bool vsync = true;
     int  w = 0, h = 0;
     // Programs + uniform locations
-    struct Prog { GLuint id = 0; GLint uWVP = -1; } color, tex, shiny;
+    struct Prog { GLuint id = 0; GLint uWVP = -1; GLint uFlip = -1; } color, tex, shiny;
     GLint shinyT[4] = { -1, -1, -1, -1 };
+    // gFlip: 1 while rendering into an FBO (D3D top-origin sampling vs GL bottom-up FBOs).
+    int flip = 0;
+    // Present rect: the game's 16:9 image centered in the (possibly wider) surface —
+    // pillarboxed. Zero prW = disabled (viewport covers the surface, Windows-free path).
+    int prX = 0, prY = 0, prW = 0, prH = 0;
+    void BackbufferViewport() {
+        if (prW > 0) glViewport(prX, prY, prW, prH);
+        else glViewport(0, 0, w, h);
+    }
     // Dynamic geometry (per-draw orphaned STREAM buffers — the d3d8.cpp ring is a later
     // perf optimization; correctness first).
     GLuint vao = 0, vbo = 0, ibo = 0;
@@ -148,6 +165,7 @@ struct Device::Impl {
     void ApplyWVP(const Prog& pr) {
         glUseProgram(pr.id);
         glUniformMatrix4fv(pr.uWVP, 1, GL_TRUE, wvp);   // GL_TRUE: row-major → D3D mul(v,M)
+        glUniform1i(pr.uFlip, flip);
     }
     GLuint TexId(TextureHandle t) {
         return (t >= 0 && t < (int)texs.size() && texs[t].id) ? texs[t].id : whiteTex;
@@ -194,7 +212,23 @@ static void ReuploadAssetTexture(GLuint id, const uint32_t* rgba, int w, int h, 
     if (genMips) glGenerateMipmap(GL_TEXTURE_2D);
 }
 
+// Surface-handoff mirror (app lifecycle): pointers into the app's single Impl, captured in
+// Create (member context — Impl is private, so free functions can't name it). See the
+// GlesRelease/AttachWindowSurface functions at the bottom of this file.
+static struct {
+    EGLDisplay dpy = EGL_NO_DISPLAY;
+    EGLContext ctx = EGL_NO_CONTEXT;
+    EGLConfig  cfg = nullptr;
+    EGLSurface* surf = nullptr;
+    bool vsync = true;
+    int* w = nullptr; int* h = nullptr;
+    int* prX = nullptr; int* prY = nullptr; int* prW = nullptr; int* prH = nullptr;
+} g_appEgl;
+
 bool Device::Create(HWND hwnd, const PresentParams& pp) {
+    // The app retries Create on transient failures — every failure path MUST tear down the
+    // half-built Impl (and its EGL objects) or the retry loop leaks a context per attempt.
+    if (p_) Shutdown();
     p_ = new Impl();
     p_->vsync = pp.vsync;
     memset(p_->wvp, 0, sizeof p_->wvp);
@@ -202,8 +236,8 @@ bool Device::Create(HWND hwnd, const PresentParams& pp) {
 
     ANativeWindow* win = reinterpret_cast<ANativeWindow*>(hwnd);
     p_->dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    if (p_->dpy == EGL_NO_DISPLAY) { printf("[gles] no EGL display\n"); return false; }
-    if (!eglInitialize(p_->dpy, nullptr, nullptr)) { printf("[gles] eglInitialize failed\n"); return false; }
+    if (p_->dpy == EGL_NO_DISPLAY) { printf("[gles] no EGL display\n"); Shutdown(); return false; }
+    if (!eglInitialize(p_->dpy, nullptr, nullptr)) { printf("[gles] eglInitialize failed\n"); Shutdown(); return false; }
     const EGLint cfgAttr[] = {
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
@@ -211,18 +245,19 @@ bool Device::Create(HWND hwnd, const PresentParams& pp) {
         EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8, EGL_NONE };
     EGLConfig cfg; EGLint numCfg = 0;
     if (!eglChooseConfig(p_->dpy, cfgAttr, &cfg, 1, &numCfg) || numCfg < 1) {
-        printf("[gles] eglChooseConfig failed\n"); return false; }
+        printf("[gles] eglChooseConfig failed\n"); Shutdown(); return false; }
+    p_->cfg = cfg;
     if (win) {
         EGLint fmt = 0; eglGetConfigAttrib(p_->dpy, cfg, EGL_NATIVE_VISUAL_ID, &fmt);
         ANativeWindow_setBuffersGeometry(win, 0, 0, fmt);
     }
     const EGLint ctxAttr[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_NONE };
     p_->ctx = eglCreateContext(p_->dpy, cfg, EGL_NO_CONTEXT, ctxAttr);
-    if (p_->ctx == EGL_NO_CONTEXT) { printf("[gles] eglCreateContext failed\n"); return false; }
+    if (p_->ctx == EGL_NO_CONTEXT) { printf("[gles] eglCreateContext failed\n"); Shutdown(); return false; }
     p_->surf = win ? eglCreateWindowSurface(p_->dpy, cfg, win, nullptr) : EGL_NO_SURFACE;
-    if (p_->surf == EGL_NO_SURFACE) { printf("[gles] eglCreateWindowSurface failed\n"); return false; }
+    if (p_->surf == EGL_NO_SURFACE) { printf("[gles] eglCreateWindowSurface failed\n"); Shutdown(); return false; }
     if (!eglMakeCurrent(p_->dpy, p_->surf, p_->surf, p_->ctx)) {
-        printf("[gles] eglMakeCurrent failed\n"); return false; }
+        printf("[gles] eglMakeCurrent failed\n"); Shutdown(); return false; }
     eglSwapInterval(p_->dpy, p_->vsync ? 1 : 0);
     EGLint sw = 0, sh = 0;
     eglQuerySurface(p_->dpy, p_->surf, EGL_WIDTH, &sw);
@@ -235,10 +270,13 @@ bool Device::Create(HWND hwnd, const PresentParams& pp) {
     p_->color.id = Link(kColorVS, kColorFS);
     p_->tex.id   = Link(kTexVS, kTexFS);
     p_->shiny.id = Link(kShinyVS, kShinyFS);
-    if (!p_->color.id || !p_->tex.id || !p_->shiny.id) return false;
+    if (!p_->color.id || !p_->tex.id || !p_->shiny.id) { Shutdown(); return false; }
     p_->color.uWVP = glGetUniformLocation(p_->color.id, "gWVP");
     p_->tex.uWVP   = glGetUniformLocation(p_->tex.id, "gWVP");
     p_->shiny.uWVP = glGetUniformLocation(p_->shiny.id, "gWVP");
+    p_->color.uFlip = glGetUniformLocation(p_->color.id, "gFlip");
+    p_->tex.uFlip   = glGetUniformLocation(p_->tex.id, "gFlip");
+    p_->shiny.uFlip = glGetUniformLocation(p_->shiny.id, "gFlip");
     glUseProgram(p_->tex.id);
     glUniform1i(glGetUniformLocation(p_->tex.id, "gTex"), 0);
     glUseProgram(p_->shiny.id);
@@ -272,11 +310,24 @@ bool Device::Create(HWND hwnd, const PresentParams& pp) {
     glDisable(GL_CULL_FACE);           // d3d8.cpp: CULL_NONE (engine/UI need it off)
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
-    glViewport(0, 0, p_->w, p_->h);
+    if (g_gameW > 0) {                 // center the game's 16:9 image (pillarbox)
+        p_->prW = g_gameW; p_->prH = g_gameH;
+        p_->prX = (p_->w - g_gameW) / 2; p_->prY = (p_->h - g_gameH) / 2;
+        if (p_->prX < 0) p_->prX = 0;
+        if (p_->prY < 0) p_->prY = 0;
+    }
+    p_->BackbufferViewport();
 
     // 1x1 white default texture (untextured draws + stale-handle fallback → white, not black).
     uint32_t white = 0xffffffffu;
     p_->whiteTex = UploadAssetTexture(&white, 1, 1, false);
+
+    // Capture the surface-handoff mirror (see GlesRelease/AttachWindowSurface).
+    g_appEgl.dpy = p_->dpy; g_appEgl.ctx = p_->ctx; g_appEgl.cfg = p_->cfg;
+    g_appEgl.surf = &p_->surf; g_appEgl.vsync = p_->vsync;
+    g_appEgl.w = &p_->w; g_appEgl.h = &p_->h;
+    g_appEgl.prX = &p_->prX; g_appEgl.prY = &p_->prY;
+    g_appEgl.prW = &p_->prW; g_appEgl.prH = &p_->prH;
     return true;
 }
 
@@ -307,6 +358,13 @@ ID3D11Device* Device::D3D11() const { return nullptr; }
 
 void Device::Clear(uint32_t flags, uint32_t argb, float z, uint8_t stencil) {
     if (!p_) return;
+    const bool boxed = p_->activeRT < 0 && p_->prW > 0;
+    if (boxed && (flags & CLEAR_TARGET)) {
+        glClearColor(0, 0, 0, 1);                    // pillars: always black
+        glClear(GL_COLOR_BUFFER_BIT);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(p_->prX, p_->prY, p_->prW, p_->prH);
+    }
     GLbitfield mask = 0;
     if (flags & CLEAR_TARGET) {
         glClearColor(((argb >> 16) & 0xff) / 255.0f, ((argb >> 8) & 0xff) / 255.0f,
@@ -316,6 +374,7 @@ void Device::Clear(uint32_t flags, uint32_t argb, float z, uint8_t stencil) {
     if (flags & CLEAR_ZBUFFER) { glClearDepthf(z); glDepthMask(GL_TRUE); mask |= GL_DEPTH_BUFFER_BIT; }
     if (flags & CLEAR_STENCIL) { glClearStencil(stencil); mask |= GL_STENCIL_BUFFER_BIT; }
     if (mask) glClear(mask);
+    if (boxed && (flags & CLEAR_TARGET)) glDisable(GL_SCISSOR_TEST);
 }
 
 void Device::BeginScene() {}
@@ -394,7 +453,10 @@ void Device::DrawShinyIndexed(const VertexPT2C* verts, int vertexCount,
 // --- Textures ---------------------------------------------------------------------------
 TextureHandle Device::CreateTexture(const uint32_t* rgba, int width, int height) {
     if (!p_ || width <= 0 || height <= 0) return kNoTexture;
-    GLuint id = UploadAssetTexture(rgba, width, height, true);
+    // NO row flip (false), proven by the on-device title screen (session 28): texel v=0 =
+    // data row 0 in BOTH D3D and GL — bottom-up is a window/readback convention, not a
+    // sampler one. The first pass flipped here and every texture rendered mirrored in place.
+    GLuint id = UploadAssetTexture(rgba, width, height, false);
     if (!id) return kNoTexture;
     ++p_->liveTextures;
     return p_->AllocSlot(id, width, height, false);
@@ -403,7 +465,7 @@ TextureHandle Device::CreateTexture(const uint32_t* rgba, int width, int height)
 bool Device::UpdateTexture(TextureHandle t, const uint32_t* rgba, int width, int height, bool genMips) {
     if (!p_ || t < 0 || t >= (int)p_->texs.size() || !p_->texs[t].id) return false;
     if (p_->texs[t].w != width || p_->texs[t].h != height) return false;
-    ReuploadAssetTexture(p_->texs[t].id, rgba, width, height, true, genMips);
+    ReuploadAssetTexture(p_->texs[t].id, rgba, width, height, false, genMips);
     return true;
 }
 
@@ -431,7 +493,7 @@ TextureHandle Device::AcquireTexture(const uint32_t* rgba, int width, int height
         TextureHandle h = it->second.back(); it->second.pop_back();
         --p_->pooledTextures;
         if (h < 0 || h >= (int)p_->texs.size() || !p_->texs[h].id) continue;
-        ReuploadAssetTexture(p_->texs[h].id, rgba, width, height, true, true);
+        ReuploadAssetTexture(p_->texs[h].id, rgba, width, height, false, true);
         ++p_->liveTextures;
         return h;
     }
@@ -477,14 +539,19 @@ void Device::SetRenderTexture(TextureHandle t) {
     glBindFramebuffer(GL_FRAMEBUFFER, p_->texs[t].fbo);
     glViewport(0, 0, p_->texs[t].w, p_->texs[t].h);
     p_->activeRT = t;
+    // GL FBOs are bottom-up but the game samples RTs with D3D top-origin UVs: negate
+    // clip-space Y while rendering in (gFlip; cull is off, so winding is safe) so texel
+    // row 0 holds the image TOP, exactly like a D3D render target.
+    p_->flip = 1;
 }
 
 void Device::SetRenderTargetBackbuffer() {
     if (!p_) return;
     int prev = p_->activeRT;
     p_->activeRT = -1;
+    p_->flip = 0;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, p_->w, p_->h);
+    p_->BackbufferViewport();
     if (prev >= 0 && prev < (int)p_->texs.size() && p_->texs[prev].id) {
         glBindTexture(GL_TEXTURE_2D, p_->texs[prev].id);
         glGenerateMipmap(GL_TEXTURE_2D);
@@ -493,24 +560,49 @@ void Device::SetRenderTargetBackbuffer() {
 
 TextureHandle Device::CreateCaptureTexture() {
     if (!p_) return kNoTexture;
+    // Captures are GAME-sized (the present rect), not surface-sized: the game side sizes
+    // its capture bookkeeping to the render resolution, and the pillars are not content.
+    int cw = p_->prW > 0 ? p_->prW : p_->w;
+    int ch = p_->prW > 0 ? p_->prH : p_->h;
     GLuint id = 0; glGenTextures(1, &id);
     glBindTexture(GL_TEXTURE_2D, id);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, p_->w, p_->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cw, ch, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glGenerateMipmap(GL_TEXTURE_2D);
+    // A color-only FBO wrapping the texture, so CopyBackbufferTo can blit Y-inverted
+    // (D3D top-origin content) instead of glCopyTexSubImage2D's bottom-up copy.
+    GLuint fbo = 0; glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, id, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, p_->activeRT >= 0 ? p_->texs[p_->activeRT].fbo : 0);
     ++p_->liveTextures;
-    return p_->AllocSlot(id, p_->w, p_->h, true);   // isRT: freed (not pooled) on release
+    TextureHandle h = p_->AllocSlot(id, cw, ch, true);  // isRT: freed (not pooled) on release
+    p_->texs[h].fbo = fbo;                              // no depth: capture-only FBO
+    return h;
 }
 
 void Device::CopyBackbufferTo(TextureHandle t) {
     if (!p_ || t < 0 || t >= (int)p_->texs.size() || !p_->texs[t].id) return;
-    // Read from the default framebuffer (backbuffer) into the texture. GL's origin is
-    // bottom-left, so the capture is V-relative to GL; screen-transition users may need a
-    // flip (device-tuning note).
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindTexture(GL_TEXTURE_2D, p_->texs[t].id);
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, p_->w, p_->h);
+    Impl::Tex& tex = p_->texs[t];
+    int sx = p_->prW > 0 ? p_->prX : 0, sy = p_->prW > 0 ? p_->prY : 0;
+    int sw = p_->prW > 0 ? p_->prW : p_->w, sh = p_->prW > 0 ? p_->prH : p_->h;
+    if (tex.fbo) {
+        // Y-inverting blit: default-FB rows are bottom-up, the game samples captures with
+        // D3D top-origin UVs — swap the source Y range so texel row 0 = screen top.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tex.fbo);
+        glBlitFramebuffer(sx, sy + sh, sx + sw, sy,           // src top-down
+                          0, 0, tex.w, tex.h,                 // dst
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glBindFramebuffer(GL_FRAMEBUFFER, p_->activeRT >= 0 ? p_->texs[p_->activeRT].fbo : 0);
+    } else {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glBindTexture(GL_TEXTURE_2D, tex.id);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, sx, sy,
+                            sw < tex.w ? sw : tex.w, sh < tex.h ? sh : tex.h);
+    }
+    glBindTexture(GL_TEXTURE_2D, tex.id);
     glGenerateMipmap(GL_TEXTURE_2D);
 }
 
@@ -578,6 +670,62 @@ bool Device::SaveBackbuffer(const char* path) {
         fwrite(row.data(), 1, stride, f);
     }
     fclose(f);
+    return true;
+}
+
+// ---- App-lifecycle surface handoff (Android compositor use only) -------------------------
+// The ANativeWindow dies on APP_CMD_TERM_WINDOW and a NEW one arrives on the next
+// INIT_WINDOW; the EGL context (all textures/programs) must survive the gap. These free
+// functions operate through g_appEgl (captured at Create) so the shared d3d8.h interface —
+// which the D3D11 and null backends also implement — stays untouched.
+bool GlesReleaseWindowSurface() {
+    if (g_appEgl.dpy == EGL_NO_DISPLAY || !g_appEgl.surf) return false;
+    // Keep the context current surfaceless (EGL_KHR_surfaceless_context is universal on
+    // GLES3 hardware); if the driver refuses, unbind entirely — Attach re-binds.
+    if (!eglMakeCurrent(g_appEgl.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, g_appEgl.ctx))
+        eglMakeCurrent(g_appEgl.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (*g_appEgl.surf != EGL_NO_SURFACE) {
+        eglDestroySurface(g_appEgl.dpy, *g_appEgl.surf);
+        *g_appEgl.surf = EGL_NO_SURFACE;
+    }
+    printf("[gles] window surface released (context kept)\n");
+    return true;
+}
+
+bool GlesAttachWindowSurface(void* nativeWindow) {
+    if (g_appEgl.dpy == EGL_NO_DISPLAY || !g_appEgl.surf || !nativeWindow) return false;
+    if (*g_appEgl.surf != EGL_NO_SURFACE) {
+        eglDestroySurface(g_appEgl.dpy, *g_appEgl.surf);
+        *g_appEgl.surf = EGL_NO_SURFACE;
+    }
+    ANativeWindow* win = (ANativeWindow*)nativeWindow;
+    EGLint fmt = 0; eglGetConfigAttrib(g_appEgl.dpy, g_appEgl.cfg, EGL_NATIVE_VISUAL_ID, &fmt);
+    ANativeWindow_setBuffersGeometry(win, 0, 0, fmt);
+    EGLSurface s = eglCreateWindowSurface(g_appEgl.dpy, g_appEgl.cfg, win, nullptr);
+    if (s == EGL_NO_SURFACE) { printf("[gles] attach: eglCreateWindowSurface failed\n"); return false; }
+    if (!eglMakeCurrent(g_appEgl.dpy, s, s, g_appEgl.ctx)) {
+        printf("[gles] attach: eglMakeCurrent failed\n");
+        eglDestroySurface(g_appEgl.dpy, s);
+        return false;
+    }
+    *g_appEgl.surf = s;
+    eglSwapInterval(g_appEgl.dpy, g_appEgl.vsync ? 1 : 0);
+    EGLint sw = 0, sh = 0;
+    eglQuerySurface(g_appEgl.dpy, s, EGL_WIDTH, &sw);
+    eglQuerySurface(g_appEgl.dpy, s, EGL_HEIGHT, &sh);
+    if (sw > 0 && sh > 0) { *g_appEgl.w = sw; *g_appEgl.h = sh; }
+    // Recompute the centered present rect for the (possibly resized) surface, then aim the
+    // viewport at it — the game keeps rendering its fixed 16:9 size regardless.
+    if (g_appEgl.prW && *g_appEgl.prW > 0) {
+        *g_appEgl.prX = (*g_appEgl.w - *g_appEgl.prW) / 2;
+        *g_appEgl.prY = (*g_appEgl.h - *g_appEgl.prH) / 2;
+        if (*g_appEgl.prX < 0) *g_appEgl.prX = 0;
+        if (*g_appEgl.prY < 0) *g_appEgl.prY = 0;
+        glViewport(*g_appEgl.prX, *g_appEgl.prY, *g_appEgl.prW, *g_appEgl.prH);
+    } else {
+        glViewport(0, 0, *g_appEgl.w, *g_appEgl.h);
+    }
+    printf("[gles] window surface attached %dx%d\n", *g_appEgl.w, *g_appEgl.h);
     return true;
 }
 

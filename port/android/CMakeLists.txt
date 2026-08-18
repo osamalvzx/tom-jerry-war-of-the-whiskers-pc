@@ -136,19 +136,34 @@ add_library(tj_gles STATIC ${RT}/gfx/gles_gfx.cpp)
 target_include_directories(tj_gles PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(tj_gles PRIVATE GLESv3 EGL android)
 
-# --- Stage 6: libtjapp.so — THE GAME ON THE PHONE. The full hybrid game layer (HYB_GAME_SRC,
-# the exact code Gate S5c proved) + the GLES3 backend (gles_gfx) + the Android entry
-# (native_main: game boot thread + gamepad/touch input on port 0). Packaged by
-# port/tools/build_apk.ps1. Renders the real game to the device surface.
+# --- Stage 6: THE SUBPROCESS ARCHITECTURE (session 28). The engine cannot share an address
+# space with ART (its dalvik-main space owns the low 256 MB the guest's GPU memory needs),
+# so the game is a separate ART-free EXECUTABLE the app fork/execs, streaming draw commands
+# to the app through a shared memfd ring (src/android/ipc_protocol.h).
+#
+# tjgame -> libtjgame.so: the game binary. Named like a library so the APK packer puts it in
+# lib/arm64-v8a/ and the installer extracts it to the native-lib dir — the one app-owned
+# location Android allows exec() from. Dynamic PIE (the proven S5c shape); links NO
+# GLES/EGL — gfx is the ipc ring producer.
+add_executable(tjgame
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/android/game_main.cpp
+    ${RT}/gfx/ipc_gfx.cpp
+    ${HYB_GAME_SRC})
+set_target_properties(tjgame PROPERTIES OUTPUT_NAME "libtjgame.so" SUFFIX "")
+target_include_directories(tjgame PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(tjgame PRIVATE tj_engine tj_softfloat)
+
+# tjapp -> libtjapp.so: the COMPOSITOR SHELL. Window + GLES3 (replays the ring into
+# gles_gfx on the real surface) + input -> shm + subprocess management. Contains NO game
+# code — the whole hybrid layer lives in tjgame.
 add_library(tjapp SHARED
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/android/native_main.cpp
     ${RT}/gfx/gles_gfx.cpp
-    ${HYB_GAME_SRC}
     ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
 target_include_directories(tjapp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
     ${ANDROID_NDK}/sources/android/native_app_glue)
-target_link_libraries(tjapp PRIVATE tj_engine tj_softfloat GLESv3 EGL android log)
+target_link_libraries(tjapp PRIVATE GLESv3 EGL android log)
 # native_app_glue provides ANativeActivity_onCreate; the linker must keep it (nothing in the
 # .so references it directly — the framework loads it by name).
 target_link_options(tjapp PRIVATE -u ANativeActivity_onCreate)

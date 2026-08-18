@@ -77,7 +77,12 @@ bool HybridBootSequence(const char* xbe) {
     ReserveGpuAperture();
     SetupContiguousPool();
     ReserveTrampPad();
-    EnsureDisplay(640, 480, 1);          // null recorder headless; real GLES device on Android
+    // Render resolution: TJ_W/TJ_H (the Android app passes the surface's landscape dims —
+    // resolution AUTO, ANDROID_PLAN §2.7). Unset = 640x480, the headless S5c legs unchanged.
+    int dispW = 640, dispH = 480;
+    if (const char* e = getenv("TJ_W")) { int v = atoi(e); if (v >= 320 && v <= 7680) dispW = v; }
+    if (const char* e = getenv("TJ_H")) { int v = atoi(e); if (v >= 240 && v <= 4320) dispH = v; }
+    EnsureDisplay(dispW, dispH, 1);      // null recorder headless; ipc ring device on Android
 
     XbeInfo info;
     if (!MapXbeImage(xbe, &info)) { printf("[boot] image map failed\n"); return false; }
