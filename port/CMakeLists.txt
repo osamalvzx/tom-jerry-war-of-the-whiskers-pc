@@ -10,6 +10,18 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     message(WARNING "Configure with the x86 (Win32) toolchain: cmake -A Win32")
 endif()
 
+# Gate S5d: a Windows build that swaps the D3D11 gfx backend for the SAME null-gfx
+# recorder the ARM headless build uses, so TJ_DRAWLOG streams compare apples-to-apples
+# (Windows-null vs ARM-null). Default OFF — the shipped Windows build is untouched.
+# Configure a SEPARATE build dir with -DTJ_NULL_GFX=ON; never enable it in port/build.
+option(TJ_NULL_GFX "Swap the D3D11 gfx backend for the null-gfx draw recorder (Gate S5d)" OFF)
+if(TJ_NULL_GFX)
+    set(TJ_GFX_SRC src/runtime/gfx/null_gfx.cpp)
+    message(STATUS "TJ_NULL_GFX=ON: gfx backend = null-gfx recorder (Gate S5d reference)")
+else()
+    set(TJ_GFX_SRC src/runtime/gfx/d3d8.cpp)
+endif()
+
 add_executable(TomJerryWOW WIN32
     src/shell/main.cpp
     src/shell/config.cpp
@@ -33,7 +45,7 @@ set_target_properties(TomJerryWOW PROPERTIES
 # --- Native runtime (Xbox platform replacement) -----------------------------
 add_library(tj_runtime STATIC
     src/runtime/kernel/xboxkrnl.cpp
-    src/runtime/gfx/d3d8.cpp
+    ${TJ_GFX_SRC}
     src/runtime/engine/sys_video.cpp
     src/runtime/assets/xmf_texture.cpp
     src/runtime/assets/xmf_mesh.cpp

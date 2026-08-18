@@ -121,3 +121,10 @@ target_include_directories(tj_headless_static PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 target_link_options(tj_headless_static PRIVATE -static "-Wl,--image-base=0xF0000000")
 target_link_libraries(tj_headless_static PRIVATE tj_engine tj_softfloat)
 target_link_libraries(tj_headless PRIVATE tj_engine tj_softfloat)
+
+# --- Stage 6: the GLES3 gfx backend (runtime/gfx/d3d8.h reimplemented on GLES3). Built as a
+# library here so it compiles/links against the NDK's GLES3/EGL headers on its own, ahead of
+# the full APK harness. It replaces null_gfx.cpp in the shipping app (never both).
+add_library(tj_gles STATIC ${RT}/gfx/gles_gfx.cpp)
+target_include_directories(tj_gles PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(tj_gles PRIVATE GLESv3 EGL android)
