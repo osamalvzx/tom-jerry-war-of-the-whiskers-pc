@@ -30,6 +30,16 @@ namespace dispatch_detail {
     printf("[dispatch] FATAL: %s\n", what);
     FatalStop(0xD5);
 }
+// Richer variant for the >4GB return-pointer tripwire: names the hook, its key, the bad
+// value, and the guest CALL SITE (the return EIP) so the offending path is identifiable
+// from the log without a rebuild.
+[[noreturn]] void DispatchFatalRetPtr(const char* label, uint32_t key,
+                                      unsigned long long val, uint32_t site) {
+    printf("[dispatch] FATAL: hook '%s' (key %08X) returned host pointer %llX (>4 GB) "
+           "to guest call site %08X — relocate its result below 4 GB (GuestObjAlloc)\n",
+           label ? label : "?", key, val, site);
+    FatalStop(0xD5);
+}
 #endif
 } // namespace dispatch_detail
 

@@ -7,7 +7,7 @@
 #
 # Output: /data/local/tmp/tj/<Tag>.det + .log, pulled back into %TEMP%\tj_eng_runs.
 # Compare with:  python port\tools\det_diff.py %TEMP%\tj_eng_runs\exS27.det %TEMP%\tj_eng_runs\<Tag>.det
-# (the Windows reference MUST be an -Exact engine leg — S5c is EXACT-vs-EXACT.)
+# (the Windows reference MUST be an -Exact engine leg - S5c is EXACT-vs-EXACT.)
 param([string]$Adb = "", [string]$Tag = "armA", [int]$Seconds = 2400,
       [switch]$SkipAssets, [int]$Arena = 3)
 
@@ -21,7 +21,7 @@ New-Item -ItemType Directory -Force $out | Out-Null
 
 if ($Adb -ne "") { & $adbExe connect $Adb }
 $devs = & $adbExe devices | Select-String "device$"
-if (-not $devs) { Write-Host "NO DEVICE — pair wireless adb first (Developer options -> Wireless debugging)"; exit 1 }
+if (-not $devs) { Write-Host "NO DEVICE - pair wireless adb first (Developer options -> Wireless debugging)"; exit 1 }
 
 & $adbExe shell mkdir -p $dev
 & $adbExe push $bin "$dev/tj_headless"

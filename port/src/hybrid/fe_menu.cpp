@@ -119,10 +119,14 @@ static char* __cdecl Hk_GetText(uint32_t idxArg) {
     case 0xE5: return g_exitQ;
     }
     for (const auto& s : kSaveText) if (s.idx == idx) return (char*)s.text;
-    if (const char* lan = LanCustomText(idx)) return (char*)lan;  // LAN UI rows (0x100 and up)
-    if (const char* a = AudioCustomText(idx)) return (char*)a;    // audio sliders (0x1C0 up)
-    if (const char* mt = MeatCustomText(idx)) return (char*)mt;  // MAX MEAT row (0x1A0, 0xE6+)
-    if (const char* mm = MeatMenuText(idx)) return (char*)mm;    // MULTIPLAYER menu (0x1C8+)
+    // The guest STORES the returned pointer, so any host-image literal a provider hands back
+    // must be interned into the guest arena (below 4 GB) — identity passthrough on x86, the
+    // relocation on ARM. (MeatMenuText/MeatCustomText return host .rodata; lan_ui/audio_ui
+    // already return arena buffers, so intern is a no-op there.)
+    if (const char* lan = LanCustomText(idx)) return (char*)GuestInternStr(lan);  // LAN UI rows (0x100+)
+    if (const char* a = AudioCustomText(idx)) return (char*)GuestInternStr(a);    // audio sliders (0x1C0+)
+    if (const char* mt = MeatCustomText(idx)) return (char*)GuestInternStr(mt);  // MAX MEAT row (0x1A0, 0xE6+)
+    if (const char* mm = MeatMenuText(idx)) return (char*)GuestInternStr(mm);    // MULTIPLAYER menu (0x1C8+)
     if (idx > 0xE5) return g_resLabel;                        // unused custom slots
     if (!GCALL0(Cdecl, FnReady, 0x198e0)) return (char*)0x116FFC;    // "" until text ready
     uint32_t lang = *(uint8_t*)(uintptr_t)0x114C18;

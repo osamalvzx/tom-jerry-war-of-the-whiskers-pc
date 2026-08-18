@@ -93,5 +93,9 @@ template <class T> void DeleteGuestObj(T* p) {
 // declaration — never share one GuestObjAlloc between two names.
 // A string the GUEST will hold a pointer to (Hk_GetText's literals):
 char* GuestStrDup(const char* s);
+// Stable intern of a possibly-host-image string into the guest arena (below 4 GB). Same
+// source pointer -> same copy; identity passthrough on x86. Use at any host->guest string
+// boundary where the source might be a host .rodata literal (FE_GetText providers).
+const char* GuestInternStr(const char* s);
 
 } // namespace tj::hybrid

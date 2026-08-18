@@ -116,6 +116,30 @@ char* GuestStrDup(const char* s) {
     return d;
 }
 
+// Intern a possibly-host-image C string into the guest arena, returning a STABLE below-4GB
+// copy. The guest STORES the returned pointer and reuses it across frames (e.g. FE_GetText's
+// menu labels), so the SAME source pointer must always map to the SAME arena copy — a
+// per-call GuestStrDup would leak the arena a string per frame. On the x86 host every pointer
+// is already below 4 GB, so this is identity passthrough and the Windows path stays
+// byte-identical. On ARM it relocates host string literals (a whole class of gptr bug the
+// >4GB return-pointer tripwire otherwise catches only at runtime: FE_GetText's MeatMenuText
+// kText[], MeatCustomText "MAX MEAT:"/kValText[] were host .rodata).
+const char* GuestInternStr(const char* s) {
+    if (!s) return s;
+#if !defined(_M_IX86)
+    if (((uintptr_t)s >> 32) == 0) return s;     // already guest-visible (arena / guest addr)
+    static const char* src[256];
+    static const char* dup[256];
+    static int n = 0;
+    for (int i = 0; i < n; ++i) if (src[i] == s) return dup[i];
+    const char* d = GuestStrDup(s);
+    if (n < 256) { src[n] = s; dup[n] = d; ++n; }   // cache (full is never expected here)
+    return d;
+#else
+    return s;
+#endif
+}
+
 void* GuestObjAlloc(size_t size, size_t align) {
     static uint8_t* chunk = nullptr;
     static size_t used = 0, cap = 0;

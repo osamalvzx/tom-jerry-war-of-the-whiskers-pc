@@ -239,6 +239,8 @@ template <CallConv CC, class R, class... A> struct SigCC<CC, R(*)(A...)> {
 };
 
 [[noreturn]] void DispatchFatal(const char* what);   // dispatch.cpp
+[[noreturn]] void DispatchFatalRetPtr(const char* label, uint32_t key,
+                                      unsigned long long val, uint32_t site);  // dispatch.cpp
 
 // The ARM typed invoke: same marshaling as x86's Shim, called through the plain C ABI.
 // eax gets the (≤4-byte or guest-pointer) result; edx is left untouched — on x86 the
@@ -260,7 +262,7 @@ template <CallConv CC, class F> struct ShimCC {
                     Sig::template RawArg<I>(s))...);
             if constexpr (std::is_pointer_v<R>) {
                 uintptr_t v = (uintptr_t)r;
-                if (v >> 32) DispatchFatal("hook returned a pointer above 4 GB");
+                if (v >> 32) DispatchFatalRetPtr(e.label, e.key, (unsigned long long)v, ret);
                 s.r[tj::engine::EAX] = (uint32_t)v;
             } else {
                 uint32_t u = 0; std::memcpy(&u, &r, sizeof(R));
