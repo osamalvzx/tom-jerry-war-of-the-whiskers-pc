@@ -34,6 +34,7 @@ target_compile_definitions(tj_softfloat
 add_library(tj_engine STATIC
     ${ENG}/x86_interp.cpp
     ${ENG}/x87_exact.cpp
+    ${ENG}/x87_fast.cpp
     ${ENG}/fpu_host.cpp
 )
 target_include_directories(tj_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../src)

@@ -106,6 +106,17 @@ bool X87Exec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
 #ifdef _M_IX86
     if (g_fpuMode == FpuMode::Native) return X87NativeExec(s, op, modrm, ea);
 #endif
+    // FAST mode (TJ_ENG_FAST=1, non-x86 hosts): host-double core first; anything it
+    // does not reproduce bit-equivalently falls through to the EXACT unit below on
+    // the untouched image (x87_fast.cpp documents the contract).
+    static const bool fast = X87FastWanted();
+    if (fast) {
+        int rf = X87FastExec(s, op, modrm, ea);
+        if (rf != kX87FastFallback) {
+            if (rf < 0) { g_x87Fault = true; return false; }
+            return rf != 0;
+        }
+    }
     int r = X87ExactExec(s, op, modrm, ea);
     if (r < 0) { g_x87Fault = true; return false; }
     return r != 0;

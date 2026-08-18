@@ -339,6 +339,7 @@ add_library(tj_engine STATIC
     src/engine/x86_interp.cpp
     src/engine/x87_native.cpp
     src/engine/x87_exact.cpp
+    src/engine/x87_fast.cpp
     src/engine/eng_gate.cpp
     src/engine/fpu_host.cpp
 )

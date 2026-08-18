@@ -60,4 +60,15 @@ int X87ExactExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea);
 void X87ExactOnImage(uint8_t image[108], uint8_t op, uint8_t modrm, uint32_t ea,
                      int* outcome);
 
+// FAST unit (x87_fast.cpp; ANDROID_PLAN §2.3/§7-D2): the same ops computed with HOST
+// DOUBLES, selected at runtime by TJ_ENG_FAST=1 on non-x86 hosts (default OFF; the
+// EXACT unit is unaffected unless opted in). X87FastExec returns the X87ExactExec
+// contract (1/0/-1) OR kX87FastFallback, which means "not reproduced bit-equivalently
+// on the fast path — run the SAME op through X87ExactExec on the untouched image".
+// The only committed deviation from EXACT is the transcendental class (libm doubles
+// instead of 80-bit SoftFloat kernels); see the x87_fast.cpp header comment.
+constexpr int kX87FastFallback = -2;
+bool X87FastWanted();   // env gate + host-environment sanity; false on x86 hosts
+int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea);
+
 } // namespace tj::engine

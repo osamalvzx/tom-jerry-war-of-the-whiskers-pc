@@ -83,6 +83,10 @@ int main(int argc, char** argv) {
     }
     tj::gfx::SetSharedRegion(base);
     tj::snd::MixSndSetRegion(base);     // the software mixer's PCM ring lives in the region
+    // FAST x87 by default ON THE PHONE: host-double core, det-IDENTICAL to the EXACT
+    // reference over a full 149k-frame MEAT leg (session 29) — the in-match interpreter
+    // was the ~18 fps bound. no-overwrite: TJ_ENG_FAST=0 in the environment forces EXACT.
+    setenv("TJ_ENG_FAST", "1", 0);
     printf("[game] shm attached: surface %ux%u ring %u MB\n",
            g_hdr->surfW, g_hdr->surfH, g_hdr->ringBytes >> 20);
 
