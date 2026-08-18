@@ -144,11 +144,13 @@ void Device::Present() {
     if (!p_) return;
     RingWrite(tj::ipc::OP_PRESENT, nullptr, 0);
     uint32_t produced = g_hdr->framesProduced.fetch_add(1, std::memory_order_acq_rel) + 1;
-    // Pacing: at most ONE undisplayed frame in flight, and never faster than the frame
-    // clock (the app's vsync may be 120 Hz; the game is a 60 Hz simulation).
+    // Pacing: up to TWO unconsumed frames in flight (the compositor batch-drops when it
+    // falls behind, so a deeper window just decouples the sim from the swap — it never
+    // grows latency past one displayed frame), and never faster than the frame clock
+    // (the app's vsync may be 120 Hz; the game is a 60 Hz simulation).
     for (;;) {
         uint32_t consumed = g_hdr->framesConsumed.load(std::memory_order_acquire);
-        if (produced - consumed <= 1) break;
+        if (produced - consumed <= 2) break;
         if (g_hdr->quit.load(std::memory_order_relaxed)) ExitLost("quit flag");
         if (getppid() == 1) ExitLost("app process died (orphaned)");
         usleep(500);

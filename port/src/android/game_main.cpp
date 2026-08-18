@@ -24,6 +24,7 @@
 #include <cstring>
 
 namespace tj::gfx { void SetSharedRegion(void* base); }   // ipc_gfx.cpp
+namespace tj::snd { void MixSndSetRegion(void* base); }   // mix_snd.cpp (software mixer)
 namespace tj::hybrid { const char* UserDataDir(); }       // file_io.cpp
 
 static tj::ipc::Header* g_hdr = nullptr;
@@ -81,6 +82,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     tj::gfx::SetSharedRegion(base);
+    tj::snd::MixSndSetRegion(base);     // the software mixer's PCM ring lives in the region
     printf("[game] shm attached: surface %ux%u ring %u MB\n",
            g_hdr->surfW, g_hdr->surfH, g_hdr->ringBytes >> 20);
 

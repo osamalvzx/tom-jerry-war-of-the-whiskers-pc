@@ -21,6 +21,8 @@
 #include <android/input.h>
 #include <android/keycodes.h>
 #include <android/native_window.h>
+#include <android/window.h>        // AWINDOW_FLAG_KEEP_SCREEN_ON / _FULLSCREEN
+#include <aaudio/AAudio.h>         // speaker output for the game's shm PCM ring (minSdk 26)
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -320,6 +322,50 @@ int32_t OnInput(android_app*, AInputEvent* e) {
     return 0;
 }
 
+// ---- audio: drain the game's shm PCM ring to the speaker (AAudio) --------------------------
+// The game-side software mixer (mix_snd.cpp) produces 48 kHz stereo int16 frames into the
+// region's audio ring; this callback is the consumer. Underrun plays silence — the mixer
+// keeps real-time cadence regardless, so the game's audio state machine never notices.
+AAudioStream* g_astream = nullptr;
+
+aaudio_data_callback_result_t AudioCb(AAudioStream*, void*, void* audioData, int32_t numFrames) {
+    int16_t* out = (int16_t*)audioData;
+    if (!g_hdr) { memset(out, 0, (size_t)numFrames * 4); return AAUDIO_CALLBACK_RESULT_CONTINUE; }
+    int16_t* ring = (int16_t*)((uint8_t*)g_hdr + tj::ipc::kHeaderBytes + tj::ipc::kRingBytes);
+    uint64_t tail = g_hdr->audioTail.load(std::memory_order_relaxed);
+    uint64_t head = g_hdr->audioHead.load(std::memory_order_acquire);
+    for (int32_t i = 0; i < numFrames; ++i) {
+        if (tail < head) {
+            uint32_t s = (uint32_t)(tail % tj::ipc::kAudioRingFrames);
+            out[i * 2]     = ring[s * 2];
+            out[i * 2 + 1] = ring[s * 2 + 1];
+            ++tail;
+        } else {
+            out[i * 2] = out[i * 2 + 1] = 0;
+        }
+    }
+    g_hdr->audioTail.store(tail, std::memory_order_release);
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+void StartAudio() {
+    if (g_astream) { AAudioStream_requestStart(g_astream); return; }
+    AAudioStreamBuilder* b = nullptr;
+    if (AAudio_createStreamBuilder(&b) != AAUDIO_OK || !b) { LOGE("aaudio builder failed"); return; }
+    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
+    AAudioStreamBuilder_setChannelCount(b, (int32_t)tj::ipc::kAudioChannels);
+    AAudioStreamBuilder_setSampleRate(b, (int32_t)tj::ipc::kAudioRate);
+    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setDataCallback(b, &AudioCb, nullptr);
+    aaudio_result_t r = AAudioStreamBuilder_openStream(b, &g_astream);
+    AAudioStreamBuilder_delete(b);
+    if (r != AAUDIO_OK || !g_astream) { LOGE("aaudio open failed (%d)", (int)r); g_astream = nullptr; return; }
+    AAudioStream_requestStart(g_astream);
+    LOGI("audio out: %d Hz x%d (AAudio)", AAudioStream_getSampleRate(g_astream),
+         AAudioStream_getChannelCount(g_astream));
+}
+void PauseAudio() { if (g_astream) AAudioStream_requestPause(g_astream); }
+
 // ---- render thread: replay the ring into the gles device -----------------------------------
 std::atomic<ANativeWindow*> g_pendingWindow{nullptr};   // glue -> render: new window arrived
 std::atomic<bool> g_surfaceLost{false};                 // glue -> render: release the surface
@@ -328,12 +374,18 @@ std::atomic<bool> g_surfaceDown{true};                  // render -> glue: relea
 tj::gfx::Device g_dev;
 int g_texMap[4096];
 
-// Replays until the ring is empty or a PRESENT was executed. Returns true on PRESENT.
-bool ReplayRing() {
+// Replays until the ring is EMPTY, counting completed frames; the CALLER swaps once for
+// the whole batch. Draining past intermediate presents is the frame-drop path: when replay
+// +swap is slower than the 60 Hz sim, intermediate frames are executed into the backbuffer
+// and overdrawn without an eglSwapBuffers each — the sim never throttles below 60 because
+// the display leg fell behind. (All ops still execute: texture state stays exact.)
+// Returns the number of OP_PRESENTs consumed (-1 = stream desync).
+int ReplayRing() {
     using namespace tj::ipc;
     const uint32_t N = g_hdr->ringBytes;
     uint64_t tail = g_hdr->tail.load(std::memory_order_relaxed);
     uint64_t head = g_hdr->head.load(std::memory_order_acquire);
+    int presents = 0;
     auto mapTex = [&](int32_t h) -> int {
         return (h >= 0 && h < 4096) ? g_texMap[h] : -1;
     };
@@ -343,7 +395,6 @@ bool ReplayRing() {
         memcpy(&ch, g_ring + pos, sizeof ch);
         if (ch.op == OP_WRAP) { tail += sizeof(CmdHdr) + ch.bytes; g_hdr->tail.store(tail, std::memory_order_release); continue; }
         const uint8_t* pl = g_ring + pos + sizeof(CmdHdr);
-        bool presented = false;
         switch (ch.op) {
             case OP_CLEAR: {
                 uint32_t v[4]; memcpy(v, pl, 16);
@@ -425,21 +476,37 @@ bool ReplayRing() {
                 g_dev.SetBlendMode((tj::gfx::Device::BlendMode)v[0], v[1] != 0);
             } break;
             case OP_PRESENT:
-                g_dev.Present();
+                // Counted, NOT swapped here — the caller swaps once per drain batch.
                 g_hdr->framesConsumed.fetch_add(1, std::memory_order_acq_rel);
-                presented = true;
+                ++presents;
                 break;
             default:
                 LOGE("replay: unknown op %u — stream desync, stopping", ch.op);
                 g_hdr->quit.store(1, std::memory_order_release);   // or the child wedges in
                 g_stop.store(true);                                // RingWrite backpressure
-                return false;
+                return -1;
         }
         tail += CmdTotal(ch.bytes);
         g_hdr->tail.store(tail, std::memory_order_release);   // free space promptly
-        if (presented) return true;
+        if (ch.op == OP_PRESENT) {
+            // Drain past this frame ONLY if a further COMPLETE frame is already in the
+            // ring — the backbuffer must always hold a finished frame when the caller
+            // swaps, never a half-replayed one. Bounded so a fast producer can't starve
+            // the swap forever.
+            if (presents >= 4) break;
+            head = g_hdr->head.load(std::memory_order_acquire);
+            bool more = false;
+            for (uint64_t t2 = tail; t2 < head; ) {
+                uint32_t p2 = (uint32_t)(t2 % N);
+                CmdHdr h2; memcpy(&h2, g_ring + p2, sizeof h2);
+                if (h2.op == OP_WRAP) { t2 += sizeof(CmdHdr) + h2.bytes; continue; }
+                if (h2.op == OP_PRESENT) { more = true; break; }
+                t2 += CmdTotal(h2.bytes);
+            }
+            if (!more) break;
+        }
     }
-    return false;
+    return presents;
 }
 
 void* RenderThread(void* pv) {
@@ -483,7 +550,9 @@ void* RenderThread(void* pv) {
             else LOGE("surface attach failed");
         }
         if (!haveSurface) { usleep(20000); continue; }   // ring backpressure pauses the game
-        if (!ReplayRing()) usleep(1000);                 // nothing presented: idle briefly
+        int frames = ReplayRing();
+        if (frames > 0) g_dev.Present();                 // ONE swap per drained batch
+        else if (frames == 0) usleep(1000);              // nothing complete: idle briefly
     }
     return nullptr;
 }
@@ -519,8 +588,10 @@ void OnCmd(android_app* app, int32_t cmd) {
                     break;                       // g_running stays false; INIT can retry
                 }
                 g_running = true;
+                StartAudio();
             } else {
                 g_pendingWindow.store(app->window, std::memory_order_release);
+                StartAudio();                    // resume after a TERM (backgrounded) pause
             }
         } break;
         case APP_CMD_TERM_WINDOW: {
@@ -529,6 +600,7 @@ void OnCmd(android_app* app, int32_t cmd) {
             // attach to a freed ANativeWindow — then wait (bounded) for the render thread
             // to actually let go of the current surface.
             if (!g_running) break;
+            PauseAudio();                        // backgrounded: no sound from a hidden app
             g_pendingWindow.store(nullptr, std::memory_order_release);
             g_surfaceDown.store(false, std::memory_order_release);
             g_surfaceLost.store(true, std::memory_order_release);
@@ -541,11 +613,38 @@ void OnCmd(android_app* app, int32_t cmd) {
 
 } // namespace
 
+// Fullscreen: hide status+nav bars, immersive sticky (swipe reveals temporarily). A theme
+// cannot hide the nav bar — this is the standard JNI call NativeActivity apps make.
+static void MakeImmersive(android_app* app) {
+    JavaVM* vm = app->activity->vm;
+    JNIEnv* env = nullptr;
+    if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return;
+    jobject activity = app->activity->clazz;
+    jclass actCls = env->GetObjectClass(activity);
+    jmethodID getWindow = env->GetMethodID(actCls, "getWindow", "()Landroid/view/Window;");
+    jobject window = env->CallObjectMethod(activity, getWindow);
+    jclass winCls = env->GetObjectClass(window);
+    jmethodID getDecor = env->GetMethodID(winCls, "getDecorView", "()Landroid/view/View;");
+    jobject decor = env->CallObjectMethod(window, getDecor);
+    jclass viewCls = env->GetObjectClass(decor);
+    jmethodID setVis = env->GetMethodID(viewCls, "setSystemUiVisibility", "(I)V");
+    // FULLSCREEN | HIDE_NAVIGATION | IMMERSIVE_STICKY | LAYOUT_* (stable layout).
+    const jint flags = 0x00000004 | 0x00000002 | 0x00001000 | 0x00000100 | 0x00000200 | 0x00000400;
+    env->CallVoidMethod(decor, setVis, flags);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    vm->DetachCurrentThread();
+}
+
 void android_main(android_app* app) {
     RedirectStdio();
     app->onAppCmd = OnCmd;
     app->onInputEvent = OnInput;
     g_activity = app->activity;        // ReapThread finishes the activity on a game crash
+    // The screen must not lock mid-match (the pad is often idle for seconds); FULLSCREEN
+    // backs up the theme's status-bar hide at the window-flag level too.
+    ANativeActivity_setWindowFlags(app->activity,
+        AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
+    MakeImmersive(app);
     LOGI("android_main start (compositor shell)");
     for (;;) {
         int events;
@@ -557,12 +656,14 @@ void android_main(android_app* app) {
                 g_stop.store(true);
                 KillGame();
                 if (g_running) pthread_join(g_renderThread, nullptr);
-                // exit(0), deliberately: Android CACHES the empty process after the
-                // activity dies, and android_main would re-run in it with every static
-                // above still holding torn-down state (g_running true, dead threads, a
-                // stale shm) — a guaranteed black screen on relaunch. A fresh process is
-                // the only clean slate.
-                exit(0);
+                // _exit(0), deliberately — TWO reasons. (1) Android CACHES the empty
+                // process after the activity dies; android_main would re-run in it with
+                // every static above still holding torn-down state — a guaranteed black
+                // screen on relaunch. (2) It must be _exit, NOT exit: exit() runs static
+                // destructors while the framework's own threads (hwuiTask) are still
+                // live, and the device crash log showed exactly that — FORTIFY abort on
+                // a destroyed mutex in hwuiTask during teardown.
+                _exit(0);
             }
         }
     }

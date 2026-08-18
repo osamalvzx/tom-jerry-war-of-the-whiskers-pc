@@ -28,10 +28,17 @@
 namespace tj::ipc {
 
 constexpr uint32_t kMagic     = 0x544A4642;   // 'TJFB'
-constexpr uint32_t kVersion   = 1;
+constexpr uint32_t kVersion   = 2;            // v2: audio PCM ring appended
 constexpr uint32_t kRingBytes = 64u << 20;    // >> largest single op (a 4 MB texture) + slack
 constexpr uint32_t kHeaderBytes = 4096;
-constexpr uint32_t kRegionBytes = kHeaderBytes + kRingBytes;
+// Audio: the game-side software mixer (mix_snd.cpp) writes 48 kHz STEREO int16 frames into
+// this ring; the app's AAudio callback drains it. 500 ms capacity — deep enough to ride out
+// app-side scheduling, small enough that a stall never plays half a second of stale sound.
+constexpr uint32_t kAudioRate       = 48000;
+constexpr uint32_t kAudioChannels   = 2;
+constexpr uint32_t kAudioRingFrames = 24000;  // 500 ms
+constexpr uint32_t kAudioRingBytes  = kAudioRingFrames * kAudioChannels * 2;
+constexpr uint32_t kRegionBytes = kHeaderBytes + kRingBytes + kAudioRingBytes;
 
 // The Xbox pad state the app forwards (same fields as tj::input::XboxGamepad, kept as a
 // separate POD so the protocol header depends on nothing).
@@ -55,6 +62,12 @@ struct Header {
     std::atomic<uint32_t> framesProduced;     // game Present count (pacing)
     std::atomic<uint32_t> framesConsumed;     // app Present count
     uint32_t ringBytes;                       // == kRingBytes (cross-checked at attach)
+    // Audio SPSC ring — MONOTONIC FRAME counts (offset = value % kAudioRingFrames). The
+    // mixer (game) is the producer, the AAudio callback (app) the consumer. Underrun =
+    // the app plays silence; overrun = the mixer discards (voices still advance in real
+    // time, so the game's polled audio state machine never stalls on the app).
+    std::atomic<uint64_t> audioHead;
+    std::atomic<uint64_t> audioTail;
 };
 static_assert(sizeof(Header) <= kHeaderBytes, "header must fit its page");
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "cross-process atomics");

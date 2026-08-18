@@ -55,7 +55,7 @@ Write-Host "== aapt2 compile + link =="
 if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed" }
 & $aapt2 link -o "$build\app-unsigned.apk" -I $androidJar `
     --manifest "$appdir\AndroidManifest.xml" `
-    --min-sdk-version 24 --target-sdk-version 34 `
+    --min-sdk-version 26 --target-sdk-version 34 `
     "$build\res.zip"
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
 

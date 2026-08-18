@@ -102,13 +102,13 @@ set(HYB_GAME_SRC
     ${HYB}/dsound_bridge.cpp
     ${HYB}/d3d8_bridge.cpp
     ${HYB}/prof.cpp
-    ${RT}/snd/null_snd.cpp
     ${RT}/snd/xadpcm.cpp
     ${RT}/snd/wav_dump.cpp
     ${RT}/assets/xmf_texture.cpp)
 add_executable(tj_headless
     ${HYB}/headless_main.cpp
     ${RT}/gfx/null_gfx.cpp
+    ${RT}/snd/null_snd.cpp
     ${HYB_GAME_SRC})
 target_include_directories(tj_headless PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # DYNAMIC PIE, deliberately — the shape PROVEN on the device (eng_call_smoke): Android
@@ -148,6 +148,7 @@ target_link_libraries(tj_gles PRIVATE GLESv3 EGL android)
 add_executable(tjgame
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/android/game_main.cpp
     ${RT}/gfx/ipc_gfx.cpp
+    ${RT}/snd/mix_snd.cpp
     ${HYB_GAME_SRC})
 set_target_properties(tjgame PROPERTIES OUTPUT_NAME "libtjgame.so" SUFFIX "")
 target_include_directories(tjgame PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
@@ -163,7 +164,7 @@ add_library(tjapp SHARED
 target_include_directories(tjapp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
     ${ANDROID_NDK}/sources/android/native_app_glue)
-target_link_libraries(tjapp PRIVATE GLESv3 EGL android log)
+target_link_libraries(tjapp PRIVATE GLESv3 EGL android log aaudio)
 # native_app_glue provides ANativeActivity_onCreate; the linker must keep it (nothing in the
 # .so references it directly — the framework loads it by name).
 target_link_options(tjapp PRIVATE -u ANativeActivity_onCreate)
