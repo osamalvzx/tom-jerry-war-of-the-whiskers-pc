@@ -45,6 +45,17 @@ void EngineModeRegisterJmpHook(const void* hookEntry, uint32_t resumeVa,
 // stores automatically, but native writes are invisible to it. No-op in native mode.
 void EngineModeInvalidateCode(uint32_t va, uint32_t len);
 
+// ApplyFsFixups allocates the fake KPCR after the engine may already be armed (ARM
+// boots armed); this points the interpreter's fs base at it. Idempotent, both hosts.
+void EngineModeRefreshFsBase();
+
+#if !defined(_M_IX86)
+// ARM (headless_main): arm the engine BEFORE startup init — guest stack + exec range +
+// escape handler + virtual FPU + a live root dispatch frame, so every GCALL from host
+// boot code marshals from process start. There is no native mode to fall back to.
+bool EngineModeArmBoot();
+#endif
+
 // ================= Engine::Call — the marshaled host->guest call =================
 //
 // GCALL(Conv, FnTypedef, va, args...) replaces ((FnTypedef)GuestFnPtr(va))(args...).

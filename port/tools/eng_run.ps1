@@ -12,7 +12,7 @@
 # ⚠ The game opens the .det file deny-share: diff only after the run's process exits.
 param([string]$Tag = "engrun", [int]$Seconds = 120, [switch]$Engine, [int]$Arena = 3,
       [switch]$Detlog, [string]$Input = "", [string]$MtTrace = "", [switch]$Meat,
-      [switch]$Prof)
+      [switch]$Prof, [switch]$Exact)
 
 $root  = Split-Path (Split-Path $PSScriptRoot)   # port/tools -> project root
 $bin   = "$root\port\build\bin\Release"
@@ -34,6 +34,7 @@ $env:TJ_PROF = $(if ($Prof) { "$out\$Tag.prof" } else { $null })
 $env:TJ_MEAT = $(if ($Meat) { "1" } else { $null })
 $env:TJ_ITEMLOG = $(if ($Meat) { "$out\$Tag.items.txt" } else { $null })
 $env:TJ_ENGINE = $(if ($Engine) { "1" } else { $null })
+$env:TJ_ENG_EXACT = $(if ($Exact) { "1" } else { $null })   # Gate-S5c reference legs
 $env:TJ_DETLOG = $(if ($Detlog) { "$out\$Tag.det" } else { $null })
 $env:TJ_MTTRACE = $(if ($MtTrace -ne "") { $MtTrace } else { $null })
 if ($Input -ne "") { $env:TJ_INPUT = $Input }

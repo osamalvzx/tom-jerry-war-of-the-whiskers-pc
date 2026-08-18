@@ -1,10 +1,11 @@
 #include "runtime/assets/xmf_texture.h"
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstring>
 
 namespace tj::assets {
 namespace {
+#ifdef _WIN32
 std::vector<uint8_t> ReadFile(const std::wstring& path) {
     std::vector<uint8_t> data;
     FILE* f = _wfopen(path.c_str(), L"rb");
@@ -15,6 +16,7 @@ std::vector<uint8_t> ReadFile(const std::wstring& path) {
     fclose(f);
     return data;
 }
+#endif // _WIN32
 
 inline uint32_t rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
 inline uint16_t rd16(const uint8_t* p) { uint16_t v; memcpy(&v, p, 2); return v; }
@@ -234,6 +236,7 @@ DecodedTexture DecodeXboxTexture(int fmt, const uint8_t* pixels, size_t avail,
     return out;
 }
 
+#ifdef _WIN32
 DecodedTexture LoadFirstTexture(const std::wstring& path) {
     DecodedTexture out;
     std::vector<uint8_t> f = ReadFile(path);
@@ -260,5 +263,6 @@ DecodedTexture LoadFirstTexture(const std::wstring& path) {
 
     return DecodeDxtPixels(&f[dataStart], f.size() - dataStart, fmtCode, W, H);
 }
+#endif // _WIN32 (file-loading tooling; the bridge decodes from guest memory)
 
 } // namespace tj::assets

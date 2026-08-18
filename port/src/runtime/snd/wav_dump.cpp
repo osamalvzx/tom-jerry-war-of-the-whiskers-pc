@@ -1,4 +1,5 @@
 #include "runtime/snd/wav_dump.h"
+#include "hybrid/host_compat.h"
 #include <cstring>
 
 namespace tj::snd {

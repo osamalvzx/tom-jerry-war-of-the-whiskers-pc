@@ -53,7 +53,7 @@
 // flag is part of the match config rather than a local toggle.
 #include "hybrid/meat_rush.h"
 
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -204,7 +204,10 @@ static bool RepurposeClass(int arenaId) {
     g_savedClassVa = cls;
     memcpy(g_savedClass, U8(cls), kClassStride);
 
-    *U32(cls + 0x00) = (uint32_t)(uintptr_t)kMeatModel;   // model name -> the injected object
+    // model name -> the injected object. The guest READS this pointer, so the string
+    // rides in the guest-visible arena (kMeatModel itself is host .rodata).
+    static char* meatModelG = GuestStrDup(kMeatModel);
+    *U32(cls + 0x00) = Gp32(meatModelG);
     *U32(cls + 0x04) = 0;                                 // no "ruined" model
     *U8(cls + 0x6A)  = 0;                                 // never the bag's excluded special
     *(int16_t*)(uintptr_t)(cls + 0x70) = 0;               // harmless: no damage, no heal
@@ -560,7 +563,13 @@ static void __fastcall Hk_HudClock(uint32_t hud, uint32_t edx) {
     uint32_t m = Master();
     if (!m || m < 0x04000000u || m >= 0x10000000u) return;
     if (!hud) return;
-    static const uint32_t kWhite[3] = { 0x7F, 0x7F, 0x7F };
+    // Everything the GUEST touches here — the rect out-param, the printed string, the
+    // colour triple whose address goes into hud+0x18 — must be guest-visible memory,
+    // not host stack/statics (§2.1; the >4GB tripwire caught r[] first).
+    static uint32_t (&kWhite)[3] = *(uint32_t(*)[3])GuestObjAlloc(12, 8);
+    kWhite[0] = kWhite[1] = kWhite[2] = 0x7F;
+    static float (&r)[6] = *(float(*)[6])GuestObjAlloc(24, 8);
+    static char (&buf)[16] = *(char(*)[16])GuestObjAlloc(16, 8);
     int n = *U8(m + kNumFighters);
     if (n > 4) n = 4;
     for (int i = 0; i < n; ++i) {
@@ -570,9 +579,8 @@ static void __fastcall Hk_HudClock(uint32_t hud, uint32_t edx) {
         // at its right-hand end -- clear of the portrait (element 2 ends at x1 - 0.105) and
         // still inside the player's own panel at every player index.  x is a CENTRE anchor:
         // the retail clock draws at 0.5 and lands in the middle of the screen.
-        float r[6] = { 0, 0, 0, 0, 0, 0 };
+        for (int k = 0; k < 6; ++k) r[k] = 0;
         GCALL(Cdecl, FnPanelRect, kPanelRect, r, 1, *U8(f + kPlayerNum));
-        char buf[16];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%u", *U8(f + kScoreOff));
         *(float*)(uintptr_t)(hud + 0x14) = 0.06f;                         // text scale
         *(uint32_t*)(uintptr_t)(hud + 0x18) = (uint32_t)(uintptr_t)kWhite;

@@ -7,7 +7,7 @@
 // matching a retail Xbox with no debug monitor and giving clean "no thread" branches.
 #include "hybrid/xbe_image.h"
 #include "hybrid/fs_sites.h"
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdint>
 

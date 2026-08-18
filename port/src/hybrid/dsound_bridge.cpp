@@ -26,8 +26,10 @@
 #include "runtime/snd/xaudio_backend.h"
 #include "runtime/snd/xadpcm.h"
 #include "runtime/snd/wav_dump.h"
-#include <windows.h>
+#include "hybrid/host_compat.h"
+#if defined(_M_IX86)
 #include <intrin.h>     // __readfsdword (PEB access)
+#endif
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -141,15 +143,18 @@ static void CopyWfx(XWaveFmt* dst, const void* src) {
     dst->samplesPerBlock = dst->cbSize >= 2 ? *(const uint16_t*)((const char*)src + 18) : 0;
 }
 
-struct XMediaPkt {          // XMEDIAPACKET, 0x18 bytes
-    void*     pvBuffer;
-    uint32_t  dwMaxSize;
-    uint32_t* pdwCompletedSize;
-    uint32_t* pdwStatus;
-    void*     ctx;
-    void*     prtTimestamp;
+struct XMediaPkt {          // XMEDIAPACKET, 0x18 bytes — a GUEST struct: 32-bit pointers
+    uint32_t pvBuffer;
+    uint32_t dwMaxSize;
+    uint32_t pdwCompletedSize;
+    uint32_t pdwStatus;
+    uint32_t ctx;
+    uint32_t prtTimestamp;
 };
 static_assert(sizeof(XMediaPkt) == 0x18, "XMEDIAPACKET layout");
+// Guest-address helpers for the packet fields (identity casts on the x86 host).
+static inline uint32_t* Gu32(uint32_t va) { return (uint32_t*)(uintptr_t)va; }
+static inline const uint8_t* Gu8c(uint32_t va) { return (const uint8_t*)(uintptr_t)va; }
 
 // --- ShimBuffer (opaque to the game; no vtable) ----------------------------
 using Pcm = std::shared_ptr<std::vector<int16_t>>;
@@ -185,8 +190,10 @@ struct ShimBuffer {
 };
 
 // --- ShimStream (real 7-slot Xbox IDirectSoundStream vtable) ---------------
+// The vtbl field is what the GUEST reads at object+0 (a 4-byte slot), so it is a
+// gptr, not a host pointer — and the object itself lives below 4 GB (NewGuestObj).
 struct ShimStream {
-    void**   vtbl;                           // MUST be first
+    uint32_t vtbl;                           // MUST be first (guest-read 4-byte slot)
     uint32_t magic = kStrmMagic;
     int      id = 0;
     bool     is3D = false;
@@ -196,7 +203,7 @@ struct ShimStream {
     uint32_t headroomMb = 0;
     uint32_t curHz = 0;                      // SetFrequency override (0 = format rate)
     snd::Voice* voice = nullptr;
-    struct Pkt { uint32_t* status; uint32_t* completed; Pcm pcm; uint32_t bytes; };
+    struct Pkt { uint32_t status; uint32_t completed; Pcm pcm; uint32_t bytes; };
     std::deque<Pkt> inflight;                // submitted to XAudio2, FIFO
     std::vector<Pcm> retired;                // flushed decodes until mixer lets go
     bool started = false, primed = false, paused = false,
@@ -205,12 +212,12 @@ struct ShimStream {
 
 // --- ShimFileMediaObject (real 10-slot XFileMediaObject vtable) ------------
 struct ShimFile {
-    void**   vtbl;                           // MUST be first
+    uint32_t vtbl;                           // MUST be first (guest-read 4-byte slot)
     uint32_t magic = kFileMagic;
     int      id = 0;
     uint32_t h = 0;                          // game/NT pseudo-handle from file_io
     uint64_t pos = 0;
-    struct Req { void* dst; uint32_t max; uint32_t* status; uint32_t* completed; uint64_t off; };
+    struct Req { uint32_t dst; uint32_t max; uint32_t status; uint32_t completed; uint64_t off; };
     std::deque<Req> pending;                 // game-thread only; serviced in DoWork
 };
 
@@ -258,16 +265,19 @@ static float StrmAmp(ShimStream* s) { return AmpOf(s->volMb, s->headroomMb); }
 
 // =====================  IDirectSound (device)  =============================
 
-static HRES __stdcall DS_DirectSoundCreate(void* guid, void** ppDS, void* unk) {
+static HRES __stdcall DS_DirectSoundCreate(void* guid, uint32_t* ppDS, void* unk) {
     (void)guid; (void)unk;
     // Engine init happens HERE (game's audio init, on the game thread) rather
     // than at bridge install: this is the same process era where the D3D
     // bridge's own worker threads are known to start cleanly.
     snd::Init();
-    static uint32_t token;                   // game stores it, checks !=0, never derefs
-    if (ppDS) *ppDS = &token;
+    // The game stores the value in a 4-byte slot, checks !=0, never derefs -- so it
+    // must be a sub-4GB address (NewGuestObj) and the write is a 32-bit store.
+    static uint32_t* token = nullptr;
+    if (!token) token = NewGuestObj<uint32_t>();
+    if (ppDS) *ppDS = Gp32(token);
     printf("[snd] DirectSoundCreate -> token %p (%s backend)\n",
-           (void*)&token, snd::IsNull() ? "null" : "XAudio2");
+           (void*)token, snd::IsNull() ? "null" : "XAudio2");
     return 0;
 }
 
@@ -284,7 +294,7 @@ static uint32_t __stdcall DS_Release(void* pDS) {
 }
 
 static ShimBuffer* NewBuffer(bool is3D) {
-    ShimBuffer* b = new ShimBuffer();
+    ShimBuffer* b = NewGuestObj<ShimBuffer>();
     b->is3D = is3D;
     b->id = (int)g_buffers.size();
     g_buffers.push_back(b);
@@ -299,18 +309,18 @@ static ShimBuffer* NewBuffer(bool is3D) {
 
 // IDirectSound_CreateSoundBuffer(pDS, LPCDSBUFFERDESC, out, pUnk) -- Xbox
 // DSBUFFERDESC leaves dwSize(+0) zero; dwFlags lives at +4 (0x10 = CTRL3D).
-static HRES __stdcall DS_CreateSoundBuffer(void* pDS, uint8_t* desc, ShimBuffer** ppBuf, void* unk) {
+static HRES __stdcall DS_CreateSoundBuffer(void* pDS, uint8_t* desc, uint32_t* ppBuf, void* unk) {
     (void)pDS; (void)unk;
     uint32_t flags = desc ? *(uint32_t*)(desc + 4) : 0;
     ShimBuffer* b = NewBuffer((flags & 0x10) != 0);
-    if (ppBuf) *ppBuf = b;
+    if (ppBuf) *ppBuf = Gp32(b);
     return 0;
 }
 
-static HRES __stdcall DS_CreateBuffer(uint8_t* desc, ShimBuffer** ppBuf) {
+static HRES __stdcall DS_CreateBuffer(uint8_t* desc, uint32_t* ppBuf) {
     uint32_t flags = desc ? *(uint32_t*)(desc + 4) : 0;
     ShimBuffer* b = NewBuffer((flags & 0x10) != 0);
-    if (ppBuf) *ppBuf = b;
+    if (ppBuf) *ppBuf = Gp32(b);
     return 0;
 }
 
@@ -319,9 +329,9 @@ static ShimStream* NewStream(uint8_t* desc);
 
 // DirectSoundCreateStream(LPCDSSTREAMDESC, out) -- DSSTREAMDESC has NO dwSize:
 // flags at +0 (0x10 = CTRL3D), dwMaxAttachedPackets +4, lpwfxFormat +8.
-static HRES __stdcall DS_CreateStream(uint8_t* desc, ShimStream** ppStrm) {
+static HRES __stdcall DS_CreateStream(uint8_t* desc, uint32_t* ppStrm) {
     ShimStream* s = NewStream(desc);
-    if (ppStrm) *ppStrm = s;
+    if (ppStrm) *ppStrm = Gp32(s);
     return 0;
 }
 
@@ -564,7 +574,7 @@ static uint32_t __stdcall DSB_Release(ShimBuffer* b) {
     delete b->voice;                         // DestroyVoice blocks until pcm is unreferenced
     b->voice = nullptr;
     b->magic = 0;
-    delete b;
+    DeleteGuestObj(b);
     return 0;
 }
 
@@ -577,8 +587,8 @@ static void StreamService(ShimStream* s) {
         uint32_t q = s->voice->QueuedCount();
         while (s->inflight.size() > q) {
             ShimStream::Pkt& p = s->inflight.front();
-            if (p.status)    *p.status = 0;
-            if (p.completed) *p.completed = p.bytes;
+            if (p.status)    *Gu32(p.status) = 0;
+            if (p.completed) *Gu32(p.completed) = p.bytes;
             s->inflight.pop_front();
             ++g_cntPktDone;
             SndLog("strm s#%d pkt done (inflight=%u)", s->id, (unsigned)s->inflight.size());
@@ -591,7 +601,7 @@ static void StreamService(ShimStream* s) {
     if (s->flushPending) {
         if (s->voice) { s->voice->Stop(); s->voice->Flush(); }
         for (ShimStream::Pkt& p : s->inflight) {
-            if (p.status) *p.status = 0;
+            if (p.status) *Gu32(p.status) = 0;
             s->retired.push_back(p.pcm);     // mixer may still read until Flush lands
         }
         s->inflight.clear();
@@ -607,12 +617,12 @@ static uint32_t __stdcall Strm_Release(ShimStream* s) {
     if (!ValidStrm(s)) return 0;
     printf("[snd] stream s#%d released\n", s->id);
     for (ShimStream::Pkt& p : s->inflight)
-        if (p.status) *p.status = 0;         // never leave slots wedged at E_PENDING
+        if (p.status) *Gu32(p.status) = 0;   // never leave slots wedged at E_PENDING
     g_streams.erase(std::remove(g_streams.begin(), g_streams.end(), s), g_streams.end());
     delete s->voice;
     s->voice = nullptr;
     s->magic = 0;
-    delete s;
+    DeleteGuestObj(s);
     return 0;
 }
 
@@ -636,14 +646,14 @@ static HRES __stdcall Strm_GetStatus(ShimStream* s, uint32_t* out) {
 static HRES __stdcall Strm_Process(ShimStream* s, XMediaPkt* src, XMediaPkt* dst) {
     (void)dst;
     if (!ValidStrm(s) || !src) return 0;
-    if (src->pdwStatus) *src->pdwStatus = kPktPending;
+    if (src->pdwStatus) *Gu32(src->pdwStatus) = kPktPending;
     if (s->flushPending)
         SndWarn("strm s#%d Process during pending flush (steal path)", s->id);
     uint32_t ba = s->fmt.blockAlign ? s->fmt.blockAlign : 36;
     uint32_t bytes = src->dwMaxSize - (src->dwMaxSize % ba);
     if (!src->pvBuffer || !bytes) {          // degenerate packet: complete as empty
-        if (src->pdwStatus) *src->pdwStatus = 0;
-        if (src->pdwCompletedSize) *src->pdwCompletedSize = 0;
+        if (src->pdwStatus) *Gu32(src->pdwStatus) = 0;
+        if (src->pdwCompletedSize) *Gu32(src->pdwCompletedSize) = 0;
         return 0;
     }
     Pcm pcm = std::make_shared<std::vector<int16_t>>();
@@ -651,21 +661,21 @@ static HRES __stdcall Strm_Process(ShimStream* s, XMediaPkt* src, XMediaPkt* dst
     if (s->fmt.tag == 0x0069 && s->fmt.ch == 2 && ba == 72) {
         frames = bytes / 72 * 65;
         pcm->resize((size_t)frames * 2);
-        snd::XadpcmDecodeStereo((const uint8_t*)src->pvBuffer, bytes, pcm->data());
-        DumpMusicPacket((const uint8_t*)src->pvBuffer, bytes, pcm->data(), frames,
+        snd::XadpcmDecodeStereo(Gu8c(src->pvBuffer), bytes, pcm->data());
+        DumpMusicPacket(Gu8c(src->pvBuffer), bytes, pcm->data(), frames,
                         s->fmt.rate ? s->fmt.rate : 48000, 2);
     } else if (s->fmt.tag == 0x0069 && s->fmt.ch == 1 && ba == 36) {
         frames = bytes / 36 * 65;
         pcm->resize(frames);
-        snd::XadpcmDecodeMono((const uint8_t*)src->pvBuffer, bytes, pcm->data());
+        snd::XadpcmDecodeMono(Gu8c(src->pvBuffer), bytes, pcm->data());
     } else if (s->fmt.tag == 1 && s->fmt.bits == 16 && s->fmt.ch >= 1) {
         frames = bytes / (s->fmt.ch * 2);    // defensive: raw PCM16 passthrough
-        pcm->assign((const int16_t*)src->pvBuffer,
-                    (const int16_t*)src->pvBuffer + (size_t)frames * s->fmt.ch);
+        pcm->assign((const int16_t*)(uintptr_t)src->pvBuffer,
+                    (const int16_t*)(uintptr_t)src->pvBuffer + (size_t)frames * s->fmt.ch);
     } else {
         SndWarn("strm s#%d unsupported format tag=%04x ch=%u blk=%u",
                 s->id, s->fmt.tag, s->fmt.ch, ba);
-        if (src->pdwStatus) *src->pdwStatus = kPktFailed;
+        if (src->pdwStatus) *Gu32(src->pdwStatus) = kPktFailed;
         return 0;
     }
     if (!s->voice) {
@@ -676,7 +686,7 @@ static HRES __stdcall Strm_Process(ShimStream* s, XMediaPkt* src, XMediaPkt* dst
     }
     if (!s->voice->Submit(pcm->data(), frames, false, 0, 0, false)) {
         SndWarn("strm s#%d submit failed", s->id);
-        if (src->pdwStatus) *src->pdwStatus = kPktFailed;
+        if (src->pdwStatus) *Gu32(src->pdwStatus) = kPktFailed;
         return 0;
     }
     s->inflight.push_back({ src->pdwStatus, src->pdwCompletedSize, pcm, bytes });
@@ -699,21 +709,28 @@ static HRES __stdcall Strm_Flush(ShimStream* s) {
     return 0;
 }
 
+#if defined(_M_IX86)
 static void* g_strmVtbl[7] = {
     (void*)&Strm_AddRef, (void*)&Strm_Release, (void*)&Strm_GetInfo,
     (void*)&Strm_GetStatus, (void*)&Strm_Process, (void*)&Strm_Discontinuity,
     (void*)&Strm_Flush,
 };
+static uint32_t StrmVtblVa() { return (uint32_t)(uintptr_t)g_strmVtbl; }
+#else
+// Filled at install from the dispatch registration KEYS, in a guest-low uint32 array.
+static uint32_t g_strmVtblVa = 0;
+static uint32_t StrmVtblVa() { return g_strmVtblVa; }
+#endif
 
 static ShimStream* NewStream(uint8_t* desc) {
-    ShimStream* s = new ShimStream();
-    s->vtbl = g_strmVtbl;
+    ShimStream* s = NewGuestObj<ShimStream>();
+    s->vtbl = StrmVtblVa();
     s->id = g_nStreams++;
     g_streams.push_back(s);
     if (desc) {
         s->is3D = (*(uint32_t*)(desc + 0) & 0x10) != 0;   // flags at +0 (no dwSize)
         s->maxPackets = *(uint32_t*)(desc + 4);
-        CopyWfx(&s->fmt, *(void**)(desc + 8));
+        CopyWfx(&s->fmt, (const void*)(uintptr_t)*(uint32_t*)(desc + 8));   // gptr field
     }
     if (g_log && s->id < 4)
         printf("[snd] create stream s#%d %s maxPkts=%u\n",
@@ -795,10 +812,11 @@ static void FileService(ShimFile* f) {
         f->pending.pop_front();
         struct { int32_t st; uint32_t info; } iosb{};
         int64_t off = (int64_t)r.off;
-        int32_t st = Hy_NtReadFile(f->h, 0, nullptr, nullptr, &iosb, r.dst, r.max, &off);
+        int32_t st = Hy_NtReadFile(f->h, 0, nullptr, nullptr, &iosb,
+                                   (void*)(uintptr_t)r.dst, r.max, &off);
         uint32_t got = st >= 0 ? iosb.info : 0;
-        if (r.completed) *r.completed = got;
-        if (r.status)    *r.status = st >= 0 ? 0u : kPktFailed;
+        if (r.completed) *Gu32(r.completed) = got;
+        if (r.status)    *Gu32(r.status) = st >= 0 ? 0u : kPktFailed;
         ++g_cntRead;
         SndLog("xfile f#%d read off=0x%llx len=0x%x got=0x%x st=%08x",
                f->id, (unsigned long long)r.off, r.max, got, (uint32_t)st);
@@ -811,12 +829,12 @@ static uint32_t __stdcall File_Release(ShimFile* f) {
     if (!ValidFile(f)) return 0;
     printf("[snd] file object f#%d released (handle %08x)\n", f->id, f->h);
     for (ShimFile::Req& r : f->pending) {    // never leave slots wedged at E_PENDING
-        if (r.status)    *r.status = 0;
-        if (r.completed) *r.completed = 0;
+        if (r.status)    *Gu32(r.status) = 0;
+        if (r.completed) *Gu32(r.completed) = 0;
     }
     g_fileObjs.erase(std::remove(g_fileObjs.begin(), g_fileObjs.end(), f), g_fileObjs.end());
     f->magic = 0;
-    delete f;
+    DeleteGuestObj(f);
     return 0;
 }
 
@@ -834,7 +852,7 @@ static HRES __stdcall File_GetStatus(ShimFile* f, uint32_t* out) {
 static HRES __stdcall File_Process(ShimFile* f, XMediaPkt* src, XMediaPkt* dst) {
     (void)src;
     if (!ValidFile(f) || !dst) return 0;
-    if (dst->pdwStatus) *dst->pdwStatus = kPktPending;
+    if (dst->pdwStatus) *Gu32(dst->pdwStatus) = kPktPending;
     f->pending.push_back({ dst->pvBuffer, dst->dwMaxSize, dst->pdwStatus,
                            dst->pdwCompletedSize, f->pos });
     f->pos += dst->dwMaxSize;
@@ -846,7 +864,7 @@ static HRES __stdcall File_Discontinuity(ShimFile* f) { (void)f; return 0; }
 static HRES __stdcall File_Flush(ShimFile* f) {
     if (!ValidFile(f)) return 0;
     for (ShimFile::Req& r : f->pending)
-        if (r.status) *r.status = 0;
+        if (r.status) *Gu32(r.status) = 0;
     f->pending.clear();
     return 0;
 }
@@ -872,26 +890,32 @@ static HRES __stdcall File_DoWork(ShimFile* f) {
     return 0;
 }
 
+#if defined(_M_IX86)
 static void* g_fileVtbl[10] = {
     (void*)&File_AddRef, (void*)&File_Release, (void*)&File_GetInfo,
     (void*)&File_GetStatus, (void*)&File_Process, (void*)&File_Discontinuity,
     (void*)&File_Flush, (void*)&File_Seek, (void*)&File_GetLength,
     (void*)&File_DoWork,
 };
+static uint32_t FileVtblVa() { return (uint32_t)(uintptr_t)g_fileVtbl; }
+#else
+static uint32_t g_fileVtblVa = 0;
+static uint32_t FileVtblVa() { return g_fileVtblVa; }
+#endif
 
 // hFile is an ALREADY-OPEN handle from the game's file-open callback -- with
 // the hybrid file layer that's a pseudo-handle (0x80000000|idx), which is why
 // reads route through Hy_NtReadFile. maxPackets: 3 (music .xmb), 2 (SFX .xbk).
-static HRES __stdcall XF_CreateMediaObjectAsync(uint32_t hFile, uint32_t maxPackets, ShimFile** ppObj) {
-    ShimFile* f = new ShimFile();
-    f->vtbl = g_fileVtbl;
+static HRES __stdcall XF_CreateMediaObjectAsync(uint32_t hFile, uint32_t maxPackets, uint32_t* ppObj) {
+    ShimFile* f = NewGuestObj<ShimFile>();
+    f->vtbl = FileVtblVa();
     f->id = g_nFiles++;
     f->h = hFile;
     g_fileObjs.push_back(f);
     printf("[snd] XFileCreateMediaObjectAsync f#%d handle=%08x maxPkts=%u%s\n",
            f->id, hFile, maxPackets,
            (hFile & 0x80000000u) ? "" : " (NOT a bridged file handle!)");
-    if (ppObj) *ppObj = f;
+    if (ppObj) *ppObj = Gp32(f);
     return 0;
 }
 
@@ -946,6 +970,11 @@ static void RestoreGameFn(int i, const char* name) {
 // +0x104..0x184 falls inside the PE DataDirectory, whose CONTENTS nothing
 // validates -- so the original XBE bytes are restored there verbatim.
 static void FixExeHeaderForThreads() {
+#if !defined(_WIN32)
+    // ARM: threads come from pthreads and read no PE header; the XBE header at 0x10000
+    // stays exactly as mapped.
+    return;
+#else
     uint8_t* self = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -966,6 +995,7 @@ static void FixExeHeaderForThreads() {
     memcpy(base, hdr, sizeof hdr);
     VirtualProtect(base, sizeof hdr, old, &old);
     printf("[snd] exe header @0x10000 rebuilt as PE (thread-stack defaults live again)\n");
+#endif
 }
 
 int InstallDSoundBridge() {
@@ -1022,23 +1052,39 @@ int InstallDSoundBridge() {
     // the arrays keep raw addresses on the x86 host (key == address), so guest-visible
     // words are unchanged; on ARM the arrays must hold the returned keys AND relocate
     // below 4 GB (host statics stored into guest objects — the gptr sweep's list).
-    DispatchRegister(HOOK_STD(Strm_AddRef),        "snd:strm.addref");
-    DispatchRegister(HOOK_STD(Strm_Release),       "snd:strm.release");
-    DispatchRegister(HOOK_STD(Strm_GetInfo),       "snd:strm.getinfo");
-    DispatchRegister(HOOK_STD(Strm_GetStatus),     "snd:strm.getstatus");
-    DispatchRegister(HOOK_STD(Strm_Process),       "snd:strm.process");
-    DispatchRegister(HOOK_STD(Strm_Discontinuity), "snd:strm.discontinuity");
-    DispatchRegister(HOOK_STD(Strm_Flush),         "snd:strm.flush");
-    DispatchRegister(HOOK_STD(File_AddRef),        "snd:file.addref");
-    DispatchRegister(HOOK_STD(File_Release),       "snd:file.release");
-    DispatchRegister(HOOK_STD(File_GetInfo),       "snd:file.getinfo");
-    DispatchRegister(HOOK_STD(File_GetStatus),     "snd:file.getstatus");
-    DispatchRegister(HOOK_STD(File_Process),       "snd:file.process");
-    DispatchRegister(HOOK_STD(File_Discontinuity), "snd:file.discontinuity");
-    DispatchRegister(HOOK_STD(File_Flush),         "snd:file.flush");
-    DispatchRegister(HOOK_STD(File_Seek),          "snd:file.seek");
-    DispatchRegister(HOOK_STD(File_GetLength),     "snd:file.getlength");
-    DispatchRegister(HOOK_STD(File_DoWork),        "snd:file.dowork");
+    const uint32_t strmKeys[7] = {
+        DispatchRegister(HOOK_STD(Strm_AddRef),        "snd:strm.addref"),
+        DispatchRegister(HOOK_STD(Strm_Release),       "snd:strm.release"),
+        DispatchRegister(HOOK_STD(Strm_GetInfo),       "snd:strm.getinfo"),
+        DispatchRegister(HOOK_STD(Strm_GetStatus),     "snd:strm.getstatus"),
+        DispatchRegister(HOOK_STD(Strm_Process),       "snd:strm.process"),
+        DispatchRegister(HOOK_STD(Strm_Discontinuity), "snd:strm.discontinuity"),
+        DispatchRegister(HOOK_STD(Strm_Flush),         "snd:strm.flush"),
+    };
+    const uint32_t fileKeys[10] = {
+        DispatchRegister(HOOK_STD(File_AddRef),        "snd:file.addref"),
+        DispatchRegister(HOOK_STD(File_Release),       "snd:file.release"),
+        DispatchRegister(HOOK_STD(File_GetInfo),       "snd:file.getinfo"),
+        DispatchRegister(HOOK_STD(File_GetStatus),     "snd:file.getstatus"),
+        DispatchRegister(HOOK_STD(File_Process),       "snd:file.process"),
+        DispatchRegister(HOOK_STD(File_Discontinuity), "snd:file.discontinuity"),
+        DispatchRegister(HOOK_STD(File_Flush),         "snd:file.flush"),
+        DispatchRegister(HOOK_STD(File_Seek),          "snd:file.seek"),
+        DispatchRegister(HOOK_STD(File_GetLength),     "snd:file.getlength"),
+        DispatchRegister(HOOK_STD(File_DoWork),        "snd:file.dowork"),
+    };
+#if defined(_M_IX86)
+    // The static arrays already hold exactly these values (key == host address).
+    (void)strmKeys; (void)fileKeys;
+#else
+    // ARM: the vtables the guest reads are uint32 KEY arrays in guest-low memory.
+    uint32_t* vt = (uint32_t*)GuestObjAlloc(sizeof strmKeys + sizeof fileKeys, 4);
+    memcpy(vt, strmKeys, sizeof strmKeys);
+    memcpy(vt + 7, fileKeys, sizeof fileKeys);
+    g_strmVtblVa = Gp32(vt);
+    g_fileVtblVa = Gp32(vt + 7);
+    printf("[snd] guest vtables at %08X (stream) / %08X (file)\n", g_strmVtblVa, g_fileVtblVa);
+#endif
     // Everything else (3D setters, mixbins, I3DL2, DownloadEffectsImage,
     // UseFullHRTF, CommitDeferredSettings) keeps its ret-0 stub: safe no-ops
     // per the RE spec. 3D positioning is a follow-up (plain volume for now).

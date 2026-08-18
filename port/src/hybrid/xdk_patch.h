@@ -41,4 +41,57 @@ uint32_t MakeGuestTramp(uint32_t va, int prologueLen, const char* label);
 // (hybrid_run calls this next to its other fixed reservations).
 void ReserveTrampPad();
 
+// CONTINUATION (jmp-hook) PATCHING — one call for both hosts. x86: patch to the naked
+// wrapper (the native-mode path, byte-identical to before) and register the engine
+// semantic at the wrapper's address. ARM: the wrapper cannot exist — a synthetic
+// dispatch key is minted, patched in, and the semantic registered at the key.
+// `callShaped` picks PatchCallSite (retarget an existing E8) over PatchJump.
+// NAKED_HOOK wraps the wrapper name so shared call sites compile on ARM, where the
+// naked function is compiled out entirely.
+#if defined(_M_IX86)
+#define NAKED_HOOK(f) ((const void*)&(f))
+#else
+#define NAKED_HOOK(f) ((const void*)nullptr)
+#endif
+bool PatchJmpHook(uint32_t va, bool callShaped, const void* nakedWrapper,
+                  uint32_t resumeVa, void(__cdecl* fn)(tj::engine::CpuState&),
+                  bool escapeSafe, const char* label);
+
+// GUEST-VISIBLE HOST OBJECTS (the §2.1 gptr relocation list, mechanized). Any host
+// object whose POINTER is stored into a 4-byte guest slot (dsound's ShimStream /
+// ShimFile / ShimBuffer, lan_ui's picture widget, vtable arrays) must live below
+// 4 GB on a 64-bit host. x86: plain new/delete, byte-identical behavior. ARM: a
+// below-4GB bump arena (allocations are never returned — matching the shims'
+// leak-on-teardown lifetime; DeleteGuestObj runs the destructor only).
+void* GuestObjAlloc(size_t size, size_t align);
+// A pointer value the guest will hold: FATAL above 4 GB rather than truncate.
+uint32_t Gp32(const void* p);
+
+template <class T, class... A> T* NewGuestObj(A&&... a) {
+#if defined(_M_IX86)
+    return new T(static_cast<A&&>(a)...);
+#else
+    return new (GuestObjAlloc(sizeof(T), alignof(T))) T(static_cast<A&&>(a)...);
+#endif
+}
+template <class T> void DeleteGuestObj(T* p) {
+    if (!p) return;
+#if defined(_M_IX86)
+    delete p;
+#else
+    p->~T();        // arena memory is never reused; the dtor releases host resources
+#endif
+}
+
+// GUEST-VISIBLE STATIC BUFFERS — for the UI files' item objects, sprite objects and
+// custom text tables, whose ADDRESSES flow into guest-walked lists or are returned to
+// guest code, the declaration pattern is a reference bound to arena memory:
+//     static char (&g_txt)[kTextN][56] = *(char(*)[kTextN][56])GuestObjAlloc(...);
+// Every use site (sizeof, indexing, array decay) reads exactly as before; the arena is
+// ordinary VirtualAlloc memory on x86 and guest-low memory on ARM, zero-initialized in
+// both (fresh pages; the bump arena never reuses). Distinct allocation per
+// declaration — never share one GuestObjAlloc between two names.
+// A string the GUEST will hold a pointer to (Hk_GetText's literals):
+char* GuestStrDup(const char* s);
+
 } // namespace tj::hybrid

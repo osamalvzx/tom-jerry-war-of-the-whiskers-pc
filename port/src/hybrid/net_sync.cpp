@@ -29,7 +29,7 @@
 //   TJ_DETFROM=<n>    start logging at frame n (skip boot noise)
 #include "net_sync.h"
 
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -95,6 +95,7 @@ static void __cdecl MtTraceRecord(uint32_t rawRet) {
 // Naked so the original stack/registers are untouched: only the counter and (briefly) the
 // flags change, and pushfd/popfd restores those. Control falls through to the trampoline,
 // which runs the real prologue and jumps back into the untouched body.
+#if defined(_M_IX86)
 __declspec(naked) static void Hk_MtNext() {
     __asm {
         pushfd
@@ -112,6 +113,7 @@ __declspec(naked) static void Hk_MtNext() {
         jmp dword ptr [g_mtTramp]
     }
 }
+#endif
 // Portable semantic for the naked hook above (engine mode, registered jmp-hook): count
 // the draw, record the TRUE caller from the interpreted stack (no escape thunk to see
 // through here), resume interpreting at the guest-window trampoline.
@@ -177,6 +179,7 @@ static void __cdecl SeedAtBarrier() {
     // [esp] already holds the caller's return address and ecx the fade object.
     g_mode6Orig = (uint32_t)(uintptr_t)GuestFnPtr(0x14EC0);
 }
+#if defined(_M_IX86)
 __declspec(naked) static void Hk_Mode6Begin() {
     __asm {
         pushad
@@ -187,6 +190,7 @@ __declspec(naked) static void Hk_Mode6Begin() {
         jmp dword ptr [g_mode6Orig]   // thiscall: ecx must still hold the fade object
     }
 }
+#endif
 // Portable semantic (engine mode): reseed, then resume interpreting at the ORIGINAL
 // callee 0x14EC0 — its entry bytes are intact (the patch was on the CALL SITE), the
 // return address is already at [esp], and ecx still holds the fade object in s. The
@@ -354,9 +358,16 @@ static void ItemLogFrame() {
 }
 
 static uint16_t FpuCw() {
+#if defined(_M_IX86)
     uint16_t cw = 0;
     __asm { fnstcw word ptr [cw] }
     return cw;
+#else
+    // Hooks run with the guest x87 materialized on the "host FPU" — which on ARM is
+    // the virtual fnsave image (fpu_host.cpp). Same read, same moment.
+    const uint8_t* im = tj::engine::VirtualHostFpu()->image;
+    return (uint16_t)(im[0] | (im[1] << 8));
+#endif
 }
 
 static uint32_t g_mtUpd = 0, g_mtRnd = 0, g_lcgUpd = 0, g_lcgRnd = 0;
@@ -462,8 +473,13 @@ static void __cdecl Hk_GameUpdate() {
         ++g_fpuWarned;
         printf("[net] WARN x87 control word %04x (expected 027F) at frame %u -- restoring\n",
                cw, g_netFrame);
+#if defined(_M_IX86)
         uint16_t want = 0x027F;
         __asm { fldcw word ptr [want] }
+#else
+        uint8_t* im = tj::engine::VirtualHostFpu()->image;
+        im[0] = 0x7F; im[1] = 0x02;
+#endif
     }
     ForceItemContest();
     uint32_t mt0 = g_mtCalls, lcg0 = g_lcgCalls;
@@ -630,23 +646,20 @@ int InstallNetSync() {
     // RNG counters. Both sites start with a single 5-byte instruction (MT:
     // `mov eax,[0xF57D0]`, rand: `call __getptd`), so a 5-byte trampoline is exact.
     g_mtTramp = MakeGuestTramp(kMtNext, 5, "net:tr.mt");
-    // HOOK_RAW ×2 below: naked hooks stay the NATIVE-mode path. Engine mode uses the
-    // registered jmp-hook semantics (MtNextEngine / Mode6Engine — portable, the ARM
-    // shape); TJ_ENG_RAWHOOKS=1 reverts those to escape+naked for same-binary A/B.
-    if (g_mtTramp && PatchJump(kMtNext, HOOK_RAW(Hk_MtNext), "net:mt")) {
-        EngineModeRegisterJmpHook((const void*)&Hk_MtNext, g_mtTramp,
-                                  &MtNextEngine, /*escapeSafe=*/true);
+    // Continuation hooks ×2 below: the naked wrappers stay the NATIVE-mode path (x86);
+    // engine mode uses the registered jmp-hook semantics (MtNextEngine / Mode6Engine —
+    // portable, and on ARM the ONLY path, patched to a synthetic key);
+    // TJ_ENG_RAWHOOKS=1 reverts to escape+naked for same-binary A/B (x86 only).
+    if (g_mtTramp && PatchJmpHook(kMtNext, /*callShaped=*/false, NAKED_HOOK(Hk_MtNext),
+                                  g_mtTramp, &MtNextEngine, /*escapeSafe=*/true, "net:mt"))
         ++ok;
-    }
     // rand/srand are REPLACED (not trampolined): we own the state so `srand(time())` in
     // the game's own startup can no longer make two peers diverge.
     if (PatchJump(kCrtRand, HOOK_CDECL(Hk_CrtRand), "net:rand")) ++ok;
     if (PatchJump(kCrtSrand, HOOK_CDECL(Hk_CrtSrand), "net:srand")) ++ok;
-    if (PatchCallSite(kMode6Begin, HOOK_RAW(Hk_Mode6Begin), "net:matchbarrier")) {
-        EngineModeRegisterJmpHook((const void*)&Hk_Mode6Begin, 0x14EC0u,
-                                  &Mode6Engine, /*escapeSafe=*/true);
+    if (PatchJmpHook(kMode6Begin, /*callShaped=*/true, NAKED_HOOK(Hk_Mode6Begin),
+                     0x14EC0u, &Mode6Engine, /*escapeSafe=*/true, "net:matchbarrier"))
         ++ok;
-    }
 
     NetInit();      // TJ_NET=host | join:<ip>  -- no-op when unset (single-player unchanged)
 

@@ -65,3 +65,59 @@ add_executable(eng_call_smoke
     ${CMAKE_CURRENT_SOURCE_DIR}/../tests/eng_call_smoke.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/hybrid/dispatch.cpp)
 target_link_libraries(eng_call_smoke PRIVATE tj_engine tj_softfloat)
+
+# --- tj_headless: THE GAME LAYER, headless (Stage 5 §4; Gates S5a..S5d) -------------
+# The whole hybrid layer + game bring-up against the null gfx recorder and the null
+# audio backend, engine armed from process start. TJ_DETLOG from this binary vs the
+# Windows EXACT leg is Gate S5c; TJ_DRAWLOG streams are Gate S5d.
+set(HYB ${CMAKE_CURRENT_SOURCE_DIR}/../src/hybrid)
+set(RT  ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime)
+add_executable(tj_headless
+    ${HYB}/headless_main.cpp
+    ${HYB}/host_compat.cpp
+    ${HYB}/dispatch.cpp
+    ${HYB}/xdk_patch.cpp
+    ${HYB}/kernel.cpp
+    ${HYB}/crt_glue.cpp
+    ${HYB}/fs_fixup.cpp
+    ${HYB}/xbe_image.cpp
+    ${HYB}/xcrypt.cpp
+    ${HYB}/symbolize.cpp
+    ${HYB}/file_io.cpp
+    ${HYB}/startup.cpp
+    ${HYB}/engine_mode.cpp
+    ${HYB}/net_sync.cpp
+    ${HYB}/net_lan_null.cpp
+    ${HYB}/lan_match.cpp
+    ${HYB}/lan_ui.cpp
+    ${HYB}/fe_menu.cpp
+    ${HYB}/audio_ui.cpp
+    ${HYB}/meat_rush.cpp
+    ${HYB}/meat_ui.cpp
+    ${HYB}/meat_menu.cpp
+    ${HYB}/dsound_bridge.cpp
+    ${HYB}/d3d8_bridge.cpp
+    ${HYB}/prof.cpp
+    ${RT}/gfx/null_gfx.cpp
+    ${RT}/snd/null_snd.cpp
+    ${RT}/snd/xadpcm.cpp
+    ${RT}/snd/wav_dump.cpp
+    ${RT}/assets/xmf_texture.cpp)
+target_include_directories(tj_headless PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# DYNAMIC PIE, deliberately — the shape PROVEN on the device (eng_call_smoke): Android
+# loads PIE high, far above the guest window, and the kernel honors
+# MAP_FIXED_NOREPLACE, so the fixed sub-4GB layout maps cleanly.
+# ⚠ Do NOT link -static here: the static base (0x200000) sits INSIDE the guest window
+# and the image-window map wipes the program's own code (measured under qemu).
+
+# --- tj_headless_static: the qemu-user leg (a LOCAL aarch64 S5c rig on this PC).
+# Same sources; static (qemu can't load bionic's dynamic linker) with the image based
+# at 0xF0000000 — above the whole guest layout, below 4 GB. Run it as:
+#   qemu-aarch64-static -B 0x2000000000 tj_headless_static <xbe>   (guest_base shifts
+# every guest mapping clear of qemu's own low host memory; qemu 8.2 emulates
+# MAP_FIXED_NOREPLACE, so no TJ_MMAP_TRUST_FIXED needed).
+add_executable(tj_headless_static $<TARGET_PROPERTY:tj_headless,SOURCES>)
+target_include_directories(tj_headless_static PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_options(tj_headless_static PRIVATE -static "-Wl,--image-base=0xF0000000")
+target_link_libraries(tj_headless_static PRIVATE tj_engine tj_softfloat)
+target_link_libraries(tj_headless PRIVATE tj_engine tj_softfloat)

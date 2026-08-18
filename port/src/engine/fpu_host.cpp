@@ -26,5 +26,10 @@ void FpuRestoreHost(const FpuEnv* env) {
     std::memcpy(g_virtualHostFpu.image, env->image, sizeof g_virtualHostFpu.image);
 }
 
+// The gate's VA->live-address seam lives in eng_gate.cpp (x86-only machinery). The
+// hybrid uses identity mapping (null) everywhere, and on this host there is no gate —
+// accept and ignore, so engine_mode.cpp stays one code path.
+void EngineSetCodeMap(void* (*)(uint32_t)) {}
+
 } // namespace tj::engine
 #endif

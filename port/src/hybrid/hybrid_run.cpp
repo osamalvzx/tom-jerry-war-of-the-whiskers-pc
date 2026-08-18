@@ -3,7 +3,7 @@
 // global data. Later milestones drive the CRT/XAPI startup chain into the game.
 #include "hybrid/xbe_image.h"
 #include "hybrid/kernel.h"
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdint>
 #include <cmath>

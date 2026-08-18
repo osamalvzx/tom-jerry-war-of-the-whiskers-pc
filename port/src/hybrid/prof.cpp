@@ -16,12 +16,24 @@
 //               (offline: diff consecutive lines to isolate the in-match interval)
 //   <path>.hot  rewritten every snap: top .text 64-byte buckets by samples, for mapping
 //               hot guest code to functions.csv offline
-#include <windows.h>
+#include "hybrid/host_compat.h"
+#ifdef _WIN32
 #include <timeapi.h>   // timeBeginPeriod (WIN32_LEAN_AND_MEAN drops mmsystem.h)
 #include <psapi.h>
+#endif
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+
+#ifndef _WIN32
+// The sampler is Suspend/GetThreadContext machinery with no POSIX analogue here, and
+// Stage-0 questions are answered; on-device profiling uses eng_bench / TJ_PROF stays
+// a Windows tool. Stubs keep the install list identical across hosts.
+namespace tj::hybrid {
+int InstallProf() { return 0; }
+void ProfRetargetToCurrentThread() {}
+}
+#else
 
 namespace tj::hybrid {
 
@@ -224,3 +236,4 @@ void ProfRetargetToCurrentThread() {
 }
 
 } // namespace tj::hybrid
+#endif // _WIN32

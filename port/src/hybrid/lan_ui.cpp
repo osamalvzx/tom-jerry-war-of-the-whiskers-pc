@@ -28,7 +28,7 @@
 #include "xdk_patch.h"
 #include "hybrid/guest_call.h"
 
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -98,7 +98,8 @@ static bool Pressed(uint32_t id) {
 // ours. Row text is rebuilt into these buffers every frame from live session state.
 static const uint16_t kTextBase = 0x100;
 static const int kTextN = 160;
-static char g_txt[kTextN][56];
+static char (&g_txt)[kTextN][56] = *(char(*)[kTextN][56])GuestObjAlloc(
+    sizeof(char[kTextN][56]), 8);   // guest holds pointers into it (Hk_GetText)
 
 // THE FONT IS PROPORTIONAL, so a "column" cannot be made of padding spaces -- every row would
 // sit at its own ragged offset (user-reported). Anything that has to line up is therefore a
@@ -250,11 +251,16 @@ static const uint32_t kColGold   = 0x169F64;   // (255,173,26,127)  values the p
 // OVERLAPPED once the upper row was selected. Everything here is spaced >= 1.5*max(S).
 static const float kPitchMin = 1.5f;
 
-struct Row { uint8_t mem[0x84]; };
+// A Row's storage is GUEST-WALKED (the screen's +0x60/+0x64 item list points into
+// it), so it lives in the guest-visible arena — allocated per instance at static-init.
+struct Row {
+    uint8_t* mem;
+    Row() : mem((uint8_t*)GuestObjAlloc(0x84, 8)) {}
+};
 static uint32_t MakeRow(Row& r, uint16_t label, float x, float y, bool selectable, float scale,
                         int align = ALIGN_CENTRE, uint32_t colour = 0) {
-    uint32_t it = (uint32_t)(uintptr_t)r.mem;
-    memset(r.mem, 0, sizeof r.mem);
+    uint32_t it = Gp32(r.mem);
+    memset(r.mem, 0, 0x84);
     ItemCtor(it, 0);
     SetLabel(it, 0, label);
     SetValue(it, 0, 0x24);                        // no separate value string
@@ -843,7 +849,8 @@ static bool g_lCardsLive = false;      // Build got far enough to bind and appen
 // has not earned resolves to the wrong sprite.
 #define FighterCtor(...)    GCALL(Fastcall, FnThis,    0x1B300, __VA_ARGS__)
 #define FighterSetSlot(...) GCALL(Fastcall, FnThisU32, 0x1B020, __VA_ARGS__)
-static uint8_t g_swatch[4][0x724];
+static uint8_t (&g_swatch)[4][0x724] = *(uint8_t(*)[4][0x724])GuestObjAlloc(
+    sizeof(uint8_t[4][0x724]), 8);  // fighter-swatch objects, guest-rendered
 static bool    g_swatchLive = false;
 // Offset from the portrait's centre so the badge sits on its lower-right CORNER rather than
 // over the character's face (the portrait is ~0.095 x 0.136 about kSeatCardY).
@@ -982,21 +989,25 @@ static void __fastcall PicRender(uint32_t self, uint32_t) {
     CardBlit(scene, kArenaFgR[arena], kRectFgR,       x0, y0, x1, y1, kRgba);
     CardBlit(scene, kArenaTt[arena],  kRectTt[arena], x0, y0, x1, y1, kRgba);
 }
-static uint32_t g_picVtbl[4];
-static uint8_t  g_picObj[0x68];
 static uint32_t MakeArenaPic() {
     // Stage-5 dispatch (dispatch.h): the widget's vtable entries are guest->host
     // boundaries — guest Screen::Render calls through them. Register and store keys
-    // (identical words on the x86 host). NOTE for the ARM sweep: g_picVtbl/g_picObj
-    // themselves are HOST statics whose addresses live in guest-walked lists — they
-    // must relocate below 4 GB with the kernel VAR exports.
-    g_picVtbl[0] = DispatchRegister(HOOK_FC(PicNop),    "lan:pic.nop");   // dtor -- never runs
-    g_picVtbl[1] = DispatchRegister(HOOK_FC(PicRender), "lan:pic.render");// Screen::Render
-    g_picVtbl[2] = g_picVtbl[0];                                          // item tick
-    g_picVtbl[3] = g_picVtbl[0];
-    memset(g_picObj, 0, sizeof g_picObj);
-    uint32_t it = (uint32_t)(uintptr_t)g_picObj;
-    *(uint32_t*)(uintptr_t)(it + 0x00) = (uint32_t)(uintptr_t)g_picVtbl;
+    // (identical words on the x86 host). The vtable AND the widget object are
+    // guest-walked (their addresses live in the screen's item list), so they come
+    // from the guest-visible arena — plain statics on x86, below 4 GB on ARM.
+    static uint32_t* picVtbl = nullptr;
+    static uint8_t*  picObj = nullptr;
+    if (!picVtbl) {
+        picVtbl = (uint32_t*)GuestObjAlloc(4 * 4, 4);
+        picObj  = (uint8_t*)GuestObjAlloc(0x68, 8);
+    }
+    picVtbl[0] = DispatchRegister(HOOK_FC(PicNop),    "lan:pic.nop");   // dtor -- never runs
+    picVtbl[1] = DispatchRegister(HOOK_FC(PicRender), "lan:pic.render");// Screen::Render
+    picVtbl[2] = picVtbl[0];                                            // item tick
+    picVtbl[3] = picVtbl[0];
+    memset(picObj, 0, 0x68);
+    uint32_t it = Gp32(picObj);
+    *(uint32_t*)(uintptr_t)(it + 0x00) = Gp32(picVtbl);
     *(float*)(uintptr_t)(it + 0x40) = kArenaPicX;
     *(float*)(uintptr_t)(it + 0x44) = kArenaPicY;
     *(uint8_t*)(uintptr_t)(it + 0x48) = 1;

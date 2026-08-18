@@ -84,7 +84,15 @@ CpuState* g_frames[32];
 int       g_frameDepth = 0;
 bool      g_marshalCalls = true;      // TJ_ENG_GATECALL=1 clears (A/B kill switch)
 uint64_t  g_guestCalls = 0;
-uint8_t   g_gcSentinel;               // nested-Run stop address (host static, never guest)
+#if defined(_M_IX86)
+uint8_t   g_gcSentinelByte;           // nested-Run stop address (host static, never guest)
+#define GC_SENTINEL ((uint32_t)(uintptr_t)&g_gcSentinelByte)
+#else
+// A truncated host static could collide with guest addresses and varies per ASLR run —
+// nondeterminism the S5c oracle cannot tolerate. Fixed constant outside the guest
+// window and the synthetic-key space.
+#define GC_SENTINEL 0xF00D0001u
+#endif
 
 uint32_t AddEntry(const DispatchEntry& e) {
     if (!g_slotInit) { memset(g_slot, 0, sizeof g_slot); g_slotInit = true; }
@@ -155,7 +163,14 @@ void InvokeArgBytes(CpuState& s, const DispatchEntry& e) {
         return;
     }
     s.r[tj::engine::EAX] = (uint32_t)r;
+#if defined(_M_IX86)
+    // x86: the uint64 cast reads the host's REAL edx — what the escape captures, so
+    // the A/B compares equal. On AArch64 the high half of x0 is callee JUNK for a
+    // 32-bit-returning function (and nondeterministic): leave EDX untouched, the same
+    // documented choice ShimCC makes. MSVC guest code only reads a callee's edx for
+    // 64-bit returns, which don't exist in this table.
     s.r[tj::engine::EDX] = (uint32_t)(r >> 32);
+#endif
     s.r[tj::engine::ESP] = esp + 4 + (uint32_t)e.argBytes;
     s.eip = ret;
 }
@@ -272,7 +287,7 @@ uint32_t GuestMarshalCall(uint32_t va, const uint32_t* stackW, int nStackW,
     CpuState ns{};
     FpuCaptureHost(&ns.fpu);
     const uint32_t base = (outer->r[ESP] - 64u - (4u + 4u * (uint32_t)nStackW)) & ~3u;
-    *(uint32_t*)(uintptr_t)base = (uint32_t)(uintptr_t)&g_gcSentinel;
+    *(uint32_t*)(uintptr_t)base = GC_SENTINEL;
     for (int i = 0; i < nStackW; ++i)
         *(uint32_t*)(uintptr_t)(base + 4 + 4 * (uint32_t)i) = stackW[i];
     ns.r[ESP] = base;
@@ -281,7 +296,7 @@ uint32_t GuestMarshalCall(uint32_t va, const uint32_t* stackW, int nStackW,
     ns.eip = va;
     ns.eflags = 0;                                     // DF clear per ABI; rest dead
 
-    RunResult rr = Run(ns, (uint32_t)(uintptr_t)&g_gcSentinel, 400ull * 1000 * 1000);
+    RunResult rr = Run(ns, GC_SENTINEL, 400ull * 1000 * 1000);
     if (rr.kind != RunResult::Stopped) {
         printf("[gcall] FATAL %s @%08X: run stopped kind=%d addr=%08X detail=%08X\n",
                what, va, (int)rr.kind, rr.addr, rr.detail);

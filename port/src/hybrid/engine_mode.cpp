@@ -27,11 +27,14 @@
 #include "hybrid/dispatch.h"
 #include "engine/engine.h"
 #include "engine/engine_priv.h"
-#include <windows.h>
+#include "engine/x87_exact.h"
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstring>
 
 namespace tj::hybrid {
+
+void EngineModeCrashDump();     // defined below; the ARM FATAL path needs it early
 
 namespace {
 
@@ -42,6 +45,7 @@ constexpr uint32_t kGuestStackSize = 4u << 20;      // matches loader-scale stac
 uint8_t* g_guestStack = nullptr;
 CpuState g_cpu;                                     // the game's whole CPU, between escapes
 
+#if defined(_M_IX86)
 // ---- escape thunks (flat globals for MSVC inline asm; single game thread) ----------
 extern "C" {
 uint32_t g_emRegs[8];                               // Reg order: EAX ECX EDX EBX ESP EBP ESI EDI
@@ -49,6 +53,7 @@ uint32_t g_emTarget, g_emEspOut;
 uint8_t  g_emFpu[108];
 uint32_t g_emSavedHostEsp, g_emSavedSeh;
 }
+#endif
 // Displaced guest return addresses. Escapes DO nest once host->guest calls re-enter
 // the engine (escape -> native hook -> gate -> nested Run -> escape), so this is a
 // small LIFO, not a slot.
@@ -58,6 +63,7 @@ static uint64_t g_escapes = 0;
 static bool     g_engineMode = false;
 static bool     g_dispatchOn = true;    // TJ_ENG_NODISPATCH=1: every hook via the escape
 
+#if defined(_M_IX86)
 // The native function's `ret` lands here (on the GUEST stack): capture and unwind back
 // to the C++ escape handler on the host stack.
 static __declspec(naked) void EmRetThunk() {
@@ -97,6 +103,7 @@ static __declspec(naked) void EmCallThunk() {
         jmp  dword ptr [g_emTarget]
     }
 }
+#endif // _M_IX86
 
 // Continuation hooks (guest_call.h): consulted BEFORE the call-shaped escape path.
 struct EmJmpHook {
@@ -145,6 +152,17 @@ static bool HostEscape(CpuState& s) {
     // and unregistered targets fall through to the escape below.
     if (g_dispatchOn && DispatchTryInvoke(s)) return true;
 
+#if !defined(_M_IX86)
+    // ARM has no native escape: every guest->host transition must be a registered,
+    // invocable dispatch entry (or a jmp-hook above). Reaching here is a coverage gap
+    // that the x86 build's zero-unregistered-targets proof says cannot exist — stop
+    // loudly with the forensics.
+    printf("[eng-mode] FATAL: unhandled host target %08X on ARM (esp=%08X)\n",
+           s.eip, s.r[ESP]);
+    EngineModeCrashDump();
+    fflush(stdout);
+    _Exit(0xE5);
+#else
     ++g_escapes;
     if (g_pendingDepth >= 16) {
         printf("[eng-mode] escape depth overflow at eip=%08X\n", s.eip);
@@ -205,6 +223,7 @@ static bool HostEscape(CpuState& s) {
     memcpy(s.fpu.image, g_emFpu, 108);
     s.eip = g_pendingRet[--g_pendingDepth];
     return true;
+#endif // _M_IX86
 }
 
 } // namespace
@@ -221,7 +240,14 @@ void ProfRetargetToCurrentThread();   // prof.cpp (TJ_PROF follows the engine th
 // so guest code stays interpreted instead of leaking into native execution inside an
 // escape. (Run() is reentrant; the gate is convention-agnostic and 141/141-proven.)
 void* GuestFnPtr(uint32_t va) {
+#if defined(_M_IX86)
     return g_engineMode ? tj::engine::EngineGateForVa(va) : (void*)(uintptr_t)va;
+#else
+    // ARM builds have no gate and no native mode; every real call goes through GCALL's
+    // marshal (GuestMarshalReady() is true from boot arming). The identity value keeps
+    // shared expressions like SeedAtBarrier's g_mode6Orig refresh meaningful-but-unused.
+    return (void*)(uintptr_t)va;
+#endif
 }
 bool EngineModeArmed() { return g_engineMode; }
 uint32_t EngineModeDisplacedRet() {
@@ -250,8 +276,10 @@ void EngineModeCrashDump() {
            (uint32_t)(uintptr_t)g_guestStack + kGuestStackSize);
     for (int i = 0; i < g_pendingDepth && i < 16; ++i)
         printf("[VEH]   pendingRet[%d]=%08X\n", i, g_pendingRet[i]);
+#if defined(_M_IX86)
     printf("[VEH]   thunks: target=%08X savedHostEsp=%08X espOut=%08X retThunk=%p callThunk=%p\n",
            g_emTarget, g_emSavedHostEsp, g_emEspOut, (void*)&EmRetThunk, (void*)&EmCallThunk);
+#endif
     DispatchCrashDump();
     uint32_t ring[96];
     uint32_t n = EngineEipRing(ring, 96);
@@ -264,10 +292,14 @@ void EngineModeCrashDump() {
     fflush(stdout);
 }
 
-// The interpreter body — runs on the engine thread (or the main thread under
-// TJ_ENG_MAINTHREAD=1). Split out of RunGameMainEngine for the thread hop.
-static bool RunGameMainEngineBody(uint32_t vaGameMain) {
-    ProfRetargetToCurrentThread();              // TJ_PROF: sampler follows the game
+// One-time engine-mode setup: guest stack, A/B switches, exec range, escape handler,
+// FPU init, g_cpu's initial ESP. Shared by the Windows body (runs on the engine
+// thread, after every Install*) and the ARM boot arming (runs BEFORE startup init —
+// on ARM the engine is armed from process start; see EngineModeArmBoot).
+static bool EngineModeConfigure() {
+    static bool done = false;
+    if (done) return g_guestStack != nullptr;
+    done = true;
     g_guestStack = (uint8_t*)VirtualAlloc(nullptr, kGuestStackSize,
                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!g_guestStack) { printf("[eng-mode] guest stack alloc failed\n"); return false; }
@@ -291,7 +323,13 @@ static bool RunGameMainEngineBody(uint32_t vaGameMain) {
         g_jmpSemanticsOn = false;               // same-binary A/B: naked hooks via escape
         printf("[eng-mode] escape-safe naked hooks via ESCAPE (TJ_ENG_RAWHOOKS)\n");
     }
-    DispatchReport();
+    if (GetEnvironmentVariableA("TJ_ENG_EXACT", nc, 8) && nc[0] == '1') {
+        // The Gate-S5c reference leg: the Windows engine runs the EXACT soft-float
+        // unit so its detlog is comparable with the ARM run (§2.3 — S5c is
+        // EXACT-vs-EXACT, never EXACT-vs-silicon). Non-x86 builds are EXACT always.
+        EngineSetFpuMode(tj::engine::FpuMode::Exact);
+        printf("[eng-mode] x87 unit: EXACT soft-float (TJ_ENG_EXACT)\n");
+    }
     // The executable guest range is the WHOLE guest window, not just the XBE image:
     // the game runs code it placed in its own heap (proven at the 73.5s round-over —
     // a call whose displaced return address was 0x0C0E352C, deep in the low arena).
@@ -306,6 +344,7 @@ static bool RunGameMainEngineBody(uint32_t vaGameMain) {
     if (kpcr) EngineSetFsBase(kpcr);            // all fs:[...] -> the fake Xbox KPCR
 
     memset(&g_cpu, 0, sizeof g_cpu);
+#if defined(_M_IX86)
     {   // SetupFpu ran on the MAIN thread; this body may be on the engine thread whose
         // FPU is only the OS default. Same init, explicitly, so the captured guest
         // environment is CW 0x27F by construction, not by thread-creation defaults.
@@ -313,14 +352,69 @@ static bool RunGameMainEngineBody(uint32_t vaGameMain) {
         __asm { fninit }
         __asm { fldcw cw }
     }
+#else
+    {   // The virtual host FPU (fpu_host.cpp) starts zeroed: give it the same fninit +
+        // fldcw 0x27F state the x86 thread gets, byte for byte in the fnsave image.
+        uint8_t* im = tj::engine::VirtualHostFpu()->image;
+        memset(im, 0, 108);
+        im[0] = 0x7F; im[1] = 0x02;             // CW  = 0x027F
+        im[8] = 0xFF; im[9] = 0xFF;             // TW  = all-empty
+    }
+#endif
     FpuCaptureHost(&g_cpu.fpu);                 // CW 0x27F, as SetupFpu established
-    uint32_t esp = (uint32_t)(uintptr_t)(g_guestStack + kGuestStackSize - 0x1000);
-    static uint8_t sentinel;
-    *(uint32_t*)(uintptr_t)(esp) = (uint32_t)(uintptr_t)&sentinel;   // main never returns
-    g_cpu.r[ESP] = esp;
+    g_cpu.r[ESP] = (uint32_t)(uintptr_t)(g_guestStack + kGuestStackSize - 0x1000);
+    return true;
+}
+
+// After ApplyFsFixups (which allocates the fake KPCR) the engine's fs base must follow
+// — on Windows the body runs later and picks it up; on ARM the boot arming ran first,
+// so startup.cpp refreshes it here.
+void EngineModeRefreshFsBase() {
+    uint32_t kpcr = FsFixupKpcrBase();
+    if (kpcr) EngineSetFsBase(kpcr);
+}
+
+#if !defined(_M_IX86)
+// ARM: arm the engine BEFORE any guest code needs to run — startup init, CRT tables,
+// everything is marshaled through GCALL against this root context from process start.
+// The root dispatch frame makes GuestMarshalReady() true for host boot code.
+bool EngineModeArmBoot() {
+    g_engineMode = true;
+    if (!EngineModeConfigure()) return false;
+    DispatchPushFrame(&g_cpu);
+    printf("[eng-mode] armed from process start (guest stack %08X..%08X, root frame live)\n",
+           (uint32_t)(uintptr_t)g_guestStack,
+           (uint32_t)(uintptr_t)g_guestStack + kGuestStackSize);
+    return true;
+}
+#endif
+
+// The interpreter body — runs on the engine thread (or the main thread under
+// TJ_ENG_MAINTHREAD=1). Split out of RunGameMainEngine for the thread hop.
+static bool RunGameMainEngineBody(uint32_t vaGameMain) {
+    ProfRetargetToCurrentThread();              // TJ_PROF: sampler follows the game
+    if (!EngineModeConfigure()) return false;
+    // Re-assert range + fs base here: on ARM the boot arming configured them BEFORE the
+    // installs patched guest bytes; the exec-range reset also clears any decode-cache
+    // entries startup init left over now-patched sites (host writes are invisible to
+    // the store barrier — same rule as EngineModeInvalidateCode).
+    EngineSetExecRange(0x00011000u, 0x10000000u);
+    EngineModeRefreshFsBase();
+    DispatchReport();
+    uint32_t esp = g_cpu.r[ESP];
+#if defined(_M_IX86)
+    static uint8_t sentinel;                    // any non-guest host address works here
+    const uint32_t stop = (uint32_t)(uintptr_t)&sentinel;
+#else
+    // A host static's TRUNCATED low 32 bits could collide with guest addresses — and
+    // vary per ASLR run, which is nondeterminism S5c cannot have. Fixed constant:
+    // outside the guest window, outside the synthetic-key space.
+    const uint32_t stop = 0xF00D0002u;
+#endif
+    *(uint32_t*)(uintptr_t)(esp) = stop;        // main never returns
     g_cpu.eip = vaGameMain;
 
-    RunResult rr = Run(g_cpu, (uint32_t)(uintptr_t)&sentinel, ~0ull);
+    RunResult rr = Run(g_cpu, stop, ~0ull);
     uint64_t ins, calls; EngineStats(&ins, &calls);
     uint64_t ch, cm; EngineCacheStats(&ch, &cm);
     uint64_t dsp, gcalls; uint32_t dspMiss; DispatchStats(&dsp, &dspMiss, &gcalls);

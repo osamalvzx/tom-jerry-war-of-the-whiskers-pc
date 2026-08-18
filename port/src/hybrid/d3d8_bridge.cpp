@@ -14,8 +14,12 @@
 #include "runtime/gfx/d3d8.h"
 #include "runtime/assets/xmf_texture.h"
 #include "runtime/input/xinput_pad.h"
-#include <windows.h>
+#include "hybrid/host_compat.h"
+#ifdef _WIN32
 #include <psapi.h>
+#else
+#include <sys/mman.h>   // mincore: the IsReadable probe
+#endif
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
@@ -41,6 +45,7 @@ void SetBackbufferSize(int w, int h) { g_backW = w; g_backH = h; }
 int  GetDisplayModeKind() { return g_dispMode; }
 bool SetDisplayModeKind(int kind);                          // fwd (needs g_dev/g_devReady)
 
+#ifdef _WIN32
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     // Closing the window quits the game -- there is nothing to unwind through (the
     // loader's low image is overwritten), so a clean ExitProcess is the correct exit.
@@ -103,10 +108,24 @@ static DWORD WINAPI UiThreadMain(LPVOID) {
     return 0;
 }
 
+#endif // _WIN32
+
 // Create the native window (on its UI thread) + D3D11 device. Idempotent.
+// Headless (ARM): no window, no UI thread — the null recorder device only.
 bool EnsureDisplay(int width, int height, int sampleCount) {
     if (g_devReady) return true;
     printf("[d3d8] EnsureDisplay enter\n");
+#ifndef _WIN32
+    (void)sampleCount;
+    StartInputThread();     // initializes the pad lock (no poll thread headless)
+    tj::gfx::PresentParams hp;
+    hp.backWidth = width; hp.backHeight = height; hp.vsync = false; hp.sampleCount = 1;
+    if (!g_dev.Create(nullptr, hp)) { printf("[d3d8] null Device::Create failed\n"); return false; }
+    SetBackbufferSize(width, height);
+    g_devReady = true;
+    printf("[d3d8] headless display ready: %dx%d (null recorder)\n", width, height);
+    return true;
+#else
     StartInputThread();     // pristine-process moment: XInput must lazily init NOW
     g_uiW = width; g_uiH = height;
     g_uiReady = CreateEventA(nullptr, TRUE, FALSE, nullptr);
@@ -127,13 +146,16 @@ bool EnsureDisplay(int width, int height, int sampleCount) {
     g_devReady = true;
     printf("[d3d8] native display ready: %dx%d MSAAx%d (hwnd=%p)\n", width, height, sampleCount, (void*)g_wnd);
     return true;
+#endif // _WIN32
 }
 
 void PumpMessages() {
+#ifdef _WIN32
     MSG msg;
     while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg); DispatchMessageA(&msg);
     }
+#endif
 }
 
 tj::gfx::Device* BridgeDevice() { return g_devReady ? &g_dev : nullptr; }
@@ -143,6 +165,11 @@ tj::gfx::Device* BridgeDevice() { return g_devReady ? &g_dev : nullptr; }
 // windowed sizes the window to it, borderless stretches it over the monitor, exclusive
 // mode-switches the display to it.
 bool SetDisplayModeKind(int kind) {
+#ifndef _WIN32
+    // Headless: there is no window and no mode to switch (and the Android build has no
+    // resolution settings by decision anyway — ANDROID_PLAN §2.7).
+    return kind == g_dispMode;
+#else
     if (!g_devReady || !g_wnd) return false;
     if (kind == g_dispMode) return true;
     // leave exclusive first (DXGI requires the windowed transition before restyling)
@@ -179,6 +206,7 @@ bool SetDisplayModeKind(int kind) {
     printf("[d3d8] display mode -> %s\n",
            kind == DISP_WINDOWED ? "windowed" : kind == DISP_BORDERLESS ? "borderless" : "fullscreen");
     return true;
+#endif // _WIN32
 }
 
 // Live resolution change (the in-game RESOLUTION row). Works in every display mode:
@@ -187,6 +215,11 @@ bool SetDisplayModeKind(int kind) {
 // mode itself. The transition-capture textures are size-stale afterwards; Br_Swap
 // recreates them on the next frame via the size check.
 bool ResizeDisplay(int w, int h) {
+#ifndef _WIN32
+    if (!g_devReady) return false;
+    g_backW = w; g_backH = h;
+    return g_dev.ResizeBackbuffer(w, h);
+#else
     if (!g_devReady || !g_wnd) return false;
     g_backW = w; g_backH = h;
     switch (g_dispMode) {
@@ -204,6 +237,7 @@ bool ResizeDisplay(int w, int h) {
         return g_dev.SetFullscreenExclusive(true, w, h);
     }
     return false;
+#endif // _WIN32
 }
 
 // The Xbox exposes unified memory to the GPU through a write-combined alias based at
@@ -386,6 +420,7 @@ static bool IsReadable(uint32_t p, uint32_t len) {
     // VirtualQuery is a syscall and the vertex paths called IsReadable ~2x per draw
     // (~900 syscalls/frame at 450 draws) on pointers that are ALWAYS in this window.
     if (p >= 0x04000000u && end <= 0x10000000u) return true;
+#ifdef _WIN32
     while (p < end) {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery((void*)(uintptr_t)p, &mbi, sizeof(mbi))) return false;
@@ -393,6 +428,17 @@ static bool IsReadable(uint32_t p, uint32_t len) {
         p = (uint32_t)(uintptr_t)mbi.BaseAddress + (uint32_t)mbi.RegionSize;
     }
     return true;
+#else
+    // POSIX equivalent of the VirtualQuery walk: mincore fails with ENOMEM on any
+    // unmapped page — same "is this committed" answer, page by page.
+    uintptr_t a = p & ~(uintptr_t)0xFFF;
+    while (a < end) {
+        unsigned char vec = 0;
+        if (mincore((void*)a, 0x1000, &vec) != 0) return false;
+        a += 0x1000;
+    }
+    return true;
+#endif
 }
 
 static int FmtBpp(int fmt);   // defined with the LockRect bridge below
@@ -453,7 +499,7 @@ static bool RtBind(void* texHdr) {
 // it mid-pass, exactly as on hardware) + RTT-active flag.
 static void __cdecl Br_RttBegin(void* texSlot, void* depthSlot) {
     (void)depthSlot;
-    void* texHdr = texSlot ? *(void**)((char*)texSlot + 4) : nullptr;
+    void* texHdr = texSlot ? (void*)(uintptr_t)*(uint32_t*)((char*)texSlot + 4) : nullptr;
     static int calls = 0;
     if (calls < 12) { ++calls;
         printf("[rtt] begin f=%d slot=%p hdr=%p\n", g_frame, texSlot, texHdr); }
@@ -1705,7 +1751,8 @@ static void __stdcall Br_LockRect(void* tex, uint32_t level, void* lockedRect, v
     void* bits;
     if (data >= 0x04000000 && data < 0x10000000) bits = (void*)(uintptr_t)data;   // pool or low-arena memory
     else { if (!g_lockScratch) g_lockScratch = (uint8_t*)VirtualAlloc(nullptr, 8<<20, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE); bits = g_lockScratch; }
-    if (lockedRect) { *(uint32_t*)lockedRect = (uint32_t)pitch; *(void**)((char*)lockedRect + 4) = bits; }
+    if (lockedRect) { *(uint32_t*)lockedRect = (uint32_t)pitch;
+                      *(uint32_t*)((char*)lockedRect + 4) = Gp32(bits); }   // D3DLOCKED_RECT.pBits (gptr)
 }
 
 // D3DDevice_Clear(Count, pRects, Flags, Color, Z, Stencil) ret 0x18
@@ -1776,8 +1823,12 @@ static void __stdcall Br_Swap(uint32_t flags) {
     if (g_frame % 400 == 0) {
         // tex/mem census rides along: the live-texture count and working set are the
         // leak canaries (a climb here = the slow-motion-then-crash class of bug).
+#ifdef _WIN32
         PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
         K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+#else
+        struct { size_t WorkingSetSize; } pmc = {};
+#endif
         extern uint32_t LowArenaHighMB();        // kernel.cpp (arena exhaustion canary)
         extern uint32_t ContigPoolLiveMB();      // kernel.cpp (contiguous-pool recycler canaries)
         extern uint32_t ContigPoolHighMB();      //   live must plateau; high < 128 forever
@@ -1997,6 +2048,9 @@ static void ParseInputScript() {
     }
     free(e);
 }
+#ifndef _WIN32
+static void MergeKeyboard(tj::input::XboxGamepad&) {}   // headless: script only
+#else
 static bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 static void MergeKeyboard(tj::input::XboxGamepad& gp) {
     // While a LAN text modal is capturing, typing must not also drive the menu (pressing
@@ -2024,6 +2078,7 @@ static void MergeKeyboard(tj::input::XboxGamepad& gp) {
     if (KeyDown('A')) gp.sThumbLX = -32767; else if (KeyDown('D')) gp.sThumbLX = 32767;
     if (KeyDown('S')) gp.sThumbLY = -32767; else if (KeyDown('W')) gp.sThumbLY = 32767;
 }
+#endif // _WIN32
 static void ApplyPress(tj::input::XboxGamepad& gp, const ScriptPress& s,
                        uint16_t btnOverride = 0) {
     if (btnOverride) { gp.wButtons |= btnOverride; return; }
@@ -2247,6 +2302,7 @@ static bool PadIsActive(const tj::input::XboxGamepad& gp) {
            (gp.sThumbRY > kStick || gp.sThumbRY < -kStick);
 }
 
+#ifdef _WIN32
 static DWORD WINAPI InputThreadMain(LPVOID) {
     bool conn[4] = {};                 // XInput index -> connected?
     int  portOf[4] = { -1, -1, -1, -1 };   // XInput index -> Xbox port (-1 = not claimed yet)
@@ -2291,6 +2347,7 @@ static DWORD WINAPI InputThreadMain(LPVOID) {
         Sleep(4);
     }
 }
+#endif // _WIN32
 
 // How many Xbox ports currently have a controller on them. Drives the hot-plug mask the game
 // is told about, which is what lets it accept a second, third and fourth local player.
@@ -2320,9 +2377,13 @@ static void StartInputThread() {
     if (started) return;
     started = true;
     InitializeCriticalSection(&g_padLock);
+#ifdef _WIN32
     HANDLE t = CreateThread(nullptr, 0, InputThreadMain, nullptr, 0, nullptr);
     if (t) CloseHandle(t);
     printf("[input] pad poll thread started\n");
+#else
+    printf("[input] headless: no pad poll thread (TJ_INPUT script drives port 0)\n");
+#endif
 }
 // The controls of ONE local player on THIS instance, as netplay should see them: their own
 // physical pad (unless TJ_NOINPUT), plus -- for local player 1 only -- the keyboard and the

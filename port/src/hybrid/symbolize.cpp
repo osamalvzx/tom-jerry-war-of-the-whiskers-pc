@@ -1,5 +1,5 @@
 #include "hybrid/symbolize.h"
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

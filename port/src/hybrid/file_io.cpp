@@ -6,7 +6,7 @@
 //
 // Struct layouts (Xbox): OBJECT_ATTRIBUTES {HANDLE Root; ANSI_STRING* Name; ULONG Attr}
 // ANSI_STRING {u16 Length; u16 Max; char* Buffer}; IO_STATUS_BLOCK {NTSTATUS; ULONG Info}.
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -234,10 +234,10 @@ static void EnsureDirs(const char* path, bool includeLast) {
 
 static const char* NameFromObjAttr(void* objAttr, char* buf, size_t cap) {
     if (!objAttr) return nullptr;
-    void* ansi = *(void**)((char*)objAttr + 4);      // ANSI_STRING*
+    void* ansi = (void*)(uintptr_t)*(uint32_t*)((char*)objAttr + 4);   // ANSI_STRING* (gptr)
     if (!ansi) return nullptr;
     uint16_t len = *(uint16_t*)((char*)ansi + 0);
-    char* str = *(char**)((char*)ansi + 4);
+    char* str = (char*)(uintptr_t)*(uint32_t*)((char*)ansi + 4);        // Buffer (gptr)
     if (!str) return nullptr;
     if (len >= cap) len = (uint16_t)(cap - 1);
     memcpy(buf, str, len); buf[len] = 0;
@@ -427,7 +427,7 @@ extern "C" int32_t __stdcall Hy_NtQueryDirectoryFile(uint32_t handle, uint32_t e
     char mask[128] = "*";
     if (fileMask) {
         uint16_t ml = *(uint16_t*)fileMask;
-        char* mb = *(char**)((char*)fileMask + 4);
+        char* mb = (char*)(uintptr_t)*(uint32_t*)((char*)fileMask + 4);   // gptr
         if (mb && ml && ml < sizeof(mask) - 1) { memcpy(mask, mb, ml); mask[ml] = 0; }
     }
     WIN32_FIND_DATAA fd;

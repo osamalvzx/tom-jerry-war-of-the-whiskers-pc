@@ -21,7 +21,7 @@
 #include "hybrid/lan_ui.h"
 #include "hybrid/audio_ui.h"
 #include "hybrid/guest_call.h"
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -56,9 +56,11 @@ static const Mode kModes[] = {
 };
 static const int kModeCount = (int)(sizeof(kModes) / sizeof(kModes[0]));
 static int  g_mode = 0;              // index into kModes (current/pending)
-static char g_resLabel[64]  = "RESOLUTION: 640X480";
+// The labels are returned to GUEST code by Hk_GetText, so they live in the
+// guest-visible arena; defaults are written at install (InstallFeMenu).
+static char (&g_resLabel)[64] = *(char(*)[64])GuestObjAlloc(64, 8);
 static int  g_dispKind = 0;          // 0 windowed / 1 borderless / 2 fullscreen
-static char g_dispLabel[64] = "DISPLAY: WINDOWED";
+static char (&g_dispLabel)[64] = *(char(*)[64])GuestObjAlloc(64, 8);
 static const char* kDispNames[3] = { "WINDOWED", "BORDERLESS", "FULLSCREEN" };
 
 static void RefreshLabel() {
@@ -92,13 +94,14 @@ static void ApplyAndPersist() {
 
 // ---- custom localized-text: full native replacement of FUN_00019910 (tiny, formula
 // verified against the disassembly; readiness check preserved via the original helper).
-static char g_exitQ[64]  = "ARE YOU SURE YOU WANT TO EXIT?";
+static char (&g_exitQ)[64] = *(char(*)[64])GuestObjAlloc(64, 8);  // filled at install
 // SAVE-GAME WORDING. The save messages all talk about "the Xbox hard disk" and "your Xbox
 // console"; on this port the saves are files in _SAVES next to the executable, so the retail
 // text is simply wrong. These override the localized entries in place. Two things must be
 // preserved exactly: 0xD6 is used as a printf FORMAT with the shortfall (keep one %d), and
 // \x08x / \x08o are the A/B button glyphs.
-static const struct { uint16_t idx; const char* text; } kSaveText[] = {
+static struct { uint16_t idx; const char* text; } kSaveText[] = {   // strings
+    // relocated to the guest arena at install (the guest stores the pointers)
     { 0xD0, "No TOM AND JERRY saved game\nexists on this PC.\nDo you wish to create a new save?" },
     { 0xD1, "A TOM AND JERRY saved game\nexists on this PC.\nDo you wish to load the saved game?" },
     { 0xD2, "Loading saved game. Please don't turn\noff your PC." },
@@ -155,8 +158,8 @@ static void __fastcall Hk_OptionsBuild(uint32_t self, uint32_t edx) {
 // The 0x310-byte screen object has no spare slots; the items live in DLL memory (they
 // are only ever reached through list pointers). Rebuilt on every FE build (the factory
 // re-runs on each return to the frontend).
-static uint8_t g_resItem[0x84];
-static uint8_t g_dispItem[0x84];
+static uint8_t (&g_resItem)[0x84]  = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
+static uint8_t (&g_dispItem)[0x84] = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
 // Construct a custom menu row: ctor + label + geometry, display fields (colors/justify/
 // font) inherited from an existing sibling item, spliced into the list after `prevIt`.
 static void MakeCustomRow(uint8_t* store, uint16_t label, float y,
@@ -334,7 +337,9 @@ static uint32_t __fastcall Hk_VideoUpdate(uint32_t self, uint32_t edx) {
 // own boot save prompt (screen 1): a message line + YES/NO items at x 0.25/0.75,
 // left/right to choose (input ids 3/4), A (id 1) to confirm, B (id 2) to cancel,
 // default NO. Retail strings: 0xD8 "Are you sure you want to quit?", 0x27 YES, 0x28 NO.
-static uint8_t g_exitMsg[0x84], g_exitYes[0x84], g_exitNo[0x84];
+static uint8_t (&g_exitMsg)[0x84] = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
+static uint8_t (&g_exitYes)[0x84] = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
+static uint8_t (&g_exitNo)[0x84]  = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
 static bool    g_exitModal = false;
 static uint8_t g_savedVis[24]; static uint32_t g_savedItems[24]; static int g_savedN = 0;
 using FnSetSel = void (__fastcall*)(uint32_t self, uint32_t, uint32_t item, uint32_t cursor);
@@ -450,6 +455,16 @@ static uint32_t __fastcall Hk_MenuUpdate(uint32_t self, uint32_t edx) {
 }
 
 int InstallFeMenu() {
+    // Guest-visible text: defaults for the arena-resident labels, and the save-text
+    // literals duplicated into the arena (the guest stores Hk_GetText's pointers).
+    if (!g_resLabel[0])  strcpy_s(g_resLabel, "RESOLUTION: 640X480");
+    if (!g_dispLabel[0]) strcpy_s(g_dispLabel, "DISPLAY: WINDOWED");
+    if (!g_exitQ[0])     strcpy_s(g_exitQ, "ARE YOU SURE YOU WANT TO EXIT?");
+    static bool dupped = false;
+    if (!dupped) {
+        dupped = true;
+        for (auto& st : kSaveText) st.text = GuestStrDup(st.text);
+    }
     // Boot resolution = same ini read (and clamp) the loader did for EnsureDisplay.
     char ini[MAX_PATH]; IniPath(ini, sizeof(ini));
     int bootW = (int)GetPrivateProfileIntA("Display", "Width",  640, ini);

@@ -8,7 +8,8 @@
 #include "hybrid/kernel.h"
 #include "hybrid/xbe_image.h"
 #include "hybrid/dispatch.h"
-#include <windows.h>
+#include "hybrid/xdk_patch.h"
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -81,6 +82,7 @@ void ReserveLowArena();   // below (identity-masked game-memory arena)
 // in via the 0x84000000 alias but reads at 0x04000000 faulted -> EVERY texture
 // "unreadable" -> cache empty, nullbind explosion, no 3D. Session 11 misattributed
 // those runs to the texture recycling pool; the pool was innocent.
+#ifdef _WIN32
 #ifndef MEM_REPLACE_PLACEHOLDER
 #define MEM_REPLACE_PLACEHOLDER 0x00004000
 #endif
@@ -90,13 +92,16 @@ void ReserveLowArena();   // below (identity-masked game-memory arena)
 typedef PVOID(WINAPI* PFN_MapViewOfFile3)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T,
                                           ULONG, ULONG, void*, ULONG);
 static PFN_MapViewOfFile3 g_pMapViewOfFile3 = nullptr;
+#endif
 static bool g_holdPlaceholders = false;    // loader hold is a placeholder + API resolved
 
 static void* MapIdentityView(HANDLE sec, uint32_t base, uint32_t size) {
     if (!sec) return nullptr;
+#ifdef _WIN32
     if (g_holdPlaceholders)
         return g_pMapViewOfFile3(sec, GetCurrentProcess(), (void*)(uintptr_t)base, 0, size,
                                  MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+#endif
     return MapViewOfFileEx(sec, FILE_MAP_ALL_ACCESS, 0, 0, size, (void*)(uintptr_t)base);
 }
 // A failed fixed-address view = split-brain memory: writes land through one view while
@@ -121,6 +126,7 @@ void SetupContiguousPool() {
     // then REPLACE each with its section view atomically. Legacy path (old loader /
     // pre-1803 Windows): release the hold then map immediately -- a lose-able window,
     // kept only as a fallback.
+#ifdef _WIN32
     HMODULE kb = GetModuleHandleA("kernelbase.dll");
     g_pMapViewOfFile3 = kb ? (PFN_MapViewOfFile3)GetProcAddress(kb, "MapViewOfFile3") : nullptr;
     char ph[8] = {};
@@ -129,6 +135,12 @@ void SetupContiguousPool() {
         VirtualFree((void*)(uintptr_t)kPhysBase, kPhysSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
     if (!g_holdPlaceholders)
         VirtualFree((void*)(uintptr_t)kPhysBase, 0, MEM_RELEASE);   // legacy: free the whole hold
+#else
+    // ARM headless: there is no loader hold — the range below 0x10000000 is free by
+    // construction (headless_main maps the guest image window first, nothing else is
+    // allowed to squat the low 4 GB before this runs). Plain fixed-address views.
+    g_holdPlaceholders = false;
+#endif
     printf("[mm] low-hold swap: %s\n",
            g_holdPlaceholders ? "placeholder-atomic" : "release-then-map (LEGACY, racy)");
     ReserveLowArena();     // 0x0C000000..0x10000000 (own section; placeholder-replaced too)
@@ -242,11 +254,31 @@ static uint32_t XBAPI Sh_MmClaimGpuInstanceMemory(uint32_t sz, uint32_t* out) { 
 // Small allocations (< 0x1000) stay on malloc: they're object headers the game reads
 // through unmasked pointers, and 64 KB arena granularity would waste the arena on them.
 static void* LowArenaAllocPool(uint32_t bytes);       // fwd (uses the arena declared below)
+static void* LowArenaCarve(uint32_t bytes, bool zero);
 static bool  LowArenaFree(void* p);
 static void* XBAPI Sh_ExAllocatePoolWithTag(uint32_t bytes, uint32_t tag) {
     (void)tag;
     if (bytes >= 0x1000) { void* p = LowArenaAllocPool(bytes); if (p) return p; }
+#ifdef _WIN32
     return malloc(bytes);
+#else
+    // ARM: the returned pointer is read by GUEST code through 32-bit slots, so it must
+    // be a sub-4GB guest-window address — bionic's malloc is not. Small blocks bump-
+    // carve 64 KB arena chunks; ExFreePool's in-range path absorbs their frees without
+    // recycling (bounded leak, the same "never corrupt" policy as untracked contig
+    // frees). Blocks are ZEROED — more deterministic than malloc junk, never less.
+    static uint8_t* chunk = nullptr; static uint32_t used = 0;
+    uint32_t need = (bytes + 15u) & ~15u;
+    if (need > 0x10000u) return LowArenaAllocPool(bytes);
+    if (!chunk || used + need > 0x10000u) {
+        chunk = (uint8_t*)LowArenaCarve(0x10000u, true);
+        used = 0;
+        if (!chunk) return nullptr;
+    }
+    void* p = chunk + used;
+    used += need;
+    return p;
+#endif
 }
 static void  XBAPI Sh_ExFreePool(void* p) { if (!LowArenaFree(p)) free(p); }
 static uint32_t XBAPI Sh_ExQueryPoolBlockSize(void* p) { (void)p; return 0; }
@@ -352,15 +384,16 @@ static bool LowArenaFree(void* p) {
 uint32_t LowArenaHighMB() { return (g_lowHigh - kLowArenaBase) >> 20; }
 
 // Nt virtual memory
-static int32_t XBAPI Sh_NtAllocateVirtualMemory(void** base, uint32_t zerobits, uint32_t* size,
+static int32_t XBAPI Sh_NtAllocateVirtualMemory(uint32_t* base, uint32_t zerobits, uint32_t* size,
                                                 uint32_t type, uint32_t protect) {
+    // `base` is a guest PVOID* — a 4-byte slot. Never read or write it pointer-width.
     (void)zerobits;
     // The Xbox kernel rounds the base down and the size UP to granularity, and returns
     // both -- and the heap manager relies on the rounded *size for its block accounting.
     // Not reporting the rounded size makes the heap under-account and blocks overlap
     // (heap corruption). Round: 64 KB for reserve, 4 KB for commit.
     uint32_t gran = (type & MEM_RESERVE) ? 0x10000u : 0x1000u;
-    uint32_t reqBase = (uint32_t)(uintptr_t)*base;
+    uint32_t reqBase = *base;
     uint32_t alignedBase = reqBase & ~(gran - 1);
     uint32_t rounded = ((*size + (reqBase - alignedBase)) + gran - 1) & ~(gran - 1);
     void* want = alignedBase ? (void*)(uintptr_t)alignedBase : nullptr;
@@ -383,20 +416,20 @@ static int32_t XBAPI Sh_NtAllocateVirtualMemory(void** base, uint32_t zerobits, 
                          protect ? protect : PAGE_READWRITE);
     }
     if (!p) return STATUS_UNSUCCESSFUL;
-    *base = p;
+    *base = Gp32(p);
     *size = rounded;
     return STATUS_SUCCESS;
 }
-static int32_t XBAPI Sh_NtFreeVirtualMemory(void** base, uint32_t* size, uint32_t type) {
+static int32_t XBAPI Sh_NtFreeVirtualMemory(uint32_t* base, uint32_t* size, uint32_t type) {
     (void)type;
-    uint32_t a = (uint32_t)(uintptr_t)*base;
+    uint32_t a = *base;                      // guest PVOID* slot: 4-byte read
     if (a >= kLowArenaBase && a < kLowArenaEnd) {
         // Section-backed arena: can't decommit section pages, but MUST return the region
         // to the free-list so it's reused -- not doing so exhausted the arena over a
         // long session and spilled later allocations past 0x10000000 = WC-alias crash.
         LowArenaRelease(a);
     } else {
-        VirtualFree(*base, 0, MEM_RELEASE);
+        VirtualFree((void*)(uintptr_t)a, 0, MEM_RELEASE);
     }
     return STATUS_SUCCESS;
 }
@@ -461,7 +494,7 @@ static void XBAPI Sh_RtlInitAnsiString(void* dst, const char* s) {
     uint16_t len = s ? (uint16_t)strlen(s) : 0;
     *(uint16_t*)((char*)dst + 0) = len;
     *(uint16_t*)((char*)dst + 2) = len ? len + 1 : 0;
-    *(const char**)((char*)dst + 4) = s;
+    *(uint32_t*)((char*)dst + 4) = Gp32(s);   // ANSI_STRING.Buffer: a 4-byte guest slot
 }
 static uint32_t XBAPI Sh_RtlNtStatusToDosError(int32_t st) { return (uint32_t)st; }
 
@@ -520,21 +553,29 @@ static uint32_t XBAPI Sh_ok1() { return 1; }
 
 // ---------------------------------------------------------------------------
 // VAR data blobs (data exports). Provide small valid structures.
+//
+// One struct instead of loose statics: the guest READS these through the 32-bit
+// thunk-slot value, so on a 64-bit host the whole block must live BELOW 4 GB.
+// FillKernelThunks relocates it there in one copy (x86 keeps the static — the slot
+// value is the host address either way, and the layout/values are unchanged).
 // ---------------------------------------------------------------------------
-static uint32_t g_KeTickCount = 0;
-static uint8_t  g_XboxHardwareInfo[16] = {0};
-static uint8_t  g_XboxHDKey[16] = {0};
-static uint32_t g_XboxKrnlVersion[2] = { (1<<16)|0, (5558<<16)|1 }; // {major.minor, build.qfe}
-static uint8_t  g_XboxSignatureKey[16] = {0};
-static uint16_t g_XeImageFileName[128] = {0};
-static uint32_t g_LaunchDataPage = 0;
-static uint32_t g_ExEventObjectType = 0;
-static uint32_t g_IoFileObjectType = 0;
-static uint32_t g_HalBootSMCVideoMode = 0;
-static uint32_t g_IdexChannelObject = 0;
-static uint32_t g_HalDiskCachePartitionCount = 2;
-static uint8_t  g_XboxAlternateSignatureKeys[16*16] = {0};
-static uint8_t  g_XePublicKeyData[284] = {0};
+struct KernelVars {
+    uint32_t KeTickCount = 0;
+    uint8_t  XboxHardwareInfo[16] = {0};
+    uint8_t  XboxHDKey[16] = {0};
+    uint32_t XboxKrnlVersion[2] = { (1<<16)|0, (5558<<16)|1 }; // {major.minor, build.qfe}
+    uint8_t  XboxSignatureKey[16] = {0};
+    uint16_t XeImageFileName[128] = {0};
+    uint32_t LaunchDataPage = 0;
+    uint32_t ExEventObjectType = 0;
+    uint32_t IoFileObjectType = 0;
+    uint32_t HalBootSMCVideoMode = 0;
+    uint32_t IdexChannelObject = 0;
+    uint32_t HalDiskCachePartitionCount = 2;
+    uint8_t  XboxAlternateSignatureKeys[16*16] = {0};
+    uint8_t  XePublicKeyData[284] = {0};
+};
+static KernelVars g_kv;
 
 // ---------------------------------------------------------------------------
 // Ordinal table
@@ -553,12 +594,12 @@ static Entry g_table[] = {
     {8,  "DbgPrint",                    (void*)&Sh_DbgPrint,                  false, -1},
     // Ex
     {15, "ExAllocatePoolWithTag",       (void*)&Sh_ExAllocatePoolWithTag,     false, 8},
-    {16, "ExEventObjectType",           (void*)&g_ExEventObjectType,          true,  0},
+    {16, "ExEventObjectType",           (void*)&g_kv.ExEventObjectType,          true,  0},
     {17, "ExFreePool",                  (void*)&Sh_ExFreePool,                false, 4},
     {23, "ExQueryPoolBlockSize",        (void*)&Sh_ExQueryPoolBlockSize,      false, 4},
     {24, "ExQueryNonVolatileSetting",   (void*)&Sh_ExQueryNonVolatileSetting, false, 20},
     // Hal (mostly stubs)
-    {40, "HalDiskCachePartitionCount",  (void*)&g_HalDiskCachePartitionCount, true,  0},
+    {40, "HalDiskCachePartitionCount",  (void*)&g_kv.HalDiskCachePartitionCount, true,  0},
     {44, "HalGetInterruptVector",       (void*)&Sh_ok0,                       false, 8},
     {46, "HalReadWritePCISpace",        (void*)&Sh_ok0,                       false, 24},
     {47, "HalRegisterShutdownNotification",(void*)&Sh_ok0,                    false, 8},
@@ -566,7 +607,7 @@ static Entry g_table[] = {
     // Io
     {67, "IoCreateSymbolicLink",        (void*)&Hy_IoCreateSymbolicLink,      false, 8},
     {69, "IoDeleteSymbolicLink",        (void*)&Sh_ok0,                       false, 4},
-    {71, "IoFileObjectType",            (void*)&g_IoFileObjectType,           true,  0},
+    {71, "IoFileObjectType",            (void*)&g_kv.IoFileObjectType,           true,  0},
     {87, "IofCompleteRequest",          (void*)&Sh_ok0,                       false, 0},   // fastcall (patched)
     // Ke
     {95, "KeBugCheck",                  (void*)&Sh_KeBugCheck,                false, 4},
@@ -587,11 +628,11 @@ static Entry g_table[] = {
     {149,"KeSetTimer",                  (void*)&Sh_ok0,                       false, 16},
     {151,"KeStallExecutionProcessor",   (void*)&Sh_KeStallExecutionProcessor, false, 4},
     {153,"KeSynchronizeExecution",      (void*)&Sh_ok0,                       false, 12},
-    {156,"KeTickCount",                 (void*)&g_KeTickCount,                true,  0},
+    {156,"KeTickCount",                 (void*)&g_kv.KeTickCount,                true,  0},
     {159,"KeWaitForSingleObject",       (void*)&Sh_ok0,                       false, 20},
     {160,"KfRaiseIrql",                 (void*)&Sh_ok0,                       false, 0},   // fastcall (patched)
     {161,"KfLowerIrql",                 (void*)&Sh_ok0,                       false, 0},   // fastcall (patched)
-    {164,"LaunchDataPage",              (void*)&g_LaunchDataPage,             true,  0},
+    {164,"LaunchDataPage",              (void*)&g_kv.LaunchDataPage,             true,  0},
     // Mm
     {165,"MmAllocateContiguousMemory",  (void*)&Sh_MmAllocateContiguousMemory,false, 4},
     {166,"MmAllocateContiguousMemoryEx",(void*)&Sh_MmAllocateContiguousMemoryEx,false,20},
@@ -644,11 +685,11 @@ static Entry g_table[] = {
     {302,"RtlRaiseException",           (void*)&Sh_ok0,                       false, 4},
     {312,"RtlUnwind",                   (void*)&Sh_ok0,                       false, 16},
     // Xbox VARs / crypto
-    {322,"XboxHardwareInfo",            (void*)&g_XboxHardwareInfo,           true,  0},
-    {323,"XboxHDKey",                   (void*)&g_XboxHDKey,                  true,  0},
-    {324,"XboxKrnlVersion",             (void*)&g_XboxKrnlVersion,            true,  0},
-    {325,"XboxSignatureKey",            (void*)&g_XboxSignatureKey,           true,  0},
-    {326,"XeImageFileName",             (void*)&g_XeImageFileName,            true,  0},
+    {322,"XboxHardwareInfo",            (void*)&g_kv.XboxHardwareInfo,           true,  0},
+    {323,"XboxHDKey",                   (void*)&g_kv.XboxHDKey,                  true,  0},
+    {324,"XboxKrnlVersion",             (void*)&g_kv.XboxKrnlVersion,            true,  0},
+    {325,"XboxSignatureKey",            (void*)&g_kv.XboxSignatureKey,           true,  0},
+    {326,"XeImageFileName",             (void*)&g_kv.XeImageFileName,            true,  0},
     {327,"XeLoadSection",               (void*)&Sh_ok1,                       false, 4},
     {328,"XeUnloadSection",             (void*)&Sh_ok1,                       false, 4},
     {335,"XcSHAInit",                   (void*)&Hy_XcSHAInit,                       false, 4},
@@ -656,10 +697,10 @@ static Entry g_table[] = {
     {337,"XcSHAFinal",                  (void*)&Hy_XcSHAFinal,                       false, 8},
     {340,"XcHMAC",                      (void*)&Hy_XcHMAC,                       false, 28},
     {344,"XcVerifyPKCS1Signature",      (void*)&Sh_ok1,                       false, 12},
-    {354,"XboxAlternateSignatureKeys",  (void*)&g_XboxAlternateSignatureKeys, true,  0},
-    {355,"XePublicKeyData",             (void*)&g_XePublicKeyData,            true,  0},
-    {356,"HalBootSMCVideoMode",         (void*)&g_HalBootSMCVideoMode,        true,  0},
-    {357,"IdexChannelObject",           (void*)&g_IdexChannelObject,          true,  0},
+    {354,"XboxAlternateSignatureKeys",  (void*)&g_kv.XboxAlternateSignatureKeys, true,  0},
+    {355,"XePublicKeyData",             (void*)&g_kv.XePublicKeyData,            true,  0},
+    {356,"HalBootSMCVideoMode",         (void*)&g_kv.HalBootSMCVideoMode,        true,  0},
+    {357,"IdexChannelObject",           (void*)&g_kv.IdexChannelObject,          true,  0},
     {360,"HalInitiateShutdown",         (void*)&Sh_ok0,                       false, 0},
 };
 static const int g_tableCount = (int)(sizeof(g_table)/sizeof(g_table[0]));
@@ -683,6 +724,7 @@ static void __cdecl TrapReport(int ordinal) {
     ExitProcess(0xC0DE0000u | (uint32_t)ordinal);
 }
 static void* MakeTrap(int ordinal) {
+#if defined(_M_IX86)
     if (!g_traps) {
         g_traps = (Trap*)VirtualAlloc(nullptr, sizeof(Trap) * 512,
                                       MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -694,6 +736,12 @@ static void* MakeTrap(int ordinal) {
     c[k++] = 0xFF; c[k++] = 0xD0;                                   // call eax
     c[k++] = 0xCC;                                                  // int3 (never reached)
     return t->code;
+#else
+    // ARM: no generated code exists or is needed — the trap's semantics live in the
+    // dispatch entry (InvokeTrap); the slot gets the synthetic key.
+    (void)ordinal;
+    return nullptr;
+#endif
 }
 
 // A STDCALL STUB MUST STILL CLEAN ITS CALLER'S ARGUMENTS. Sh_ok0/Sh_ok1 take no parameters,
@@ -714,6 +762,7 @@ struct StubThunk { uint8_t code[16]; };
 static StubThunk* g_stubs = nullptr;
 static int g_stubNext = 0;
 static void* MakeCleanStub(uint32_t retVal, int argBytes) {
+#if defined(_M_IX86)
     if (!g_stubs)
         g_stubs = (StubThunk*)VirtualAlloc(nullptr, sizeof(StubThunk) * 128,
                                            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -723,6 +772,82 @@ static void* MakeCleanStub(uint32_t retVal, int argBytes) {
     c[k++] = 0xB8; *(uint32_t*)(c + k) = retVal; k += 4;            // mov eax, retVal
     c[k++] = 0xC2; *(uint16_t*)(c + k) = (uint16_t)argBytes; k += 2; // ret argBytes
     return t->code;
+#else
+    // ARM: semantics-as-data only (InvokeRetStub); no executable bytes, key is synthetic.
+    (void)retVal; (void)argBytes;
+    return nullptr;
+#endif
+}
+
+#if !defined(_M_IX86)
+// DbgPrint (ordinal 8) is the ONE cdecl/varargs kernel import — unmarshalable by
+// argBytes, escape-serviced on the x86 host, and the last Raw entry standing after
+// session 26. Its ARM semantics: read the format string and 4-byte varargs cells
+// straight off the interpreted guest stack and print. Never observed to be called by
+// the retail game; implemented so a call is a log line, not a FATAL coverage gap.
+static void DbgPrintInvoke(tj::engine::CpuState& s, const DispatchEntry&) {
+    using namespace tj::engine;
+    const uint32_t esp = s.r[ESP];
+    const uint32_t ret = *(const uint32_t*)(uintptr_t)esp;
+    const char* fmt = (const char*)(uintptr_t)*(const uint32_t*)(uintptr_t)(esp + 4);
+    char out[1024];
+    int o = 0;
+    uint32_t argAt = esp + 8;
+    auto arg32 = [&]() { uint32_t v = *(const uint32_t*)(uintptr_t)argAt; argAt += 4; return v; };
+    for (const char* p = fmt; p && *p && o < (int)sizeof(out) - 64; ++p) {
+        if (*p != '%') { out[o++] = *p; continue; }
+        ++p;
+        if (*p == '%') { out[o++] = '%'; continue; }
+        // skip flags/width/precision/length conservatively
+        char spec[16]; int si = 0;
+        spec[si++] = '%';
+        while (*p && si < 12 && (strchr("0123456789.+-# lh", *p) != nullptr)) spec[si++] = *p++;
+        char c = *p;
+        spec[si++] = c == 'i' ? 'd' : c;
+        spec[si] = 0;
+        switch (c) {
+        case 'd': case 'i': case 'u': case 'x': case 'X': case 'c': case 'p':
+            o += snprintf(out + o, sizeof(out) - o, spec, arg32()); break;
+        case 's': {
+            uint32_t sp = arg32();
+            o += snprintf(out + o, sizeof(out) - o, "%s",
+                          sp ? (const char*)(uintptr_t)sp : "(null)");
+            break;
+        }
+        case 'f': case 'g': case 'e': {
+            double d; uint64_t bits = arg32(); bits |= (uint64_t)arg32() << 32;
+            memcpy(&d, &bits, 8);
+            o += snprintf(out + o, sizeof(out) - o, spec, d);
+            break;
+        }
+        default: o += snprintf(out + o, sizeof(out) - o, "%s", spec); break;
+        }
+    }
+    out[o] = 0;
+    printf("[DbgPrint] %s", out);
+    s.r[tj::engine::EAX] = 0;
+    s.r[tj::engine::ESP] = esp + 4;    // cdecl: the interpreted caller cleans its args
+    s.eip = ret;
+}
+#endif
+
+// The guest reads VARs through the 32-bit slot value, so on a 64-bit host the block
+// is COPIED below 4 GB once and the slots point at the copy. ⚠ On ARM the low copy is
+// the live one — any future host-side access to a kernel VAR must go through this.
+static KernelVars* KernelVarsLive() {
+#if defined(_M_IX86)
+    return &g_kv;
+#else
+    static KernelVars* low = nullptr;
+    if (!low) {
+        low = (KernelVars*)VirtualAlloc(nullptr, sizeof(KernelVars),
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        memcpy(low, &g_kv, sizeof(KernelVars));
+        printf("[kernel] VARs relocated below 4 GB (%p, %u bytes)\n",
+               (void*)low, (unsigned)sizeof(KernelVars));
+    }
+    return low;
+#endif
 }
 
 void FillKernelThunks(uint32_t thunkTableVa) {
@@ -735,38 +860,54 @@ void FillKernelThunks(uint32_t thunkTableVa) {
         if (enc == 0) break;                       // table terminator
         if (!(enc & 0x80000000u)) continue;        // not an ordinal import
         int ord = (int)(enc & 0x7FFFFFFF);
-        void* target = nullptr;
+        // THE SLOT GETS THE REGISTRATION KEY, uniformly. On the x86 host every key IS
+        // the host address (byte-identical to what this loop always wrote); on ARM the
+        // key is the synthetic handle / relocated data address the marshaling needs.
+        uint32_t key = 0;
+        bool matched = false;
         for (int j = 0; j < g_tableCount; ++j) if (g_table[j].ord == ord) {
             const Entry& te = g_table[j];
-            target = te.shim;
+            matched = true;
+            void* target = te.shim;
             if ((target == (void*)&Sh_ok0 || target == (void*)&Sh_ok1) && te.argBytes > 0) {
                 uint32_t rv = target == (void*)&Sh_ok1 ? 1u : 0u;
                 void* clean = MakeCleanStub(rv, te.argBytes);
-                if (clean) {
-                    target = clean; ++cleaned;
-                    // Stage-5 dispatch (dispatch.h): stub semantics as data — the ARM
-                    // build cannot execute the generated x86 bytes.
-                    DispatchRegisterRetStub(clean, te.name, rv, te.argBytes);
-                }
+#if defined(_M_IX86)
+                if (clean) { key = DispatchRegisterRetStub(clean, te.name, rv, te.argBytes); ++cleaned; }
+                else key = (uint32_t)(uintptr_t)target;   // stub pool exhausted: old behavior
+#else
+                key = DispatchRegisterRetStub(clean, te.name, rv, te.argBytes); ++cleaned;
+#endif
+            } else if (te.isVar) {
+                // VAR exports are guest-READ data, never executed. Relocated below
+                // 4 GB on ARM (the slot value is the pointer the guest dereferences).
+                void* live = (uint8_t*)KernelVarsLive() + ((uint8_t*)target - (uint8_t*)&g_kv);
+                key = DispatchRegisterData(live, te.name);
+            } else if (te.argBytes < 0) {
+                // cdecl/varargs — DbgPrint only. x86: raw escape target. ARM: the
+                // guest-stack varargs formatter above.
+#if defined(_M_IX86)
+                key = DispatchRegisterArgBytes(target, te.name, te.argBytes, CallConv::Stdcall);
+#else
+                key = DispatchRegister(Hook{ target, &DbgPrintInvoke, CallConv::Cdecl,
+                                             HookKind::Typed, 0 }, te.name);
+#endif
             } else {
                 // Every kernel shim's convention is already data in this table:
-                // argBytes = stdcall stack bytes, -1 = cdecl/varargs (escape-only).
-                // VAR exports are guest-READ data, never executed — recorded so the
-                // ARM relocation sweep has the complete list.
-                if (te.isVar) DispatchRegisterData(target, te.name);
-                else          DispatchRegisterArgBytes(target, te.name, te.argBytes,
-                                                       CallConv::Stdcall);
+                // argBytes = stdcall stack bytes cleaned by the callee.
+                key = DispatchRegisterArgBytes(target, te.name, te.argBytes, CallConv::Stdcall);
             }
             break;
         }
-        if (target) { slot[i] = (uint32_t)(uintptr_t)target; ++filled; }
+        if (matched) { slot[i] = key; ++filled; }
         else {
             void* trap = MakeTrap(ord);
-            DispatchRegisterTrap(trap, KernelOrdinalName(ord), (uint32_t)ord, &TrapReport);
-            slot[i] = (uint32_t)(uintptr_t)trap; ++trapped;
+            slot[i] = DispatchRegisterTrap(trap, KernelOrdinalName(ord), (uint32_t)ord,
+                                           &TrapReport);
+            ++trapped;
         }
     }
-    FlushInstructionCache(GetCurrentProcess(), g_traps, sizeof(Trap) * 512);
+    if (g_traps) FlushInstructionCache(GetCurrentProcess(), g_traps, sizeof(Trap) * 512);
     if (g_stubs) FlushInstructionCache(GetCurrentProcess(), g_stubs, sizeof(StubThunk) * 128);
     printf("[kernel] thunk table filled: %d implemented (%d arg-cleaning stubs), %d trapped\n",
            filled, cleaned, trapped);

@@ -1,6 +1,7 @@
 #include "hybrid/xdk_patch.h"
 #include "hybrid/xbe_image.h"
-#include <windows.h>
+#include "hybrid/guest_call.h"
+#include "hybrid/host_compat.h"
 #include <cstdio>
 
 namespace tj::hybrid {
@@ -68,6 +69,69 @@ bool PatchCallSite(uint32_t va, const void* target, const char* label) {
     DispatchRegister(Hook{ const_cast<void*>(target), nullptr, CallConv::Cdecl,
                            HookKind::Raw, 0 }, label);
     return PatchCallBytes(va, target, label);
+}
+
+// ---- continuation (jmp-hook) patching ----------------------------------------------
+bool PatchJmpHook(uint32_t va, bool callShaped, const void* nakedWrapper,
+                  uint32_t resumeVa, void(__cdecl* fn)(tj::engine::CpuState&),
+                  bool escapeSafe, const char* label) {
+#if defined(_M_IX86)
+    // Exactly the pre-refactor two-step: HOOK_RAW-style registration + patch to the
+    // naked wrapper, then the engine jmp-hook at the wrapper's address.
+    Hook h{ const_cast<void*>(nakedWrapper), nullptr, CallConv::Cdecl, HookKind::Raw, 0 };
+    bool ok = callShaped ? PatchCallSite(va, h, label) : PatchJump(va, h, label);
+    if (ok) EngineModeRegisterJmpHook(nakedWrapper, resumeVa, fn, escapeSafe);
+    return ok;
+#else
+    (void)nakedWrapper;
+    // Mint a synthetic key for the semantic (Raw, non-invocable: HostEscape's jmp-hook
+    // check runs BEFORE the dispatch invoke, so the entry only exists to own a key and
+    // appear in the coverage report).
+    Hook h{ (void*)fn, nullptr, CallConv::Cdecl, HookKind::Raw, 0 };
+    uint32_t key = DispatchRegister(h, label);
+    bool ok = callShaped ? PatchCallBytes(va, (const void*)(uintptr_t)key, label)
+                         : PatchJumpBytes(va, (const void*)(uintptr_t)key, label);
+    if (ok) EngineModeRegisterJmpHook((const void*)(uintptr_t)key, resumeVa, fn, escapeSafe);
+    return ok;
+#endif
+}
+
+// ---- guest-visible host objects -----------------------------------------------------
+uint32_t Gp32(const void* p) {
+    uintptr_t u = (uintptr_t)p;
+#if !defined(_M_IX86)
+    if (u >> 32) {
+        printf("[patch] FATAL: guest-visible object above 4 GB (%p)\n", p);
+        fflush(stdout);
+        ExitProcess(0x69B);
+    }
+#endif
+    return (uint32_t)u;
+}
+
+char* GuestStrDup(const char* s) {
+    size_t n = strlen(s) + 1;
+    char* d = (char*)GuestObjAlloc(n, 1);
+    memcpy(d, s, n);
+    return d;
+}
+
+void* GuestObjAlloc(size_t size, size_t align) {
+    static uint8_t* chunk = nullptr;
+    static size_t used = 0, cap = 0;
+    if (align < 8) align = 8;
+    used = (used + align - 1) & ~(align - 1);
+    if (!chunk || used + size > cap) {
+        cap = size > (256u << 10) ? ((size + 0xFFFFu) & ~(size_t)0xFFFFu) : (256u << 10);
+        chunk = (uint8_t*)VirtualAlloc(nullptr, cap, MEM_COMMIT | MEM_RESERVE,
+                                       PAGE_READWRITE);
+        used = 0;
+        if (!chunk) { printf("[patch] FATAL: guest-object arena alloc failed\n");
+                      fflush(stdout); ExitProcess(0x69C); }
+    }
+    void* p = chunk + used;
+    used += size;
+    return p;
 }
 
 // ---- guest-window trampoline pad --------------------------------------------------

@@ -1,5 +1,5 @@
 #include "hybrid/xbe_image.h"
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

@@ -37,7 +37,7 @@
 #include "hybrid/xdk_patch.h"
 #include "hybrid/guest_call.h"
 
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -78,7 +78,9 @@ const char* MeatMenuText(uint16_t idx) {
     return (idx >= kTextBase && idx < kTextBase + T_COUNT) ? kText[idx - kTextBase] : nullptr;
 }
 
-static uint8_t g_title[0x84], g_rows[3][0x84], g_multi[0x84];
+static uint8_t (&g_title)[0x84]   = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
+static uint8_t (&g_rows)[3][0x84] = *(uint8_t(*)[3][0x84])GuestObjAlloc(3 * 0x84, 8);
+static uint8_t (&g_multi)[0x84]   = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
 static int  g_sel = 0;
 static bool g_launch = false;    // FIGHT SETTINGS confirmed; go on to the setup screen
 static bool g_installed = false;

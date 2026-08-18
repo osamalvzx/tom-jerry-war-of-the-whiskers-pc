@@ -31,7 +31,7 @@
 #include "hybrid/xdk_patch.h"
 #include "hybrid/net_sync.h"
 #include "hybrid/guest_call.h"
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -162,7 +162,8 @@ void AudioUiFrameTick(int frame) {
 // unambiguously ours.
 static const uint16_t kTextBase = 0x1C0;
 enum { T_VAL_MUSIC = 0, T_VAL_EFFECTS, T_COUNT };
-static char g_txt[T_COUNT][24];
+static char (&g_txt)[T_COUNT][24] = *(char(*)[T_COUNT][24])GuestObjAlloc(
+    sizeof(char[T_COUNT][24]), 8);
 
 const char* AudioCustomText(uint16_t idx) {
     if (idx < kTextBase || idx >= kTextBase + T_COUNT) return nullptr;
@@ -198,8 +199,10 @@ static int      g_feBackup[2] = { 9, 11 };
 static int      g_feRow       = 0;                 // 0 music, 1 effects, 2 confirm
 static float    g_feKnobPulse[2] = { 1.0f, 1.0f };
 static float    g_feKnobStep2[2] = { 1.0f, 1.0f };
-static uint8_t  g_feGroove2[0x94], g_feKnob2[0x94];   // the second slider's two sprites
-static uint8_t  g_feVal[2][0x84];                     // the two percentage rows
+static uint8_t (&g_feGroove2)[0x94] = *(uint8_t(*)[0x94])GuestObjAlloc(0x94, 8);
+static uint8_t (&g_feKnob2)[0x94]   = *(uint8_t(*)[0x94])GuestObjAlloc(0x94, 8);
+static uint8_t (&g_feVal)[2][0x84]  = *(uint8_t(*)[2][0x84])GuestObjAlloc(
+    sizeof(uint8_t[2][0x84]), 8);                     // the two percentage rows
 static bool     g_feSprCtord = false;
 
 // A PERCENT SIGN HAS TO BE DOUBLED. Every string that reaches an item is used as the FORMAT

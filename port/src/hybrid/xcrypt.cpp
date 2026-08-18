@@ -18,7 +18,7 @@
 // only ever produced and checked by this same build, and the saves never leave the PC.
 // Context layout is ours too -- the XAPI code only ever passes the pointer through. It must
 // fit the 0x74 bytes the game leaves at ctx+8 inside its 0x7C-byte allocation; this is 0x60.
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdint>
 #include <cstring>
 

@@ -7,7 +7,7 @@
 //     shims that keep _tiddata in a Win32 TLS slot, so all CRT per-thread code works.
 #include "hybrid/xdk_patch.h"
 #include "hybrid/guest_call.h"
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdint>
 
@@ -33,7 +33,10 @@ bool CreateGameHeap() {
     uint32_t reserve = 0, commit = 0;
     memcpy(&reserve, (void*)(uintptr_t)0x10134, 4); // PeHeapReserve
     memcpy(&commit,  (void*)(uintptr_t)0x10138, 4); // PeHeapCommit
-    uint8_t params[0x30]; memset(params, 0, sizeof(params));
+    // The params block is read by GUEST code (RtlCreateHeap) — a host stack buffer
+    // truncates on a 64-bit host, so it comes from the guest-visible arena.
+    uint8_t* params = (uint8_t*)GuestObjAlloc(0x30, 8);
+    memset(params, 0, 0x30);
     *(uint32_t*)params = 0x30;                       // params.Length
     // Engine::Call seam (guest_call.h): pre-engine this is the raw native call, exactly
     // as before; if the CRT ever re-enters here under interpretation it stays guest.

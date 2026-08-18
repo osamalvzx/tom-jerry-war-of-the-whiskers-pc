@@ -25,9 +25,10 @@
 // vtable, so our Enter hook runs from inside Build automatically.
 #include "hybrid/meat_rush.h"
 #include "hybrid/guest_call.h"
+#include "hybrid/xdk_patch.h"
 #include "hybrid/dispatch.h"
 
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -87,7 +88,7 @@ const char* MeatCustomText(uint16_t idx) {
 }
 
 // ---- state -------------------------------------------------------------------
-static uint8_t  g_row[0x84];                   // the item itself: screen 7 is FULL (0x520 B),
+static uint8_t (&g_row)[0x84] = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);                   // the item itself: screen 7 is FULL (0x520 B),
                                                // and its dtor never walks the item list, so a
                                                // DLL-side item is safe and is never freed.
 static int      g_sel = V_5;                 // what the row is showing right now

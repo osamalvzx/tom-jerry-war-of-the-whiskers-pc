@@ -29,7 +29,7 @@
 #include "net_sync.h"
 #include "xdk_patch.h"
 
-#include <windows.h>
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -174,8 +174,8 @@ static void ApplyRules(const LanMatchConfig& c) {
 // FUN_00040900 is thiscall(fighter) -> char* and maps fighter+0x7021 (the player index) to
 // the retail strings "PLAYER 1".."PLAYER 4". The banner ring FUN_00059880 stores the
 // returned pointer and draws it FRAMES LATER, so the buffer must be static, never a local.
-static char g_bannerName[4][20];
-static char g_bannerTeam[4][20];
+static char (&g_bannerName)[4][20] = *(char(*)[4][20])GuestObjAlloc(80, 8);
+static char (&g_bannerTeam)[4][20] = *(char(*)[4][20])GuestObjAlloc(80, 8);
 static bool g_namesLive = false;
 
 static char* __fastcall Hk_PlayerName(uint32_t self, uint32_t) {
@@ -245,6 +245,7 @@ static void __cdecl RoundEndC(int winner) {
         if (master[0x280 + winner]) --master[0x280 + winner];
     }
 }
+#if defined(_M_IX86)
 __declspec(naked) static void Hk_RoundEnd() {
     __asm {
         pushad
@@ -257,6 +258,7 @@ __declspec(naked) static void Hk_RoundEnd() {
         jmp dword ptr [g_roundEndRet]
     }
 }
+#endif
 // Engine mode must NOT reach the naked wrapper above through the host-call escape: this
 // is a mid-function jmp-in/jmp-out hook, so [esp] is the round-over function's live data
 // (a heap pointer), not a return address — the escape's displacement handed the guest a
@@ -516,16 +518,17 @@ int InstallLanMatch() {
     int n = 0;
     static const uint8_t kRoundEndBytes[] = { 0xC6, 0x81, 0x7D, 0x02, 0x00, 0x00, 0x01 };
     if (Expect(kRoundEnd, kRoundEndBytes, 7, "rounds")) {
-        // HOOK_RAW: naked jmp-in/jmp-out continuation — engine mode services it via the
-        // registered jmp-hook below, never the dispatch table or the call-shaped escape.
-        if (PatchJump(kRoundEnd, HOOK_RAW(Hk_RoundEnd), "lan:rounds")) {
+        // Naked jmp-in/jmp-out continuation — engine mode services it via the
+        // registered jmp-hook, never the dispatch table or the call-shaped escape.
+        if (PatchJmpHook(kRoundEnd, /*callShaped=*/false, NAKED_HOOK(Hk_RoundEnd),
+                         kRoundEndRet, &RoundEndEngine, /*escapeSafe=*/false,
+                         "lan:rounds")) {
             DWORD old;
             VirtualProtect((void*)(uintptr_t)kRoundEnd, 8, PAGE_EXECUTE_READWRITE, &old);
             ((uint8_t*)(uintptr_t)kRoundEnd)[5] = 0x90;      // pad the 7-byte site
             ((uint8_t*)(uintptr_t)kRoundEnd)[6] = 0x90;
             VirtualProtect((void*)(uintptr_t)kRoundEnd, 8, old, &old);
             FlushInstructionCache(GetCurrentProcess(), (void*)(uintptr_t)kRoundEnd, 8);
-            EngineModeRegisterJmpHook((const void*)&Hk_RoundEnd, kRoundEndRet, &RoundEndEngine);
             ++n;
         }
     }

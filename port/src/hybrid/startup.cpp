@@ -5,7 +5,8 @@
 // function (symbolized) that blocked us -- the crash-by-crash bring-up loop.
 #include "hybrid/xbe_image.h"
 #include "hybrid/symbolize.h"
-#include <windows.h>
+#include "hybrid/guest_call.h"
+#include "hybrid/host_compat.h"
 #include <cstdio>
 #include <cstdint>
 
@@ -37,6 +38,18 @@ static const uint32_t VA_gameInit = 0x000191f0; // game init (called once by mai
 
 typedef void (__cdecl* VoidFn)(void);
 
+// One guest void() call, host-appropriate: native on the x86 host (the pre-engine
+// startup init is deliberately native there — TJ_ENGINE arms later), marshaled through
+// Engine::Call on ARM (the engine is armed from process start; EngineModeArmBoot).
+static void CallGuestVoid(uint32_t va) {
+#if defined(_M_IX86)
+    ((VoidFn)(uintptr_t)va)();
+#else
+    GCALL0(Cdecl, VoidFn, va);
+#endif
+}
+
+#ifdef _WIN32
 // Heuristic stack trace: scan the stack for values that point just past a `call`
 // instruction in the XBE image -- those are return addresses. Prints a plausible call
 // chain, symbolized. Good enough to locate the caller during bring-up.
@@ -194,6 +207,23 @@ static bool GuardedCallAddr(const char* label, uint32_t va) {
     }
 }
 
+#else // !_WIN32 -----------------------------------------------------------------------
+
+// ARM: no VEH, no SEH — a guest problem is reported by the ENGINE (RunResult::Fault
+// through the marshal's loud FATAL), and a host fault crashes into headless_main's
+// signal dump. The guarded call is a marshaled Engine::Call from process start.
+static bool g_vehStop = true;         // referenced by the shared milestone functions
+static void InstallVeh() {}
+static bool GuardedCallAddr(const char* label, uint32_t va) {
+    printf("[startup] -> %s @ %s\n", label, Symbolize(va));
+    fflush(stdout);
+    CallGuestVoid(va);              // a failure inside is a loud engine FATAL, not a return
+    printf("[startup] <- %s returned OK\n", label);
+    return true;
+}
+
+#endif // _WIN32
+
 // Replicate __cinit's table walks with per-entry logging, so a faulting C++ ctor is
 // pinpointed exactly (the VEH prints the address; we print which init entry it was).
 static void RunInitTable(const char* which, uint32_t lo, uint32_t hi) {
@@ -202,14 +232,14 @@ static void RunInitTable(const char* which, uint32_t lo, uint32_t hi) {
         if (fn == 0 || fn == 0xFFFFFFFF) continue;
         printf("[cinit] %s[%u] -> %s\n", which, (p - lo) / 4, Symbolize(fn));
         fflush(stdout);
-        ((VoidFn)(uintptr_t)fn)();
+        CallGuestVoid(fn);
     }
 }
 
 static void RunCinitVerbose() {
     // __cinit prologue: optional pre-init hook at [0x18270c].
     uint32_t hook = *(uint32_t*)(uintptr_t)0x0018270c;
-    if (hook) { printf("[cinit] pre-init hook -> %s\n", Symbolize(hook)); fflush(stdout); ((VoidFn)(uintptr_t)hook)(); }
+    if (hook) { printf("[cinit] pre-init hook -> %s\n", Symbolize(hook)); fflush(stdout); CallGuestVoid(hook); }
     // ORDER MATTERS (mirror original __cinit): the 0xf574c table runs first -- it
     // contains ___onexitinit which builds the atexit table the C++ ctors then use.
     RunInitTable("__xp", 0x000f574c, 0x000f5760); // onexit init + CRT pre-ctors
@@ -218,9 +248,18 @@ static void RunCinitVerbose() {
 
 // Mimic the XDK CRT __controlfp: default x87 precision/rounding the game expects.
 static void SetupFpu() {
+#if defined(_M_IX86)
     unsigned cw = 0x027F; // round-nearest, double-extended precision, all exceptions masked
     __asm { fninit }
     __asm { fldcw cw }
+#else
+    // The "host FPU" is the virtual fnsave image (fpu_host.cpp): same fninit + fldcw
+    // state, byte for byte. EngineModeArmBoot did this too; idempotent by construction.
+    uint8_t* im = tj::engine::VirtualHostFpu()->image;
+    memset(im, 0, 108);
+    im[0] = 0x7F; im[1] = 0x02;   // CW 0x027F
+    im[8] = 0xFF; im[9] = 0xFF;   // TW all-empty
+#endif
 }
 
 // Milestone 2: run the CRT initializer tables (static constructors). Returns count of
@@ -231,6 +270,9 @@ int RunStartupInit() {
     InstallVeh();
     SetupFpu();
     ApplyFsFixups();
+    EngineModeRefreshFsBase();   // ARM boots armed: fs:[...] must resolve to the KPCR
+                                 // BEFORE the first marshaled init call runs. Windows:
+                                 // harmless, the engine body re-asserts it later.
     printf("[startup] creating game heap...\n"); fflush(stdout);
     if (!CreateGameHeap()) { printf("[startup] heap creation FAILED\n"); return 0; }
     InstallCrtGlue();
@@ -275,10 +317,14 @@ bool RunGameLoop() {
     InstallMeatMenu();         // MEAT RUSH: the MULTIPLAYER menu (before the menu Build hook)
     InstallNetSync();          // phase-2 LAN: main-loop phase brackets + RNG counters
     InstallProf();             // TJ_PROF only; must be on the game thread (samples it)
+#if defined(_M_IX86)
     char eng[8] = {0};
     if (GetEnvironmentVariableA("TJ_ENGINE", eng, 8) && eng[0] == '1')
         return RunGameMainEngine(VA_gameMain);   // Stage 3: interpret the whole game
     return GuardedCallAddr("game main", VA_gameMain);
+#else
+    return RunGameMainEngine(VA_gameMain);       // ARM: there is only the engine
+#endif
 }
 
 } // namespace tj::hybrid
