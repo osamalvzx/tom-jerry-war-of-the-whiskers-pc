@@ -73,3 +73,4 @@ __pycache__/
 *.user
 Thumbs.db
 desktop.ini
+port/build-apk/

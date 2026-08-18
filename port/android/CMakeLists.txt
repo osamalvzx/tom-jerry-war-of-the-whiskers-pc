@@ -128,3 +128,19 @@ target_link_libraries(tj_headless PRIVATE tj_engine tj_softfloat)
 add_library(tj_gles STATIC ${RT}/gfx/gles_gfx.cpp)
 target_include_directories(tj_gles PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(tj_gles PRIVATE GLESv3 EGL android)
+
+# --- Stage 6: libtjapp.so — the APK's native activity. FIRST MILESTONE: NativeActivity +
+# the GLES3 backend presenting an animated clear on the device surface (proves EGL/GLES3 on
+# hardware + the whole scripted APK pipeline). The game loop / SAF / audio / input wire in
+# on top of this. Packaged by port/tools/build_apk.ps1.
+add_library(tjapp SHARED
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/android/native_main.cpp
+    ${RT}/gfx/gles_gfx.cpp
+    ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
+target_include_directories(tjapp PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    ${ANDROID_NDK}/sources/android/native_app_glue)
+target_link_libraries(tjapp PRIVATE GLESv3 EGL android log)
+# native_app_glue provides ANativeActivity_onCreate; the linker must keep it (nothing in the
+# .so references it directly — the framework loads it by name).
+target_link_options(tjapp PRIVATE -u ANativeActivity_onCreate)
