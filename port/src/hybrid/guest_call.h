@@ -13,6 +13,7 @@
 // On ARM (Stage 5) this same seam becomes Engine::Call — the sites will not change again.
 #pragma once
 #include <cstdint>
+#include <cstdio>
 #include "hybrid/dispatch.h"
 
 namespace tj::hybrid {
@@ -79,17 +80,25 @@ bool EngineModeArmBoot();
 // caller's fstp.
 namespace gcall_detail {
 
-template <class T> inline uint32_t ToSlot(T v) {
+template <class T> inline uint32_t ToSlot(T v, uint32_t va, int argIdx) {
     if constexpr (std::is_pointer_v<T>) {
         // A pointer argument handed to guest code must be a guest-visible address.
         uintptr_t u = (uintptr_t)v;
 #if !defined(_M_IX86)
-        if (u >> 32) tj::hybrid::dispatch_detail::DispatchFatal(
-            "guest-call pointer argument above 4 GB (relocate the data)");
+        if (u >> 32) {
+            // Name the site: which guest callee, which argument, what host pointer —
+            // one reproduction pinpoints the un-relocated datum (session-29 LAN lesson).
+            static char msg[128];
+            std::snprintf(msg, sizeof msg,
+                "guest-call arg %d above 4 GB calling guest %08X (host %p) - relocate the data",
+                argIdx, va, (void*)u);
+            tj::hybrid::dispatch_detail::DispatchFatal(msg);
+        }
 #endif
         return (uint32_t)u;
     } else {
         static_assert(sizeof(T) <= 4, "guest-call args must fit one 4-byte slot");
+        (void)va; (void)argIdx;
         uint32_t u = 0; std::memcpy(&u, &v, sizeof(T)); return u;
     }
 }
@@ -105,7 +114,7 @@ GuestCallMarshal(uint32_t va, std::index_sequence<I...>, A... a) {
 
     uint32_t slot[n > 0 ? n : 1];
     ((slot[I] = gcall_detail::ToSlot(
-          static_cast<std::tuple_element_t<I, typename Sig::ArgTuple>>(a))), ...);
+          static_cast<std::tuple_element_t<I, typename Sig::ArgTuple>>(a), va, (int)I)), ...);
 
     uint32_t ecx = 0, edx = 0;
     uint32_t stackW[n > 0 ? n : 1];

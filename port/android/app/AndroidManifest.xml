@@ -9,6 +9,12 @@
 
     <!-- minSdk 26: AAudio (the audio output path). The engine itself still targets 24. -->
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+
+    <!-- LAN play: without INTERNET, socket() fails EPERM ("SOCKET FAILED (1)" — the
+         session-29 on-device finding). Local-subnet UDP only; nothing leaves the LAN. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
 
     <application

@@ -308,7 +308,12 @@ static void Fit(Row& r, int slot, float baseScale, float maxW, float minScale) {
     // Still too wide at the floor: ellipsize. Never cut between a 0x08 button-glyph escape
     // and the letter that selects the glyph -- a lone 0x08 makes the renderer eat the
     // terminator and walk off the end of the buffer.
-    char buf[sizeof(g_txt[0])];
+    // Guest-arena scratch, NOT a stack array: this buffer is MEASURED through the guest's
+    // FnTextWidth, and a 64-bit host stack pointer trips the >4GB tripwire (session-29
+    // on-device LAN crash — Android's default name "LOCALHOST" is wide enough to reach
+    // this path where PC names never did). Single-threaded UI build path: static is safe.
+    static char (&buf)[sizeof(g_txt[0])] =
+        *(char(*)[sizeof(g_txt[0])])GuestObjAlloc(sizeof(g_txt[0]), 8);
     int n = (int)strlen(s);
     if (n > (int)sizeof(buf) - 3) n = (int)sizeof(buf) - 3;
     for (--n; n > 0; --n) {
