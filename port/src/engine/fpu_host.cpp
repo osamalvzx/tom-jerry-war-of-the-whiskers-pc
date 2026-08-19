@@ -11,6 +11,7 @@
 // contract as everything else on this boundary.
 #if !defined(_M_IX86)
 #include "engine/engine.h"
+#include "engine/x87_exact.h"
 #include <cstring>
 
 namespace tj::engine {
@@ -19,10 +20,17 @@ static FpuEnv g_virtualHostFpu;
 
 FpuEnv* VirtualHostFpu() { return &g_virtualHostFpu; }
 
+// These two are the ONLY way a guest FPU image is read or replaced outside the x87
+// units on this host (the dispatch bracket, the escape bracket, GCALL's nested state,
+// boot init all route through here) — which makes them the natural, complete coherence
+// boundary for the FAST unit's shadow register file (x87_exact.h). Both hooks are
+// pointer-identity gated, so this stays exact even with several live CpuStates.
 void FpuCaptureHost(FpuEnv* env) {
     std::memcpy(env->image, g_virtualHostFpu.image, sizeof env->image);
+    X87FastInvalidateImage(env->image);          // env->image was just replaced
 }
 void FpuRestoreHost(const FpuEnv* env) {
+    X87FastFlushImage(const_cast<uint8_t*>(env->image));   // about to be read out
     std::memcpy(g_virtualHostFpu.image, env->image, sizeof g_virtualHostFpu.image);
 }
 

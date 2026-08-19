@@ -43,11 +43,12 @@
 // predicate is identical), C2 cleared by the trig ops, everything else preserved.
 // Transcendental flags follow EXACT's rules (PE always on the numeric path, C1=0).
 //
-// STATE: operates IN PLACE on the guest-visible 108-byte FNSAVE image (x87_exact.h
-// documents the layout). Register slots are LOGICAL (ST0 first), so push/pop shift
-// the 8 slots by 10 bytes — still far cheaper than the EXACT unit's full image
-// unpack/repack, and the freed/filled physical register's raw bytes land exactly
-// where hardware FNSAVE would put them. Tags are per PHYSICAL register and are
+// STATE: the guest-visible 108-byte FNSAVE image (x87_exact.h documents the layout).
+// CW/SW/TW are write-through per op; the eight 80-bit register slots are held in a
+// SHADOW REGISTER FILE (see below) and flushed back only at the boundaries where the
+// image can be observed — that shadow is what makes the unit fast, since the image's
+// LOGICAL slot order otherwise costs a 70-byte rotation per push/pop and an
+// extF80<->double round trip per operand. Tags are per PHYSICAL register and are
 // updated for exactly the slots an op writes (both units maintain the invariant
 // "tag matches value", so untouched slots stay correct).
 //
@@ -75,10 +76,75 @@ constexpr uint16_t kTopMask = 0x3800;
 // ---------------------------------------------------------------------------------
 // image accessor: CW/SW/TW words + logical slot bytes, committed back on success
 
+bool ReadDouble(const uint8_t* slot, double* out);   // defined below; used by the shadow
+int  WriteDouble(uint8_t* slot, double v);
+
+// May a double be held in the shadow's cached form? EXACTLY the value classes
+// ReadDouble accepts out of an 80-bit slot: true zeros and normal doubles.
+//
+// This is load-bearing, not a micro-check. A cached double bypasses the ReadDouble
+// gate on the next read, so anything cacheable here must be something that gate would
+// have re-admitted. DENORMALS are the case that bites: AddCore may return one by
+// gradual underflow, WriteDouble stores it as a *normal* extF80, and ReadDouble then
+// refuses it (exponent below double's normal range) so the next op falls back to the
+// EXACT unit — which computes it at 64-bit precision and does NOT underflow. Caching
+// such a value would silently keep that op on the fast path and change the result.
+// (Unreachable with this game's float-range values, which is exactly why it would
+// have gone unnoticed.) Inf/NaN can never reach here — the cores reject them — but
+// the test covers them for free.
+inline bool CacheableDouble(double v) {
+    uint64_t b;
+    memcpy(&b, &v, 8);
+    int e = (int)((b >> 52) & 0x7FF);
+    if (e == 0) return (b << 1) == 0;                // ±0 yes, denormal no
+    return e != 0x7FF;                               // normal yes, inf/NaN no
+}
+
+// THE SHADOW REGISTER FILE (session-30 R1 — the profile's #1 recommendation).
+//
+// The image's eight 80-bit slots are held in LOGICAL order (ST0 at img+28), so the
+// straightforward implementation pays for that layout twice on every op: a push/pop
+// physically rotates 70+70 bytes, and every operand round-trips extF80<->double. The
+// profile measured ~50% of in-match x87 ops as pushes/pops and named this marshaling
+// — not the arithmetic — as the bulk of the 29.4% x87 phase.
+//
+// So the slots live HERE instead, in a CIRCULAR buffer whose head is ST0. That is not
+// an approximation of the image layout, it IS the image layout: a push overwrites the
+// entry that was logical 7 (the bytes the memmove version dropped off the end) and a
+// pop leaves the freed entry at logical 7 (where the memmove version copied it), so a
+// flush reproduces the same 80 bytes the old code would have written — including the
+// stale bytes of empty registers, which fnsave makes guest-visible.
+//
+// COHERENCE CONTRACT. cw/sw/tw stay write-through (Commit, per op — they are cheap and
+// keep TOP/tags/exception bits live for every reader). Only the 80 slot bytes are lazy,
+// and the shadow is flushed/dropped at every point the guest image can be observed:
+//   * FpuRestoreHost/FpuCaptureHost (fpu_host.cpp) — pointer-identity hooked, which by
+//     construction covers EVERY external guest-image access on this host: the dispatch
+//     bracket, the escape bracket, GCALL's nested state, boot init.
+//   * the EXACT unit (X87Exec/X87ExactOnImage) — flushed before, dropped after.
+// Re-binding is also self-checked: Load() drops the shadow unless the owning image AND
+// its TOP still match, so a state switch can never be read through a stale cache.
+struct Shadow {
+    struct Ent {
+        uint8_t raw[10];
+        double  d;
+        bool    dValid;      // `d` holds this register's value
+        bool    rawValid;    // `raw` holds this register's bytes
+    };
+    Ent      ent[8];
+    uint8_t* owner = nullptr;    // the image these slots belong to
+    int      head = 0;           // ent[head] is ST0
+    int      top = 0;            // image TOP this mapping was built against
+    bool     live = false;
+};
+Shadow g_sh;                     // single-threaded engine, exactly like the FPU itself
+
 struct FImg {
     uint8_t* img;
     uint16_t cw, sw, tw;
     int top;
+
+    Shadow::Ent& E(int logi) { return g_sh.ent[(g_sh.head + logi) & 7]; }
 
     void Load(uint8_t* image) {
         img = image;
@@ -86,18 +152,66 @@ struct FImg {
         memcpy(&sw, img + 4, 2);
         memcpy(&tw, img + 8, 2);
         top = (sw >> 11) & 7;
+        if (!g_sh.live || g_sh.owner != image || g_sh.top != top) {
+            for (int i = 0; i < 8; ++i) {          // rebind: one 80-byte read, then cached
+                memcpy(g_sh.ent[i].raw, image + 28 + 10 * i, 10);
+                g_sh.ent[i].rawValid = true;
+                g_sh.ent[i].dValid = false;
+            }
+            g_sh.owner = image;
+            g_sh.head = 0;
+            g_sh.top = top;
+            g_sh.live = true;
+        }
     }
     void Commit() {
         sw = (uint16_t)((sw & ~kTopMask) | (top << 11));
         memcpy(img + 4, &sw, 2);
         memcpy(img + 8, &tw, 2);
+        g_sh.top = top;                            // keep the mapping's anchor in step
     }
     int Phys(int logi) const { return (top + logi) & 7; }
     int Tag(int logi) const { return (tw >> (2 * Phys(logi))) & 3; }
     void SetTagPhys(int phys, int t) {
         tw = (uint16_t)((tw & ~(3u << (2 * phys))) | ((unsigned)t << (2 * phys)));
     }
-    uint8_t* Slot(int logi) { return img + 28 + 10 * logi; }
+    // Raw byte access, for the forms that move whole 80-bit values (fld/fstp m80, fxch,
+    // fld st(i), the sign twiddles). Conservative: materializes the bytes and drops the
+    // double cache, because the caller may WRITE through this pointer.
+    uint8_t* Slot(int logi) {
+        Shadow::Ent& e = E(logi);
+        if (!e.rawValid) { WriteDouble(e.raw, e.d); e.rawValid = true; }
+        e.dValid = false;
+        return e.raw;
+    }
+
+    // ---- the hot paths: values as doubles, no extF80 round trip ----
+    // Read ST(logi) as an exact double; false = empty, or a value the fast path may not
+    // touch (the ReadDouble gate is unchanged — this only removes the re-parsing).
+    bool GetD(int logi, double* out) {
+        if (Tag(logi) == 3) return false;
+        Shadow::Ent& e = E(logi);
+        if (e.dValid) { *out = e.d; return true; }
+        if (!e.rawValid) return false;             // (unreachable: one form is always live)
+        if (!ReadDouble(e.raw, &e.d)) return false;
+        e.dValid = true;
+        *out = e.d;
+        return true;
+    }
+    // Write ST(logi) = v (finite) and set its tag exactly as WriteDouble/fnsave would.
+    void SetD(int logi, double v) {
+        Shadow::Ent& e = E(logi);
+        if (CacheableDouble(v)) {
+            e.d = v;
+            e.dValid = true;
+            e.rawValid = false;                    // bytes materialize at flush
+        } else {                                   // keep the gate's verdict intact
+            WriteDouble(e.raw, v);
+            e.rawValid = true;
+            e.dValid = false;
+        }
+        SetTagPhys(Phys(logi), v == 0.0 ? 1 : 0);  // ±0 -> tag 1, else normal -> 0
+    }
 
     void SetC1(int v) { sw = (uint16_t)((sw & ~kC1) | (v ? kC1 : 0)); }
     void SetCmp(int c0, int c2, int c3) {
@@ -107,25 +221,58 @@ struct FImg {
 
     // push a raw 10-byte value; caller has verified the dest phys reg is empty
     void PushRaw(const uint8_t v[10], int tag) {
-        uint8_t tmp[70];
-        memcpy(tmp, img + 28, 70);
-        memcpy(img + 38, tmp, 70);
-        memcpy(img + 28, v, 10);
+        g_sh.head = (g_sh.head - 1) & 7;           // the old logical 7 is overwritten,
+        Shadow::Ent& e = g_sh.ent[g_sh.head];      // exactly as the 70-byte shift did
+        memcpy(e.raw, v, 10);
+        e.rawValid = true;
+        e.dValid = false;
         top = (top - 1) & 7;
+        g_sh.top = top;                            // see Pop(): keeps the mapping honest
         SetTagPhys(top, tag);
     }
-    // pop: free phys(0), rotate slots so logical order holds, freed reg's raw bytes
-    // become logical slot 7 (exactly the hardware FNSAVE layout after a pop)
+    // push a double straight into the new ST0 (no extF80 materialization)
+    void PushD(double v) {
+        g_sh.head = (g_sh.head - 1) & 7;
+        Shadow::Ent& e = g_sh.ent[g_sh.head];
+        if (CacheableDouble(v)) {                  // see SetD: the cache honors the gate
+            e.d = v;
+            e.dValid = true;
+            e.rawValid = false;
+        } else {
+            WriteDouble(e.raw, v);
+            e.rawValid = true;
+            e.dValid = false;
+        }
+        top = (top - 1) & 7;
+        g_sh.top = top;                            // see Pop(): keeps the mapping honest
+        SetTagPhys(top, v == 0.0 ? 1 : 0);
+    }
+    // pop: free phys(0); the freed entry becomes logical slot 7 by construction (the
+    // hardware FNSAVE layout after a pop — the same bytes the old memmove placed there)
+    // The stack moves are recorded in g_sh.top as they happen, NOT at Commit: an op that
+    // pushed/popped and then bailed to EXACT never commits, so the image keeps the old
+    // TOP while the shadow head has moved — recording it here makes that mismatch visible
+    // to the next Load(), which rebinds and throws the speculative move away. Without it
+    // the invariant would rest on "no fast path ever falls back after moving the stack",
+    // which is true today and would be silent to break.
     void Pop() {
-        uint8_t sav[10], tmp[70];
-        memcpy(sav, img + 28, 10);
-        memcpy(tmp, img + 38, 70);
-        memcpy(img + 28, tmp, 70);
-        memcpy(img + 98, sav, 10);
         SetTagPhys(top, 3);
+        g_sh.head = (g_sh.head + 1) & 7;
         top = (top + 1) & 7;
+        g_sh.top = top;
     }
 };
+
+// Materialize the shadow's slots into the image it owns. Cheap and rare: the boundary
+// hooks below and the EXACT fallback are the only callers (~dozens/frame vs ~285k ops).
+void ShadowFlush() {
+    if (!g_sh.live || !g_sh.owner) return;
+    for (int i = 0; i < 8; ++i) {
+        Shadow::Ent& e = g_sh.ent[(g_sh.head + i) & 7];
+        if (!e.rawValid) { WriteDouble(e.raw, e.d); e.rawValid = true; }
+        memcpy(g_sh.owner + 28 + 10 * i, e.raw, 10);
+    }
+}
 
 // ---------------------------------------------------------------------------------
 // extF80 image <-> double (lossless where the fast path commits)
@@ -348,6 +495,16 @@ constexpr int kFall = -2;                          // == kX87FastFallback
 
 // =================================================================================
 
+// ---- shadow coherence hooks (x87_exact.h documents the contract) ----
+// Pointer-identity gated: a caller hands us whatever image it is about to read or
+// overwrite, and we act only if the shadow is that image's cache.
+void X87FastFlushImage(uint8_t* image) {
+    if (g_sh.live && g_sh.owner == image) ShadowFlush();
+}
+void X87FastInvalidateImage(const uint8_t* image) {
+    if (g_sh.owner == image) { g_sh.live = false; g_sh.owner = nullptr; }
+}
+
 bool X87FastWanted() {
 #if defined(_M_IX86) || defined(__i386__)
     // On the x86 host the guest x87 state lives on the REAL FPU between gate
@@ -410,7 +567,7 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
     // ST0-dest binary against an already-loaded double operand (memory forms)
     auto MemArith = [&](int kind, double b) -> int {
         double a;
-        if (F.Tag(0) == 3 || !ReadDouble(F.Slot(0), &a)) return kFall;
+        if (!F.GetD(0, &a)) return kFall;
         if (kind == 2 || kind == 3) {              // fcom / fcomp
             CmpCodes(a, b);
             if (kind == 3) F.Pop();
@@ -420,7 +577,7 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
         if (!arithOk) return kFall;
         AR o;
         if (!RunKind(kind, a, b, &o)) return kFall;
-        F.SetTagPhys(F.Phys(0), WriteDouble(F.Slot(0), o.r));
+        F.SetD(0, o.r);
         if (o.pe) F.sw |= kPEf;
         F.SetC1(o.c1);
         F.Commit();
@@ -430,12 +587,11 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
     // register-form binary: a = ST0, b = ST(i), result to dst (logical), pops 0/1
     auto RegArith = [&](int kind, int srcI, int dst, int pops) -> int {
         double a, b;
-        if (F.Tag(0) == 3 || F.Tag(srcI) == 3) return kFall;
-        if (!ReadDouble(F.Slot(0), &a) || !ReadDouble(F.Slot(srcI), &b)) return kFall;
+        if (!F.GetD(0, &a) || !F.GetD(srcI, &b)) return kFall;
         if (!arithOk) return kFall;
         AR o;
         if (!RunKind(kind, a, b, &o)) return kFall;
-        F.SetTagPhys(F.Phys(dst), WriteDouble(F.Slot(dst), o.r));
+        F.SetD(dst, o.r);
         if (o.pe) F.sw |= kPEf;
         F.SetC1(o.c1);
         if (pops) F.Pop();
@@ -446,8 +602,7 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
     // register compare: ST0 vs ST(i)/value, then pops
     auto RegCmp = [&](int srcI, int pops) -> int {
         double a, b;
-        if (F.Tag(0) == 3 || F.Tag(srcI) == 3) return kFall;
-        if (!ReadDouble(F.Slot(0), &a) || !ReadDouble(F.Slot(srcI), &b)) return kFall;
+        if (!F.GetD(0, &a) || !F.GetD(srcI, &b)) return kFall;
         CmpCodes(a, b);
         for (int i = 0; i < pops; ++i) F.Pop();
         F.Commit();
@@ -458,9 +613,7 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
     auto LoadInt = [&](int64_t v) -> int {
         if (v > (int64_t)1 << 53 || v < -((int64_t)1 << 53)) return kFall;
         if (F.Tag(7) != 3) return kFall;           // push room (phys top-1 == logical 7)
-        uint8_t ten[10];
-        int tag = WriteDouble(ten, (double)v);
-        F.PushRaw(ten, tag);
+        F.PushD((double)v);
         F.SetC1(0);
         F.Commit();
         return 1;
@@ -469,7 +622,7 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
     // fist/fistp
     auto StoreMemInt = [&](int size, bool pop) -> int {
         double v;
-        if (F.Tag(0) == 3 || !ReadDouble(F.Slot(0), &v)) return kFall;
+        if (!F.GetD(0, &v)) return kFall;
         double r = RoundRc(v, rc);
         bool ok;
         switch (size) {
@@ -493,7 +646,7 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
     // fst/fstp m32 (m64 from a double register is always exact — separate path)
     auto StoreMemF32 = [&](bool pop) -> int {
         double v;
-        if (F.Tag(0) == 3 || !ReadDouble(F.Slot(0), &v)) return kFall;
+        if (!F.GetD(0, &v)) return kFall;
         if (rc != 0) return kFall;                 // store rounding honors RC
         float f = (float)v;
         uint32_t fb;
@@ -513,7 +666,7 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
 
     auto StoreMemF64 = [&](bool pop) -> int {
         double v;
-        if (F.Tag(0) == 3 || !ReadDouble(F.Slot(0), &v)) return kFall;
+        if (!F.GetD(0, &v)) return kFall;
         uint64_t b;
         memcpy(&b, &v, 8);                         // register IS a double: exact store
         St64(ea, b);
@@ -526,9 +679,7 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
     // fld of a double value (memory f32/f64 already converted)
     auto PushDouble = [&](double v) -> int {
         if (F.Tag(7) != 3) return kFall;           // dest occupied: EXACT stack fault
-        uint8_t ten[10];
-        int tag = WriteDouble(ten, v);
-        F.PushRaw(ten, tag);
+        F.PushD(v);
         F.SetC1(0);
         F.Commit();
         return 1;
@@ -611,7 +762,7 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
         }
         case 0xE4: {                               // ftst
             double a;
-            if (F.Tag(0) == 3 || !ReadDouble(F.Slot(0), &a)) return kFall;
+            if (!F.GetD(0, &a)) return kFall;
             CmpCodes(a, 0.0);
             F.Commit();
             return 1;
@@ -641,11 +792,11 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
         }
         case 0xFA: {                               // fsqrt
             double a;
-            if (F.Tag(0) == 3 || !ReadDouble(F.Slot(0), &a)) return kFall;
+            if (!F.GetD(0, &a)) return kFall;
             if (!arithOk) return kFall;
             AR o;
             if (!SqrtCore(a, &o)) return kFall;
-            F.SetTagPhys(F.Phys(0), WriteDouble(F.Slot(0), o.r));
+            F.SetD(0, o.r);
             if (o.pe) F.sw |= kPEf;
             F.SetC1(o.c1);
             F.Commit();
@@ -653,9 +804,9 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
         }
         case 0xFC: {                               // frndint (honors all RC values)
             double a;
-            if (F.Tag(0) == 3 || !ReadDouble(F.Slot(0), &a)) return kFall;
+            if (!F.GetD(0, &a)) return kFall;
             double r = RoundRc(a, rc);
-            F.SetTagPhys(F.Phys(0), WriteDouble(F.Slot(0), r));
+            F.SetD(0, r);
             bool pe = (r != a);
             if (pe) F.sw |= kPEf;
             F.SetC1(pe && (std::fabs(r) > std::fabs(a)));
@@ -665,12 +816,12 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
         // ------------------------- transcendentals (the FAST contract) ----------
         case 0xF0: {                               // f2xm1
             double a;
-            if (F.Tag(0) == 3 || !ReadDouble(F.Slot(0), &a)) return kFall;
+            if (!F.GetD(0, &a)) return kFall;
             if (a == 0.0) { F.SetC1(0); F.Commit(); return 1; }   // exact, ±0 kept
             if (std::fabs(a) > 1.0) return kFall;  // out-of-domain pass-through: EXACT
             double r = std::expm1(a * 0x1.62e42fefa39efp-1);      // x * ln2
             if (!IsNormalD(r)) return kFall;
-            F.SetTagPhys(F.Phys(0), WriteDouble(F.Slot(0), r));
+            F.SetD(0, r);
             F.sw |= kPEf;
             F.SetC1(0);
             F.Commit();
@@ -678,12 +829,11 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
         }
         case 0xF1: {                               // fyl2x: ST1 = ST1 * log2(ST0), pop
             double x, y;
-            if (F.Tag(0) == 3 || F.Tag(1) == 3) return kFall;
-            if (!ReadDouble(F.Slot(0), &x) || !ReadDouble(F.Slot(1), &y)) return kFall;
+            if (!F.GetD(0, &x) || !F.GetD(1, &y)) return kFall;
             if (!(x > 0.0) || x == 1.0 || y == 0.0) return kFall;  // specials: EXACT
             double r = y * std::log2(x);
             if (!IsNormalD(r)) return kFall;
-            F.SetTagPhys(F.Phys(1), WriteDouble(F.Slot(1), r));
+            F.SetD(1, r);
             F.sw |= kPEf;
             F.SetC1(0);
             F.Pop();
@@ -692,12 +842,11 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
         }
         case 0xF3: {                               // fpatan: ST1 = atan2(ST1, ST0), pop
             double x, y;
-            if (F.Tag(0) == 3 || F.Tag(1) == 3) return kFall;
-            if (!ReadDouble(F.Slot(0), &x) || !ReadDouble(F.Slot(1), &y)) return kFall;
+            if (!F.GetD(0, &x) || !F.GetD(1, &y)) return kFall;
             if (x == 0.0 || y == 0.0) return kFall;               // specials: EXACT
             double r = std::atan2(y, x);
             if (!IsNormalD(r)) return kFall;
-            F.SetTagPhys(F.Phys(1), WriteDouble(F.Slot(1), r));
+            F.SetD(1, r);
             F.sw |= kPEf;
             F.SetC1(0);
             F.Pop();
@@ -709,10 +858,10 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
         case 0xFF: {                               // fcos
             bool push = (modrm == 0xFB);
             double a;
-            if (F.Tag(0) == 3 || !ReadDouble(F.Slot(0), &a)) return kFall;
+            if (!F.GetD(0, &a)) return kFall;
             if (push && F.Tag(7) != 3) return kFall;              // no room for cos
             if (a == 0.0) {                        // exact: sin(±0)=±0, cos=1
-                if (modrm == 0xFF) F.SetTagPhys(F.Phys(0), WriteDouble(F.Slot(0), 1.0));
+                if (modrm == 0xFF) F.SetD(0, 1.0);
                 else if (push) {
                     uint8_t ten[10];
                     int tag = WriteDouble(ten, 1.0);
@@ -727,10 +876,10 @@ int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
             double sn = 0.0, cs = 0.0;
             if (modrm != 0xFF) { sn = std::sin(a); if (!IsNormalD(sn)) return kFall; }
             if (modrm != 0xFE) { cs = std::cos(a); if (!IsNormalD(cs)) return kFall; }
-            if (modrm == 0xFE) F.SetTagPhys(F.Phys(0), WriteDouble(F.Slot(0), sn));
-            else if (modrm == 0xFF) F.SetTagPhys(F.Phys(0), WriteDouble(F.Slot(0), cs));
+            if (modrm == 0xFE) F.SetD(0, sn);
+            else if (modrm == 0xFF) F.SetD(0, cs);
             else {
-                F.SetTagPhys(F.Phys(0), WriteDouble(F.Slot(0), sn));
+                F.SetD(0, sn);
                 uint8_t ten[10];
                 int tag = WriteDouble(ten, cs);
                 F.PushRaw(ten, tag);

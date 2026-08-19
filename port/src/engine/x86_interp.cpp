@@ -14,6 +14,12 @@
 #include "engine/engine_priv.h"
 #include "engine/engine_host.h"
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#if !defined(_WIN32)
+#include <csignal>
+#include <sys/time.h>
+#endif
 
 namespace tj::engine {
 
@@ -146,6 +152,141 @@ uint32_t EngineEipRing(uint32_t* out, uint32_t n) {
     for (uint32_t i = 0; i < n; ++i)
         out[i] = g_eipRing[(g_eipRingIdx - n + i) & (kEipRingCap - 1)];
     return n;
+}
+
+// ---------------------------------------------------------------- TJ_ENG_PROF2
+// TEMPORARY session-30 instrumentation (engine.h documents the contract). Time
+// attribution: a SIGPROF/ITIMER_PROF sampler (process CPU time — under qemu that
+// includes qemu's own translation cost, which is exactly the cost being measured)
+// reads the phase variable + the last ring EIP; counters attribute instruction MIX
+// (hot-form hits, slow-path decodes, x87 outcomes). All integer — the engine stays
+// FP-free. Everything below is idle unless TJ_ENG_PROF2=1.
+volatile uint32_t g_prof2Phase = P2_HOST;
+bool g_prof2Live = false;              // Prof2Scope gate (see engine.h): off => no stores
+bool g_prof2On = false;
+namespace {
+uint64_t g_p2PhaseSamples[8];
+uint64_t g_p2Samples = 0;
+// Guest-EIP heat, time-weighted (sampled): 64-byte buckets over retail .text, 4KB
+// pages over the rest of the exec window (g_smcLo-based, same as the SMC tables).
+constexpr uint32_t kP2TextLo = 0x11000, kP2TextHi = 0x94380;
+constexpr uint32_t kP2TextN = (kP2TextHi - kP2TextLo) / 64 + 1;
+uint32_t g_p2Text[kP2TextN];
+uint32_t g_p2Page[65536];
+uint64_t g_p2EipOut = 0;                   // sampled EIP outside text+window buckets
+// Instruction-mix counters (not time): hot-form executions + slow-path lead bytes.
+uint64_t g_p2Form[32];
+uint64_t g_p2Slow = 0;
+uint64_t g_p2SlowOp[256];
+
+#if !defined(_WIN32)
+void Prof2Handler(int) {
+    uint32_t ph = g_prof2Phase;
+    ++g_p2Samples;
+    ++g_p2PhaseSamples[ph & 7];
+    if (ph <= P2_X87E) {                   // engine phases: bucket the guest EIP too
+        uint32_t eip = g_eipRing[(g_eipRingIdx - 1) & (kEipRingCap - 1)];
+        if (eip - kP2TextLo < kP2TextHi - kP2TextLo)
+            ++g_p2Text[(eip - kP2TextLo) / 64];
+        else if (eip - g_smcLo < g_smcSpan)
+            ++g_p2Page[(eip - g_smcLo) >> 12];
+        else
+            ++g_p2EipOut;
+    }
+}
+#endif
+
+bool Prof2Init() {
+    const char* e = getenv("TJ_ENG_PROF2");
+    if (!(e && *e == '1')) return false;
+    g_prof2On = true;
+    g_prof2Live = true;                // arms the Prof2Scope phase stores
+#if !defined(_WIN32)
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = Prof2Handler;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    itimerval tv{};
+    tv.it_interval.tv_usec = 2000;         // 500 samples per CPU-second
+    tv.it_value.tv_usec = 2000;
+    if (sigaction(SIGPROF, &sa, nullptr) == 0 &&
+        setitimer(ITIMER_PROF, &tv, nullptr) == 0) {
+        printf("[prof2] armed: ITIMER_PROF 500/s (cpu-time), counters on\n");
+    } else if (sigaction(SIGVTALRM, &sa, nullptr) == 0 &&
+               setitimer(ITIMER_VIRTUAL, &tv, nullptr) == 0) {
+        printf("[prof2] armed: ITIMER_VIRTUAL fallback 500/s, counters on\n");
+    } else {
+        printf("[prof2] NO timer sampler (setitimer failed) — counters only\n");
+    }
+#else
+    printf("[prof2] counters on (no sampler on Windows — use TJ_PROF there)\n");
+#endif
+    return true;
+}
+} // namespace
+
+bool EngineProf2On() { return g_prof2On; }
+
+void EngineProf2Snap(uint32_t frame) {
+    if (!g_prof2On) return;
+    static const char* kPh[8] = { "int", "x87fast", "x87exact", "dispatch",
+                                  "gcall", "detlog", "host", "?7" };
+    char line[512];
+    int n = snprintf(line, sizeof line, "[prof2] SNAP f=%u samples=%llu",
+                     frame, (unsigned long long)g_p2Samples);
+    for (int i = 0; i < 7; ++i)
+        n += snprintf(line + n, sizeof line - (size_t)n, " %s=%llu",
+                      kPh[i], (unsigned long long)g_p2PhaseSamples[i]);
+    printf("%s\n", line);
+    printf("[prof2] insn=%llu hotHit=%llu hotMiss=%llu slowDecode=%llu eipOut=%llu\n",
+           (unsigned long long)g_instrTotal, (unsigned long long)g_hotHits,
+           (unsigned long long)g_hotMiss, (unsigned long long)g_p2Slow,
+           (unsigned long long)g_p2EipOut);
+    // hot-form mix, one line (indexes match the F_* enum order)
+    n = snprintf(line, sizeof line, "[prof2] forms");
+    for (int i = 1; i < 32; ++i)
+        if (g_p2Form[i])
+            n += snprintf(line + n, sizeof line - (size_t)n, " %d:%llu",
+                          i, (unsigned long long)g_p2Form[i]);
+    printf("%s\n", line);
+    // top slow-path lead bytes
+    n = snprintf(line, sizeof line, "[prof2] slowops");
+    for (int pass = 0; pass < 12; ++pass) {
+        uint64_t best = 0; int bi = -1;
+        for (int i = 0; i < 256; ++i) {
+            if (g_p2SlowOp[i] >> 63) continue;             // already emitted this snap
+            if (g_p2SlowOp[i] > best) { best = g_p2SlowOp[i]; bi = i; }
+        }
+        if (bi < 0 || !best) break;
+        n += snprintf(line + n, sizeof line - (size_t)n, " %02X:%llu",
+                      bi, (unsigned long long)best);
+        g_p2SlowOp[bi] = ~best;            // mark (restore below)
+    }
+    for (int i = 0; i < 256; ++i)
+        if (g_p2SlowOp[i] > (1ull << 63)) g_p2SlowOp[i] = ~g_p2SlowOp[i];
+    printf("%s\n", line);
+    X87Prof2Print();
+    // top 20 time-sampled .text 64-byte buckets (+ top pages outside .text)
+    for (int pass = 0; pass < 20; ++pass) {
+        uint32_t best = 0; int bi = -1;
+        for (uint32_t i = 0; i < kP2TextN; ++i)
+            if ((int32_t)g_p2Text[i] > 0 && g_p2Text[i] > best) { best = g_p2Text[i]; bi = (int)i; }
+        if (bi < 0 || !best) break;
+        printf("[prof2] hot va=%08X n=%u\n", kP2TextLo + (uint32_t)bi * 64, best);
+        g_p2Text[bi] |= 0x80000000u;       // mark emitted this snap
+    }
+    for (uint32_t i = 0; i < kP2TextN; ++i) g_p2Text[i] &= 0x7FFFFFFFu;
+    for (int pass = 0; pass < 8; ++pass) {
+        uint32_t best = 0; int bi = -1;
+        for (int i = 0; i < 65536; ++i)
+            if ((int32_t)g_p2Page[i] > 0 && g_p2Page[i] > best) { best = g_p2Page[i]; bi = i; }
+        if (bi < 0 || !best) break;
+        printf("[prof2] hotpage va=%08X n=%u\n", g_smcLo + (uint32_t)bi * 4096, best);
+        g_p2Page[bi] |= 0x80000000u;
+    }
+    for (int i = 0; i < 65536; ++i) g_p2Page[i] &= 0x7FFFFFFFu;
+    fflush(stdout);
 }
 
 // Record (never block) an access outside the controlled world. Runs BEFORE the access:
@@ -551,6 +692,8 @@ inline void StrAdvance(CpuState& s, int regIdx, int bits) {
 
 // ---------------------------------------------------------------- the core loop
 RunResult Run(CpuState& s, uint32_t stopEip, uint64_t maxSteps) {
+    static const bool p2init = Prof2Init(); (void)p2init;   // TJ_ENG_PROF2 (once)
+    Prof2Scope p2scope(P2_INT);            // interpreter phase; excursions re-scope
     const uint32_t fsBase = g_fsBaseOverride ? g_fsBaseOverride : HostFsFallback();
     RunResult rr{};
     uint64_t steps = 0;
@@ -592,6 +735,7 @@ RunResult Run(CpuState& s, uint32_t stopEip, uint64_t maxSteps) {
                 if (e.eip == s.eip && e.gen == g_pageGen[off >> 12]) {
                     if (e.form != F_NONE) {
                         ++g_hotHits;
+                        if (g_prof2On) ++g_p2Form[e.form];   // TJ_ENG_PROF2 mix
                         auto HotEa = [&]() -> uint32_t {
                             uint32_t ea = (uint32_t)e.disp;
                             if (e.base >= 0) ea += s.r[e.base];
@@ -712,6 +856,8 @@ RunResult Run(CpuState& s, uint32_t stopEip, uint64_t maxSteps) {
                 }
             }
         }
+
+        if (g_prof2On) { ++g_p2Slow; ++g_p2SlowOp[insnStart[0]]; }   // TJ_ENG_PROF2
 
         Dec d{};
         d.p = insnStart;

@@ -71,4 +71,13 @@ constexpr int kX87FastFallback = -2;
 bool X87FastWanted();   // env gate + host-environment sanity; false on x86 hosts
 int X87FastExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea);
 
+// THE FAST UNIT'S SHADOW REGISTER FILE — coherence hooks (session 30).
+// The unit keeps the eight 80-bit register slots in a private circular cache and lets
+// the image's slot bytes go stale between ops (cw/sw/tw stay write-through). Anything
+// that can OBSERVE or REPLACE a guest image must therefore bracket itself with these.
+// Both are no-ops unless the shadow currently owns exactly that image, so they are
+// safe (and free) to call on any image, including the virtual host FPU's.
+void X87FastFlushImage(uint8_t* image);          // stale slots -> image, before a read
+void X87FastInvalidateImage(const uint8_t* image);   // image replaced -> drop the cache
+
 } // namespace tj::engine

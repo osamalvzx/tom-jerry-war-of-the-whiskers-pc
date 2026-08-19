@@ -391,6 +391,7 @@ static void DetDump(const char* path) {
 }
 
 static void DetLogFrame() {
+    tj::engine::Prof2Scope p2(tj::engine::P2_DET);   // TJ_ENG_PROF2: det/itemlog cost
     ItemLogFrame();
     if (g_detDumpAt >= 0 && (int)g_netFrame == g_detDumpAt) {
         char p[512]; char* e = nullptr; size_t n = 0;

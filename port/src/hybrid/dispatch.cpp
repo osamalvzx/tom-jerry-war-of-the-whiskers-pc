@@ -293,7 +293,8 @@ uint32_t GuestMarshalCall(uint32_t va, const uint32_t* stackW, int nStackW,
     using namespace tj::engine;
     CpuState* outer = g_frames[g_frameDepth - 1];
     ++g_guestCalls;
-
+    Prof2Scope p2(P2_GCALL);            // TJ_ENG_PROF2: marshal overhead (nested Run
+                                        // re-scopes itself to P2_INT)
     CpuState ns{};
     FpuCaptureHost(&ns.fpu);
     const uint32_t base = (outer->r[ESP] - 64u - (4u + 4u * (uint32_t)nStackW)) & ~3u;
@@ -376,6 +377,7 @@ bool DispatchTryInvoke(CpuState& s) {
     }
     if (!e->invoke) return false;                    // Raw (naked hooks) / Data — escape
     ++g_invokes;
+    tj::engine::Prof2Scope p2(tj::engine::P2_DISP);  // TJ_ENG_PROF2: boundary + hook body
     if (g_depth < 32) g_active[g_depth] = e;
     ++g_depth;
     DispatchPushFrame(&s);              // GuestCall marshals below this frame's ESP

@@ -80,6 +80,7 @@
 #include "engine/engine_priv.h"
 #include "engine/x87_exact.h"
 #include <cstring>
+#include <cstdio>
 
 extern "C" {
 #include "softfloat.h"
@@ -102,6 +103,49 @@ void EngineSetFpuMode(FpuMode m) { g_fpuMode = m; }
 FpuMode EngineGetFpuMode() { return g_fpuMode; }
 bool X87TakeFault() { bool f = g_x87Fault; g_x87Fault = false; return f; }
 
+// ---- TJ_ENG_PROF2 x87 outcome counters (session-30 temporary instrumentation) ----
+// Key = ((op-0xD8)<<8)|modrm (fwait -> the last slot); three outcome planes. Counting
+// only when TJ_ENG_PROF2=1; det-neutral (no guest state touched).
+namespace {
+constexpr int kP2X87N = 8 * 256 + 1;
+uint64_t g_p2X87[3][kP2X87N];
+inline int P2X87Key(uint8_t op, uint8_t modrm) {
+    return (op >= 0xD8 && op <= 0xDF) ? (((op - 0xD8) << 8) | modrm) : kP2X87N - 1;
+}
+} // namespace
+
+void X87Prof2Count(uint8_t op, uint8_t modrm, int outcome) {
+    ++g_p2X87[outcome][P2X87Key(op, modrm)];
+}
+
+void X87Prof2Print() {
+    static const char* kName[3] = { "fastcommit", "fallback", "exactonly" };
+    for (int pl = 0; pl < 3; ++pl) {
+        uint64_t tot = 0;
+        for (int i = 0; i < kP2X87N; ++i) tot += g_p2X87[pl][i];
+        char line[512];
+        int n = snprintf(line, sizeof line, "[prof2] x87 %s total=%llu top:",
+                         kName[pl], (unsigned long long)tot);
+        for (int pass = 0; pass < 14 && tot; ++pass) {
+            uint64_t best = 0; int bi = -1;
+            for (int i = 0; i < kP2X87N; ++i)
+                if (g_p2X87[pl][i] > best && !(g_p2X87[pl][i] >> 63)) {
+                    best = g_p2X87[pl][i]; bi = i;
+                }
+            if (bi < 0 || !best) break;
+            if (bi == kP2X87N - 1)
+                n += snprintf(line + n, sizeof line - (size_t)n, " fwait:%llu",
+                              (unsigned long long)best);
+            else
+                n += snprintf(line + n, sizeof line - (size_t)n, " %02X/%02X:%llu",
+                              0xD8 + (bi >> 8), bi & 0xFF, (unsigned long long)best);
+            g_p2X87[pl][bi] |= 1ull << 63;             // mark emitted
+        }
+        for (int i = 0; i < kP2X87N; ++i) g_p2X87[pl][i] &= ~(1ull << 63);
+        printf("%s\n", line);
+    }
+}
+
 bool X87Exec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
 #ifdef _M_IX86
     if (g_fpuMode == FpuMode::Native) return X87NativeExec(s, op, modrm, ea);
@@ -111,13 +155,25 @@ bool X87Exec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
     // the untouched image (x87_fast.cpp documents the contract).
     static const bool fast = X87FastWanted();
     if (fast) {
-        int rf = X87FastExec(s, op, modrm, ea);
+        int rf;
+        {
+            Prof2Scope p2(P2_X87F);                    // TJ_ENG_PROF2 phase
+            rf = X87FastExec(s, op, modrm, ea);
+        }
         if (rf != kX87FastFallback) {
+            if (g_prof2On) X87Prof2Count(op, modrm, X87P2_FASTCOMMIT);
             if (rf < 0) { g_x87Fault = true; return false; }
             return rf != 0;
         }
+        if (g_prof2On) X87Prof2Count(op, modrm, X87P2_FALLBACK);
+    } else if (g_prof2On) {
+        X87Prof2Count(op, modrm, X87P2_EXACTONLY);
     }
-    int r = X87ExactExec(s, op, modrm, ea);
+    int r;
+    {
+        Prof2Scope p2(P2_X87E);                        // TJ_ENG_PROF2 phase
+        r = X87ExactExec(s, op, modrm, ea);
+    }
     if (r < 0) { g_x87Fault = true; return false; }
     return r != 0;
 }
@@ -816,6 +872,11 @@ static Cls ClassF64(uint64_t u) {
 
 int X87ExactExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
     InitTrans();
+    // The FAST unit may be holding this image's register slots in its shadow cache
+    // (x87_exact.h): materialize them before we read the image, and drop the cache
+    // because everything below works on — and rewrites — the image directly.
+    X87FastFlushImage(s.fpu.image);
+    X87FastInvalidateImage(s.fpu.image);
 
     // ---- deferred #MF delivery: pending unmasked exception + waiting instruction
     uint16_t rawCw, rawSw;
@@ -1743,9 +1804,14 @@ int X87ExactExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
 void X87ExactOnImage(uint8_t image[108], uint8_t op, uint8_t modrm, uint32_t ea,
                      int* outcome) {
     CpuState s{};
+    X87FastFlushImage(image);            // the caller's image may be shadow-cached
     memcpy(s.fpu.image, image, 108);
+    // This stack CpuState could reuse the address of a dead one the shadow still
+    // names: drop any such claim before the image is used.
+    X87FastInvalidateImage(s.fpu.image);
     int r = X87ExactExec(s, op, modrm, ea);
     memcpy(image, s.fpu.image, 108);
+    X87FastInvalidateImage(image);       // caller's image replaced
     if (outcome) *outcome = r;
 }
 

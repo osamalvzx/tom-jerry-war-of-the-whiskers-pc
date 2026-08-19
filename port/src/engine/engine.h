@@ -146,4 +146,35 @@ void EngineInvalidateCode(uint32_t va, uint32_t len);
 constexpr uint32_t kEipRingCap = 256;
 uint32_t EngineEipRing(uint32_t* out, uint32_t n);
 
+// ---------------------------------------------------------------------------------
+// TJ_ENG_PROF2=1 — TEMPORARY session-30 instrumentation (in-match cost breakdown).
+// A CPU-time phase sampler (POSIX SIGPROF/ITIMER_PROF; rdtsc-free, qemu-friendly)
+// plus op-class / x87-fallback / guest-EIP-heat counters. Det-neutral by
+// construction: touches no guest-visible state, prints only to stdout. When the env
+// flag is unset the only residual cost is the phase save/restore stores below.
+// Phases: who owns the CPU right now (sampled by the SIGPROF handler).
+enum : uint32_t {
+    P2_INT = 0,     // interpreter core loop (fetch/decode/dispatch/int ops/memory)
+    P2_X87F = 1,    // x87 FAST unit (host-double attempt, committed or not)
+    P2_X87E = 2,    // x87 EXACT unit (SoftFloat; fallback or exact-mode run)
+    P2_DISP = 3,    // dispatch-boundary bracket + the host hook body it invokes
+    P2_GCALL = 4,   // host->guest marshal overhead (frame build; nested Run is P2_INT)
+    P2_DET = 5,     // TJ_DETLOG/TJ_ITEMLOG per-frame hashing + writes
+    P2_HOST = 6,    // anything else host-side (boot, pre-first-Run)
+};
+extern volatile uint32_t g_prof2Phase;
+extern bool g_prof2Live;               // set once at init; plain (hoistable, predicted)
+struct Prof2Scope {                    // save/set/restore — nesting-correct attribution
+    uint32_t old = 0;
+    // Gated so the SHIPPING build pays nothing: X87Exec brackets one of these per op
+    // (~285k/frame in-match), and two unconditional volatile stores there is real time.
+    explicit Prof2Scope(uint32_t p) {
+        if (!g_prof2Live) return;
+        old = g_prof2Phase; g_prof2Phase = p;
+    }
+    ~Prof2Scope() { if (g_prof2Live) g_prof2Phase = old; }
+};
+bool EngineProf2On();
+void EngineProf2Snap(uint32_t frame);  // print cumulative [prof2] counter lines
+
 } // namespace tj::engine

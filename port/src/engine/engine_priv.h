@@ -33,4 +33,12 @@ bool X87TakeFault();
 bool X87NativeExec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea);
 #endif
 
+// ---- TJ_ENG_PROF2 internals (session-30 temporary instrumentation) ----
+// g_prof2On lives in x86_interp.cpp; the x87 per-op-class outcome counters live in
+// x87_exact.cpp (they key on op/modrm at the X87Exec dispatch).
+extern bool g_prof2On;
+enum { X87P2_FASTCOMMIT = 0, X87P2_FALLBACK = 1, X87P2_EXACTONLY = 2 };
+void X87Prof2Count(uint8_t op, uint8_t modrm, int outcome);
+void X87Prof2Print();
+
 } // namespace tj::engine

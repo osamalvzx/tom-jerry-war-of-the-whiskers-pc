@@ -1866,6 +1866,16 @@ static void __stdcall Br_Swap(uint32_t flags) {
                (size_t)(pmc.WorkingSetSize >> 20), netbuf);
         g_frmTexCreate = g_frmTexUpdate = g_frmTexSkip = g_frmPbDedup = 0;
         g_tPb = g_tDraw = g_tTex = g_tSwap = 0;
+        // TJ_ENG_PROF2 (session-30 temporary instrumentation): cumulative engine
+        // counters + dispatch totals every 400 frames; diff consecutive snaps offline
+        // to isolate the in-match interval.
+        if (tj::engine::EngineProf2On()) {
+            tj::engine::EngineProf2Snap((uint32_t)g_frame);
+            uint64_t inv = 0, gc = 0; uint32_t miss = 0;
+            tj::hybrid::DispatchStats(&inv, &miss, &gc);
+            printf("[prof2] disp invokes=%llu gcalls=%llu\n",
+                   (unsigned long long)inv, (unsigned long long)gc);
+        }
     }
     g_dbgUiDraws = g_dbg3dDraws = g_dbgFvfDraws = g_dbgSkips = g_dbgBoneUploads = 0;
     // Diagnostic (TJ_ENTDUMP=1): dump the scene entity table (ptr @[0x15c470c]+0x1D4,
