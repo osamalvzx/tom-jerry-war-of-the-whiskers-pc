@@ -8,8 +8,16 @@
 # Output: /data/local/tmp/tj/<Tag>.det + .log, pulled back into %TEMP%\tj_eng_runs.
 # Compare with:  python port\tools\det_diff.py %TEMP%\tj_eng_runs\exS27.det %TEMP%\tj_eng_runs\<Tag>.det
 # (the Windows reference MUST be an -Exact engine leg - S5c is EXACT-vs-EXACT.)
+#   arm_run.ps1 -Adb <ip:port> -SkipAssets -Fast -Prof2 -Seconds 300 -Tag p2
+#     -Fast  : TJ_ENG_FAST=1, the x87 FAST unit (what the phone app ships)
+#     -Prof2 : TJ_ENG_PROF2=1, the phase sampler -- the ONLY way to get the real
+#              on-device in-match split. Read the [prof2] SNAP lines out of <Tag>.log and
+#              take DELTAS across an in-match window (the match arms ~f6640), e.g.
+#              f6800->f7600; shares of `samples` are the phase breakdown. qemu understates
+#              x87 work (it softfloats the FAST unit's host doubles), so THIS is the number
+#              that decides whether an x87 change paid off.
 param([string]$Adb = "", [string]$Tag = "armA", [int]$Seconds = 2400,
-      [switch]$SkipAssets, [int]$Arena = 3)
+      [switch]$SkipAssets, [int]$Arena = 3, [switch]$Fast, [switch]$Prof2)
 
 $adbExe = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 $root   = Split-Path (Split-Path $PSScriptRoot)
@@ -32,7 +40,10 @@ if (-not $SkipAssets) {
 }
 
 $inp = "@20:start,@1:start,@4:a,@14:down,@14:down,@14:a,@11:start,@map:$Arena"
-$cmd = "cd $dev && TJ_FAST=1 TJ_NOINPUT=1 TJ_UNLOCK=1 TJ_MEAT=1 " +
+$extra = ""
+if ($Fast)  { $extra += "TJ_ENG_FAST=1 " }
+if ($Prof2) { $extra += "TJ_ENG_PROF2=1 " }
+$cmd = "cd $dev && ${extra}TJ_FAST=1 TJ_NOINPUT=1 TJ_UNLOCK=1 TJ_MEAT=1 " +
        "TJ_INPUT='$inp' TJ_DETLOG=$dev/$Tag.det TJ_ITEMLOG=$dev/$Tag.items.txt " +
        "timeout $Seconds ./tj_headless $dev/extracted/default.xbe > $dev/$Tag.log 2>&1; " +
        "echo DONE"
