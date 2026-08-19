@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <atomic>
 #include <new>
+#include <vector>
 #include "runtime/gfx/d3d8.h"
 #include "android/ipc_protocol.h"
 
@@ -52,6 +53,16 @@ void SetAndroidDisplaySize(int w, int h);
 void GlesSetGameSize(int w, int h);
 bool GlesReleaseWindowSurface();
 bool GlesAttachWindowSurface(void* nativeWindow);
+void GlesSetDrawDiag(uint32_t mask);
+uint64_t GlesDrawDiagDrain(uint64_t out[4]);
+// One-upload-per-frame streaming (the Android compositor's private path; d3d8.h keeps the
+// shared Device contract). GlesStreamUpload puts a whole frame of geometry in the stream
+// buffers; the *At draws name their slice by byte offset instead of handing over a pointer.
+bool GlesStreamUpload(const void* vb, unsigned long vbBytes, const void* ib, unsigned long ibBytes);
+void GlesDrawPCAt(uint32_t vbOfs, int vertexCount);
+void GlesDrawPTCAt(uint32_t vbOfs, int vertexCount, uint32_t ibOfs, int indexCount);
+void GlesDrawShinyAt(uint32_t vbOfs, int vertexCount, uint32_t ibOfs, int indexCount,
+                     TextureHandle t0, TextureHandle t1, TextureHandle t2, TextureHandle t3);
 }
 
 namespace {
@@ -61,6 +72,14 @@ namespace {
 // across exec, its output lands in the same pump. Tag: wotw-game.
 uint64_t NowNs() {
     timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+// CPU time actually burned BY THIS THREAD. The whole display-leg conclusion rests on wall
+// clock ("replay costs 38-42 ms/frame"), and wall clock cannot tell work from waiting: a
+// descheduled or driver-blocked thread reads exactly like a busy one. Measuring both is the
+// only way to know which of the two the compositor is doing.
+uint64_t NowCpuNs() {
+    timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
@@ -412,20 +431,104 @@ bool     g_compProf = false;                  // TJ_COMP_PROF=1 in the flags fil
 // (fill rate scales with it, driver call count does not), and if the display leg is
 // fill-bound it is also the fix — a 2002 game's art does not need every phone pixel.
 float    g_gameScale = 1.0f;
+uint32_t g_compDiag = 0;                      // TJ_COMP_DIAG=<mask>, see gles_gfx.cpp
 uint64_t g_clsNs[4] = {}, g_clsN[4] = {};     // draw / texture / rendertarget / state
 
-// Replays until the ring is EMPTY, counting completed frames; the CALLER swaps once for
-// the whole batch. Draining past intermediate presents is the frame-drop path: when replay
-// +swap is slower than the 60 Hz sim, intermediate frames are executed into the backbuffer
-// and overdrawn without an eglSwapBuffers each — the sim never throttles below 60 because
-// the display leg fell behind. (All ops still execute: texture state stays exact.)
+// ---- ONE BUFFER UPLOAD PER FRAME ---------------------------------------------------------
+// The measurement that motivates this is at the top of the draw section in gles_gfx.cpp: the
+// per-draw vertex glBufferData was 5.44 ms of a 6.99 ms in-match draw budget at 253 draws.
+//
+// The ring already IS the frame command buffer -- in order, with every vertex byte inline. So
+// a frame is walked TWICE. Pass 1 copies each draw geometry into two CPU staging blocks and
+// remembers the byte offset it landed at; the two blocks go up in ONE glBufferData each; pass
+// 2 replays the commands in their exact original order, each draw naming its slice by offset.
+// Command ORDER -- every Clear, SetTexture, render-target switch, blend/depth change -- is
+// untouched by construction, because pass 2 is the same switch the streaming path always ran.
+struct DrawSlice { uint32_t vbOfs, ibOfs; };
+std::vector<uint8_t>   g_vbStage, g_ibStage;
+std::vector<DrawSlice> g_slices;
+bool g_batch = true;                        // TJ_COMP_BATCH=0 reverts to per-draw uploads
+
+inline uint32_t StageAppend(std::vector<uint8_t>& st, const void* src, size_t n, size_t align) {
+    size_t ofs = (st.size() + (align - 1)) & ~(align - 1);
+    st.resize(ofs + n);
+    if (n) memcpy(st.data() + ofs, src, n);
+    return (uint32_t)ofs;
+}
+
+// Cheap header-only walk: is a COMPLETE frame (one ending in OP_PRESENT) already in the ring?
+// Asked before staging so a frame still arriving is never memcpy'd once per 1 ms poll.
+bool HaveCompleteFrame(uint64_t tail, uint64_t head) {
+    using namespace tj::ipc;
+    const uint32_t N = g_hdr->ringBytes;
+    while (tail < head) {
+        uint32_t pos = (uint32_t)(tail % N);
+        CmdHdr ch;
+        memcpy(&ch, g_ring + pos, sizeof ch);
+        if (ch.op == OP_WRAP) { tail += sizeof(CmdHdr) + ch.bytes; continue; }
+        if (ch.op == OP_PRESENT) return true;
+        tail += CmdTotal(ch.bytes);
+    }
+    return false;
+}
+
+// Pass 1. Stages the geometry of every draw up to and including the frame OP_PRESENT.
+// Returns false if a draw header claims more bytes than its command carries -- a malformed
+// stream must not be allowed to size a memcpy, and the caller falls back to the legacy path.
+bool StageFrame(uint64_t tail, uint64_t head) {
+    using namespace tj::ipc;
+    const uint32_t N = g_hdr->ringBytes;
+    g_vbStage.clear(); g_ibStage.clear(); g_slices.clear();
+    while (tail < head) {
+        uint32_t pos = (uint32_t)(tail % N);
+        CmdHdr ch;
+        memcpy(&ch, g_ring + pos, sizeof ch);
+        if (ch.op == OP_WRAP) { tail += sizeof(CmdHdr) + ch.bytes; continue; }
+        const uint8_t* pl = g_ring + pos + sizeof(CmdHdr);
+        DrawSlice sl = { 0, 0 };
+        switch (ch.op) {
+            case OP_DRAW_PC: {
+                uint32_t vc; memcpy(&vc, pl, 4);
+                size_t vb = (size_t)vc * sizeof(tj::gfx::VertexPC);
+                if (4 + vb > ch.bytes) return false;
+                sl.vbOfs = StageAppend(g_vbStage, pl + 4, vb, 32);
+                g_slices.push_back(sl);
+            } break;
+            case OP_DRAW_PTC: {
+                uint32_t hd[2]; memcpy(hd, pl, 8);
+                size_t vb = (size_t)hd[0] * sizeof(tj::gfx::VertexPTC), ib = (size_t)hd[1] * 2;
+                if (8 + vb + ib > ch.bytes) return false;
+                sl.vbOfs = StageAppend(g_vbStage, pl + 8, vb, 32);
+                sl.ibOfs = StageAppend(g_ibStage, pl + 8 + vb, ib, 4);
+                g_slices.push_back(sl);
+            } break;
+            case OP_DRAW_SHINY: {
+                int32_t hd[6]; memcpy(hd, pl, 24);
+                if (hd[0] < 0 || hd[1] < 0) return false;
+                size_t vb = (size_t)hd[0] * sizeof(tj::gfx::VertexPT2C), ib = (size_t)hd[1] * 2;
+                if (24 + vb + ib > ch.bytes) return false;
+                sl.vbOfs = StageAppend(g_vbStage, pl + 24, vb, 32);
+                sl.ibOfs = StageAppend(g_ibStage, pl + 24 + vb, ib, 4);
+                g_slices.push_back(sl);
+            } break;
+            case OP_PRESENT: return true;
+            default: break;
+        }
+        tail += CmdTotal(ch.bytes);
+    }
+    return false;                            // caller only calls this after HaveCompleteFrame
+}
+
+// Pass 2 (and, with slices == nullptr, the whole legacy streaming path). Executes commands
+// until one OP_PRESENT has been consumed or the ring runs dry; the caller swaps.
 // Returns the number of OP_PRESENTs consumed (-1 = stream desync).
-int ReplayRing() {
+int ReplayRange(const DrawSlice* slices) {
     using namespace tj::ipc;
     const uint32_t N = g_hdr->ringBytes;
     uint64_t tail = g_hdr->tail.load(std::memory_order_relaxed);
     uint64_t head = g_hdr->head.load(std::memory_order_acquire);
     int presents = 0;
+    size_t di = 0;                           // next slice: draws are replayed in stream order
     auto mapTex = [&](int32_t h) -> int {
         return (h >= 0 && h < 4096) ? g_texMap[h] : -1;
     };
@@ -435,9 +538,6 @@ int ReplayRing() {
         memcpy(&ch, g_ring + pos, sizeof ch);
         if (ch.op == OP_WRAP) { tail += sizeof(CmdHdr) + ch.bytes; g_hdr->tail.store(tail, std::memory_order_release); continue; }
         const uint8_t* pl = g_ring + pos + sizeof(CmdHdr);
-        // Replay cost by op class. The VAO/baseVertex rework did not move the 38 ms/frame
-        // replay, so the per-draw CALL COUNT is not the bound — find what is instead of
-        // guessing again.
         uint64_t opT0 = g_compProf ? NowNs() : 0;
         switch (ch.op) {
             case OP_CLEAR: {
@@ -451,20 +551,32 @@ int ReplayRing() {
             } break;
             case OP_DRAW_PC: {
                 uint32_t vc; memcpy(&vc, pl, 4);
-                g_dev.DrawTriangleList((const tj::gfx::VertexPC*)(pl + 4), (int)vc);
+                if (slices) tj::gfx::GlesDrawPCAt(slices[di++].vbOfs, (int)vc);
+                else        g_dev.DrawTriangleList((const tj::gfx::VertexPC*)(pl + 4), (int)vc);
             } break;
             case OP_DRAW_PTC: {
                 uint32_t hd[2]; memcpy(hd, pl, 8);
-                const auto* v = (const tj::gfx::VertexPTC*)(pl + 8);
-                const uint16_t* idx = (const uint16_t*)(pl + 8 + hd[0] * sizeof(tj::gfx::VertexPTC));
-                g_dev.DrawIndexed(v, (int)hd[0], idx, (int)hd[1]);
+                if (slices) {
+                    const DrawSlice& sl = slices[di++];
+                    tj::gfx::GlesDrawPTCAt(sl.vbOfs, (int)hd[0], sl.ibOfs, (int)hd[1]);
+                } else {
+                    const auto* v = (const tj::gfx::VertexPTC*)(pl + 8);
+                    const uint16_t* idx = (const uint16_t*)(pl + 8 + hd[0] * sizeof(tj::gfx::VertexPTC));
+                    g_dev.DrawIndexed(v, (int)hd[0], idx, (int)hd[1]);
+                }
             } break;
             case OP_DRAW_SHINY: {
                 int32_t hd[6]; memcpy(hd, pl, 24);
-                const auto* v = (const tj::gfx::VertexPT2C*)(pl + 24);
-                const uint16_t* idx = (const uint16_t*)(pl + 24 + (uint32_t)hd[0] * sizeof(tj::gfx::VertexPT2C));
-                g_dev.DrawShinyIndexed(v, hd[0], idx, hd[1],
-                                       mapTex(hd[2]), mapTex(hd[3]), mapTex(hd[4]), mapTex(hd[5]));
+                if (slices) {
+                    const DrawSlice& sl = slices[di++];
+                    tj::gfx::GlesDrawShinyAt(sl.vbOfs, hd[0], sl.ibOfs, hd[1],
+                                             mapTex(hd[2]), mapTex(hd[3]), mapTex(hd[4]), mapTex(hd[5]));
+                } else {
+                    const auto* v = (const tj::gfx::VertexPT2C*)(pl + 24);
+                    const uint16_t* idx = (const uint16_t*)(pl + 24 + (uint32_t)hd[0] * sizeof(tj::gfx::VertexPT2C));
+                    g_dev.DrawShinyIndexed(v, hd[0], idx, hd[1],
+                                           mapTex(hd[2]), mapTex(hd[3]), mapTex(hd[4]), mapTex(hd[5]));
+                }
             } break;
             case OP_CREATE_TEX: {
                 int32_t hd[3]; memcpy(hd, pl, 12);
@@ -520,7 +632,7 @@ int ReplayRing() {
                 g_dev.SetBlendMode((tj::gfx::Device::BlendMode)v[0], v[1] != 0);
             } break;
             case OP_PRESENT:
-                // Counted, NOT swapped here — the caller swaps once per drain batch.
+                // Counted, NOT swapped here — the caller swaps once per drained batch.
                 g_hdr->framesConsumed.fetch_add(1, std::memory_order_acq_rel);
                 ++presents;
                 break;
@@ -542,23 +654,42 @@ int ReplayRing() {
         tail += CmdTotal(ch.bytes);
         g_hdr->tail.store(tail, std::memory_order_release);   // free space promptly
         if (ch.op == OP_PRESENT) {
-            // Drain past this frame ONLY if a further COMPLETE frame is already in the
-            // ring — the backbuffer must always hold a finished frame when the caller
-            // swaps, never a half-replayed one. Bounded so a fast producer can't starve
-            // the swap forever.
-            // ONE present per swap. Draining several frames before swapping (the
-            // session-30 "frame drop") shows the display whatever the last drained frame
-            // left in the backbuffer and is a second way to put a half-built picture on
-            // screen. The sim is paced by its own 60 Hz limiter, not by this.
+            // ONE present per swap. Draining several frames before swapping (the session-30
+            // "frame drop") shows the display whatever the last drained frame left in the
+            // backbuffer and is a second way to put a half-built picture on screen. The sim
+            // is paced by its own 60 Hz limiter, not by this.
             break;
         }
     }
     return presents;
 }
 
+// Returns the number of OP_PRESENTs consumed (-1 = stream desync).
+int ReplayRing() {
+    if (g_batch) {
+        uint64_t tail = g_hdr->tail.load(std::memory_order_relaxed);
+        uint64_t head = g_hdr->head.load(std::memory_order_acquire);
+        if (HaveCompleteFrame(tail, head)) {
+            if (StageFrame(tail, head)) {
+                tj::gfx::GlesStreamUpload(g_vbStage.data(), (unsigned long)g_vbStage.size(),
+                                          g_ibStage.data(), (unsigned long)g_ibStage.size());
+                return ReplayRange(g_slices.data());
+            }
+            LOGE("replay: malformed draw payload — falling back to per-draw uploads");
+        } else if (head - tail < (uint64_t)(g_hdr->ringBytes / 2)) {
+            return 0;                        // the frame is still arriving; wait for the rest
+        }
+        // No OP_PRESENT and a backlog past half the ring: a single frame can legitimately be
+        // enormous (a level load emits every texture before it presents), and waiting for its
+        // OP_PRESENT would deadlock the producer against a full ring. Drain it the old way.
+    }
+    return ReplayRange(nullptr);
+}
+
 void* RenderThread(void* pv) {
     ANativeWindow* win = (ANativeWindow*)pv;
     for (int i = 0; i < 4096; ++i) g_texMap[i] = -1;
+    tj::gfx::GlesSetDrawDiag(g_compDiag);        // before Create: it sizes the diag buffers
     tj::gfx::SetAndroidDisplaySize(g_gameW, g_gameH);
     tj::gfx::GlesSetGameSize(g_gameW, g_gameH);   // 16:9 present rect, centered per attach
     tj::gfx::PresentParams pp;
@@ -589,6 +720,13 @@ void* RenderThread(void* pv) {
     g_surfaceDown.store(false);
     LOGI("compositor up (game %dx%d)", g_gameW, g_gameH);
     bool haveSurface = true;
+    // Per-400-present accounting. `wall` is what the session-30 measurement reported; `cpu`
+    // is this thread's own CPU time over the same span. drain* covers the PARTIAL drains
+    // (the calls that returned before an OP_PRESENT), which the old counter dropped
+    // entirely — if the ring arrives in dribs the frame's replay is spread across them.
+    uint64_t rN = 0, rReplay = 0, rSwap = 0, rBatch = 0;
+    uint64_t rCpuReplay = 0, rCpuSwap = 0;
+    uint64_t rPart = 0, rPartCpu = 0, rPartN = 0;
     while (!g_stop.load(std::memory_order_relaxed)) {
         if (g_surfaceLost.load(std::memory_order_acquire)) {
             if (haveSurface) { tj::gfx::GlesReleaseWindowSurface(); haveSurface = false; }
@@ -605,17 +743,21 @@ void* RenderThread(void* pv) {
         // time it BLOCKS in Present, which conflates the 60 Hz limiter with waiting for
         // this thread — so the replay+swap split has to be measured on this side to know
         // whether the display leg or the sim is the frame's real bound.
-        uint64_t t0 = NowNs();
+        uint64_t t0 = NowNs(), c0 = NowCpuNs();
         int frames = ReplayRing();
-        uint64_t t1 = NowNs();
+        uint64_t t1 = NowNs(), c1 = NowCpuNs();
         if (frames > 0) {
             g_dev.Present();                             // ONE swap per drained batch
-            uint64_t t2 = NowNs();
-            static uint64_t rN = 0, rReplay = 0, rSwap = 0, rBatch = 0;
+            uint64_t t2 = NowNs(), c2 = NowCpuNs();
             rReplay += t1 - t0; rSwap += t2 - t1; rBatch += (uint64_t)frames;
+            rCpuReplay += c1 - c0; rCpuSwap += c2 - c1;
             if (((++rN) % 400) == 0) {
-                LOGI("comp: replay %.2f ms swap %.2f ms batch %.2f frames/drain (per present)",
-                     rReplay / 400.0 / 1e6, rSwap / 400.0 / 1e6, rBatch / 400.0);
+                LOGI("comp: replay %.2f ms (cpu %.2f) swap %.2f ms (cpu %.2f) "
+                     "partial %.2f ms (cpu %.2f, n=%.1f) batch %.2f frames/drain (per present)",
+                     rReplay / 400.0 / 1e6, rCpuReplay / 400.0 / 1e6,
+                     rSwap / 400.0 / 1e6, rCpuSwap / 400.0 / 1e6,
+                     rPart / 400.0 / 1e6, rPartCpu / 400.0 / 1e6, rPartN / 400.0,
+                     rBatch / 400.0);
                 if (g_compProf) {
                     static const char* kCls[4] = { "draw", "tex", "rt", "state" };
                     for (int i = 0; i < 4; ++i) {
@@ -624,10 +766,22 @@ void* RenderThread(void* pv) {
                         g_clsNs[i] = g_clsN[i] = 0;
                     }
                 }
-                rReplay = rSwap = rBatch = 0;
+                if (g_compDiag) {
+                    uint64_t d[4]; uint64_t nd = tj::gfx::GlesDrawDiagDrain(d);
+                    LOGI("comp:   draw phases: vb %.2f ib %.2f state %.2f draw %.2f ms/present"
+                         "  (%.1f draws/present, %.2f us/draw total)",
+                         d[0] / 400.0 / 1e6, d[1] / 400.0 / 1e6, d[2] / 400.0 / 1e6,
+                         d[3] / 400.0 / 1e6, nd / 400.0,
+                         nd ? (d[0] + d[1] + d[2] + d[3]) / (double)nd / 1e3 : 0.0);
+                }
+                rReplay = rSwap = rBatch = rCpuReplay = rCpuSwap = 0;
+                rPart = rPartCpu = rPartN = 0;
             }
         }
-        else if (frames == 0) usleep(1000);              // nothing complete: idle briefly
+        else if (frames == 0) {                          // nothing complete: idle briefly
+            rPart += t1 - t0; rPartCpu += c1 - c0; ++rPartN;
+            usleep(1000);
+        }
     }
     return nullptr;
 }
@@ -725,6 +879,9 @@ void android_main(android_app* app) {
             char line[256];
             while (fgets(line, sizeof line, f)) {
                 if (strstr(line, "TJ_COMP_PROF=1")) g_compProf = true;
+                if (const char* dg = strstr(line, "TJ_COMP_DIAG="))
+                    g_compDiag = (uint32_t)strtoul(dg + 13, nullptr, 0);
+                if (strstr(line, "TJ_COMP_BATCH=0")) g_batch = false;
                 if (const char* sc = strstr(line, "TJ_GAME_SCALE=")) {
                     float v = (float)atof(sc + 14);
                     if (v >= 0.35f && v <= 1.0f) g_gameScale = v;

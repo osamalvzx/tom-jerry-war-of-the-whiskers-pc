@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <vector>
 #include <unordered_map>
 
@@ -112,10 +113,63 @@ int g_dispW = 1280, g_dispH = 720;
 // confined to a centered present rect of this size — pillarboxed on wider panels.
 int g_gameW = 0, g_gameH = 0;
 
+// --- DRAW-PATH DIAGNOSTICS (session 31) -------------------------------------------------
+// The measured display cost is ~75-84 us PER DRAW at ~800 draws/frame, and three suspects
+// are already dead: call count (7,300 -> 1,500 GL calls/frame moved nothing), fill (half
+// resolution moved 84 -> 70-81 us) and textures (0.04 ms of a 67.9 ms replay). What is left
+// inside a draw is the two streaming-buffer writes. This is the instrument that names the
+// call, plus the "what if we simply did not do it" A/B that no reasoning can argue with.
+//
+// TJ_COMP_DIAG=<mask> in the flags file; 0 (absent) in every shipping run. The skip bits
+// DELIBERATELY draw the wrong picture — they are measurement legs, never a shipping path.
+//   bit 0 (1) — do not issue glDraw*            (uploads + state, no draw)
+//   bit 1 (2) — do not upload vertices/indices  (draw from a zero-filled resident buffer)
+//   bit 2 (4) — time each draw in four phases   (upload VB / upload IB / state / draw)
+uint32_t g_diag = 0;
+uint64_t g_diagNs[4] = {};      // vb, ib, state, draw
+uint64_t g_diagDraws = 0;
+bool     g_diagBufReady = false;
+
+inline uint64_t DiagNowNs() {
+    timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+// Four-phase stopwatch; entirely dead (one predictable branch) unless bit 2 is set.
+struct DiagPhase {
+    uint64_t t; bool on;
+    DiagPhase() : t(0), on((g_diag & 4u) != 0) { if (on) t = DiagNowNs(); }
+    void mark(int i) { if (!on) return; uint64_t n = DiagNowNs(); g_diagNs[i] += n - t; t = n; }
+};
+// bit 1 needs the buffers to stay big enough that indices can never address past them, and
+// ZERO-filled so every index reads vertex 0 (degenerate triangles, no fill) rather than
+// undefined memory. One 10 MB upload at the first draw, then never touched again.
+void DiagEnsureResidentBuffers(GLuint vbo, GLuint ibo) {
+    if (g_diagBufReady) return;
+    g_diagBufReady = true;
+    const size_t vbBytes = 8u << 20, ibBytes = 2u << 20;
+    void* zeros = calloc(1, vbBytes);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vbBytes, zeros, GL_STREAM_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)ibBytes, zeros, GL_STREAM_DRAW);
+    free(zeros);
+    printf("[gles] TJ_COMP_DIAG=%u: resident %zu/%zu KB buffers, per-draw upload OFF\n",
+           g_diag, vbBytes >> 10, ibBytes >> 10);
+}
+
 } // namespace
 
 void SetAndroidDisplaySize(int w, int h) { if (w > 0 && h > 0) { g_dispW = w; g_dispH = h; } }
 void GlesSetGameSize(int w, int h) { if (w > 0 && h > 0) { g_gameW = w; g_gameH = h; } }
+
+// Draw-path diagnostics seam (the app reads TJ_COMP_DIAG from the flags file and sets it
+// before the device is created). Drain returns ns totals for [vb, ib, state, draw] and the
+// draw count since the previous drain, then zeroes them.
+void GlesSetDrawDiag(uint32_t mask) { g_diag = mask; }
+uint64_t GlesDrawDiagDrain(uint64_t out[4]) {
+    for (int i = 0; i < 4; ++i) { out[i] = g_diagNs[i]; g_diagNs[i] = 0; }
+    uint64_t n = g_diagDraws; g_diagDraws = 0; return n;
+}
 
 int EnumDisplayModes(DisplayMode* out, int maxOut) {
     if (out && maxOut >= 1) out[0] = { g_dispW, g_dispH, 60 };
@@ -177,6 +231,13 @@ struct Device::Impl {
     }
 };
 
+// The one live device. The batched-upload seam below is a set of free functions (the
+// Android compositor's private path -- d3d8.h stays the shared contract with the D3D11
+// backend), so it needs the live Impl by another route than `this`. Device::Impl is private:
+// namespace scope cannot name it, but the friend functions in d3d8.h can, so it is parked
+// here as void* and the type is recovered inside each of them.
+static void* g_implV = nullptr;
+
 // --- D3DCOLOR asset texture upload: BGRA→RGBA swizzle + row-flip (D3D top-origin) --------
 static GLuint UploadAssetTexture(const uint32_t* rgba, int w, int h, bool flip) {
     GLuint id = 0; glGenTextures(1, &id);
@@ -230,6 +291,7 @@ bool Device::Create(HWND hwnd, const PresentParams& pp) {
     // half-built Impl (and its EGL objects) or the retry loop leaks a context per attempt.
     if (p_) Shutdown();
     p_ = new Impl();
+    g_implV = p_;
     p_->vsync = pp.vsync;
     memset(p_->wvp, 0, sizeof p_->wvp);
     p_->wvp[0] = p_->wvp[5] = p_->wvp[10] = p_->wvp[15] = 1.0f;
@@ -350,7 +412,7 @@ void Device::Shutdown() {
         if (p_->ctx != EGL_NO_CONTEXT) eglDestroyContext(p_->dpy, p_->ctx);
         eglTerminate(p_->dpy);
     }
-    delete p_; p_ = nullptr;
+    delete p_; p_ = nullptr; g_implV = nullptr;
 }
 
 bool Device::Valid() const { return p_ && p_->ctx != EGL_NO_CONTEXT; }
@@ -386,41 +448,147 @@ void Device::Present() {
 void Device::SetTransform(const float m[16]) { if (p_) memcpy(p_->wvp, m, sizeof p_->wvp); }
 
 // --- Draw paths -------------------------------------------------------------------------
-void Device::DrawTriangleList(const VertexPC* verts, int vertexCount) {
-    if (!p_ || vertexCount <= 0) return;
-    glBindVertexArray(p_->vao);
-    glBindBuffer(GL_ARRAY_BUFFER, p_->vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(VertexPC) * vertexCount, verts, GL_STREAM_DRAW);
-    p_->ApplyWVP(p_->color);
+// THE PER-DRAW UPLOAD IS WHAT THE DISPLAY LEG COSTS -- MEASURED, not guessed (session 31).
+// In-match at 253 draws/frame, with the four-phase timers below: the vertex glBufferData took
+// 5.44 ms of the 6.99 ms spent in draws, the index one 0.91 ms, all state and attribute setup
+// 0.16 ms, and the actual glDrawElements 0.44 ms. That is ~21.5 us of driver time per vertex
+// upload at ~2 uploads per draw. Call count was already ruled out (7,300 -> 1,500 GL calls per
+// frame moved nothing), fill was ruled out (half resolution moved 84 -> 70-81 us/draw), and
+// textures own 0.04 ms of a 67.9 ms replay.
+//
+// So the geometry of every draw is now placed in the stream buffers ONCE PER FRAME by the
+// compositor (GlesStreamUpload) and each draw names its slice by BYTE OFFSET. The pointer-
+// taking entry points below stay exactly as they were -- they upload, then run the same
+// offset-based body -- so the legacy path (and the d3d8.h contract shared with the Windows
+// D3D11 backend) is untouched, and remains both the A/B leg and the fallback.
+
+// Upload one frame of vertex + index bytes in a single re-specification each. Adreno wants
+// exactly this shape: orphan (glBufferData WITH data) rather than a write into a buffer the
+// GPU may still be reading.
+bool GlesStreamUpload(const void* vb, unsigned long vbBytes, const void* ib, unsigned long ibBytes) {
+    Device::Impl* p = (Device::Impl*)g_implV;
+    if (!p) return false;
+    DiagPhase dp;
+    if (g_diag & 2u) { DiagEnsureResidentBuffers(p->vbo, p->ibo); return true; }
+    if (vbBytes) {
+        glBindBuffer(GL_ARRAY_BUFFER, p->vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vbBytes, vb, GL_STREAM_DRAW);
+    }
+    dp.mark(0);
+    if (ibBytes) {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, p->ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)ibBytes, ib, GL_STREAM_DRAW);
+    }
+    dp.mark(1);
+    return true;
+}
+
+// --- the three pipelines, addressed by byte offset into the resident stream buffers ------
+// vbOfs/ibOfs are byte offsets into the CURRENT contents of vbo/ibo. Indices stay draw-local
+// (0..vertexCount-1) because the attribute pointers are re-based to vbOfs -- so no baseVertex
+// arithmetic, and therefore no chance of getting it wrong, is involved.
+void GlesDrawPCAt(uint32_t vbOfs, int vertexCount) {
+    Device::Impl* p = (Device::Impl*)g_implV;
+    if (!p || vertexCount <= 0) return;
+    DiagPhase dp;
+    glBindVertexArray(p->vao);
+    glBindBuffer(GL_ARRAY_BUFFER, p->vbo);
+    dp.mark(0); dp.mark(1);
+    p->ApplyWVP(p->color);
     glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPC), (void*)0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPC), (void*)(uintptr_t)(vbOfs + 0));
     glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPC), (void*)12);
+    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPC), (void*)(uintptr_t)(vbOfs + 12));
     glDisableVertexAttribArray(2);
     glDisableVertexAttribArray(3);
-    glDrawArrays(GL_TRIANGLES, 0, vertexCount);
+    dp.mark(2);
+    if (!(g_diag & 1u)) glDrawArrays(GL_TRIANGLES, 0, vertexCount);
+    dp.mark(3);
+    ++g_diagDraws;
+}
+
+void GlesDrawPTCAt(uint32_t vbOfs, int vertexCount, uint32_t ibOfs, int indexCount) {
+    Device::Impl* p = (Device::Impl*)g_implV;
+    if (!p || vertexCount <= 0 || indexCount <= 0) return;
+    DiagPhase dp;
+    glBindVertexArray(p->vao);
+    glBindBuffer(GL_ARRAY_BUFFER, p->vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, p->ibo);
+    dp.mark(0); dp.mark(1);
+    p->ApplyWVP(p->tex);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, p->TexId(p->curTex));
+    glBindSampler(0, p->curSamp);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPTC), (void*)(uintptr_t)(vbOfs + 0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPTC), (void*)(uintptr_t)(vbOfs + 12));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPTC), (void*)(uintptr_t)(vbOfs + 20));
+    glDisableVertexAttribArray(3);
+    dp.mark(2);
+    if (!(g_diag & 1u)) glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_SHORT, (void*)(uintptr_t)ibOfs);
+    dp.mark(3);
+    ++g_diagDraws;
+}
+
+void GlesDrawShinyAt(uint32_t vbOfs, int vertexCount, uint32_t ibOfs, int indexCount,
+                     TextureHandle t0, TextureHandle t1, TextureHandle t2, TextureHandle t3) {
+    Device::Impl* p = (Device::Impl*)g_implV;
+    if (!p || vertexCount <= 0 || indexCount <= 0) return;
+    DiagPhase dp;
+    glBindVertexArray(p->vao);
+    glBindBuffer(GL_ARRAY_BUFFER, p->vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, p->ibo);
+    dp.mark(0); dp.mark(1);
+    p->ApplyWVP(p->shiny);
+    TextureHandle ts[4] = { t0, t1, t2, t3 };
+    for (int i = 0; i < 4; ++i) { glActiveTexture(GL_TEXTURE0 + i);
+                                  glBindTexture(GL_TEXTURE_2D, p->TexId(ts[i]));
+                                  glBindSampler(i, p->curSamp); }
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOfs + 0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOfs + 12));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOfs + 20));
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOfs + 28));
+    dp.mark(2);
+    if (!(g_diag & 1u)) glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_SHORT, (void*)(uintptr_t)ibOfs);
+    dp.mark(3);
+    ++g_diagDraws;
+    glActiveTexture(GL_TEXTURE0);   // leave unit 0 active for the single-texture paths
+}
+
+// --- the d3d8.h entry points: upload this draw, then run the same body -------------------
+void Device::DrawTriangleList(const VertexPC* verts, int vertexCount) {
+    if (!p_ || vertexCount <= 0) return;
+    DiagPhase dp;
+    glBindVertexArray(p_->vao);
+    glBindBuffer(GL_ARRAY_BUFFER, p_->vbo);
+    if (g_diag & 2u) DiagEnsureResidentBuffers(p_->vbo, p_->ibo);
+    else glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(VertexPC) * vertexCount, verts, GL_STREAM_DRAW);
+    dp.mark(0);
+    dp.mark(1);                                  // no index buffer on this path
+    GlesDrawPCAt(0, vertexCount);
 }
 
 void Device::DrawIndexed(const VertexPTC* verts, int vertexCount,
                          const uint16_t* indices, int indexCount) {
     if (!p_ || vertexCount <= 0 || indexCount <= 0) return;
+    DiagPhase dp;
     glBindVertexArray(p_->vao);
     glBindBuffer(GL_ARRAY_BUFFER, p_->vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(VertexPTC) * vertexCount, verts, GL_STREAM_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, p_->ibo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)sizeof(uint16_t) * indexCount, indices, GL_STREAM_DRAW);
-    p_->ApplyWVP(p_->tex);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, p_->TexId(p_->curTex));
-    glBindSampler(0, p_->curSamp);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPTC), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPTC), (void*)12);
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPTC), (void*)20);
-    glDisableVertexAttribArray(3);
-    glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_SHORT, (void*)0);
+    if (g_diag & 2u) DiagEnsureResidentBuffers(p_->vbo, p_->ibo);
+    else glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(VertexPTC) * vertexCount, verts, GL_STREAM_DRAW);
+    dp.mark(0);
+    if (!(g_diag & 2u)) {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, p_->ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)sizeof(uint16_t) * indexCount, indices, GL_STREAM_DRAW);
+    }
+    dp.mark(1);
+    GlesDrawPTCAt(0, vertexCount, 0, indexCount);
 }
 
 void Device::DrawShinyIndexed(const VertexPT2C* verts, int vertexCount,
@@ -428,26 +596,18 @@ void Device::DrawShinyIndexed(const VertexPT2C* verts, int vertexCount,
                               TextureHandle t0, TextureHandle t1,
                               TextureHandle t2, TextureHandle t3) {
     if (!p_ || vertexCount <= 0 || indexCount <= 0) return;
+    DiagPhase dp;
     glBindVertexArray(p_->vao);
     glBindBuffer(GL_ARRAY_BUFFER, p_->vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(VertexPT2C) * vertexCount, verts, GL_STREAM_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, p_->ibo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)sizeof(uint16_t) * indexCount, indices, GL_STREAM_DRAW);
-    p_->ApplyWVP(p_->shiny);
-    TextureHandle ts[4] = { t0, t1, t2, t3 };
-    for (int i = 0; i < 4; ++i) { glActiveTexture(GL_TEXTURE0 + i);
-                                  glBindTexture(GL_TEXTURE_2D, p_->TexId(ts[i]));
-                                  glBindSampler(i, p_->curSamp); }
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)12);
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)20);
-    glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPT2C), (void*)28);
-    glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_SHORT, (void*)0);
-    glActiveTexture(GL_TEXTURE0);   // leave unit 0 active for the single-texture paths
+    if (g_diag & 2u) DiagEnsureResidentBuffers(p_->vbo, p_->ibo);
+    else glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(VertexPT2C) * vertexCount, verts, GL_STREAM_DRAW);
+    dp.mark(0);
+    if (!(g_diag & 2u)) {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, p_->ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)sizeof(uint16_t) * indexCount, indices, GL_STREAM_DRAW);
+    }
+    dp.mark(1);
+    GlesDrawShinyAt(0, vertexCount, 0, indexCount, t0, t1, t2, t3);
 }
 
 // --- Textures ---------------------------------------------------------------------------

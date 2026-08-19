@@ -120,6 +120,18 @@ public:
 private:
     struct Impl;
     Impl* p_ = nullptr;
+
+    // ANDROID/GLES ONLY. The compositor uploads a whole frame of geometry in one
+    // glBufferData (the per-draw upload was measured at 78% of in-match draw cost) and then
+    // issues draws that name their slice by byte offset. Those entry points live in
+    // gles_gfx.cpp as free functions rather than as methods, so the D3D11 backend is not
+    // obliged to implement a path it does not need — which is why they are friends here.
+    // Declarations only: no members, no virtuals, nothing the Windows build codegens.
+    friend bool GlesStreamUpload(const void*, unsigned long, const void*, unsigned long);
+    friend void GlesDrawPCAt(uint32_t, int);
+    friend void GlesDrawPTCAt(uint32_t, int, uint32_t, int);
+    friend void GlesDrawShinyAt(uint32_t, int, uint32_t, int,
+                                TextureHandle, TextureHandle, TextureHandle, TextureHandle);
 };
 
 } // namespace tj::gfx
