@@ -17,6 +17,7 @@
 #include "android/ipc_protocol.h"
 #include <sys/mman.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <unistd.h>
 #include <cstdio>
@@ -55,6 +56,9 @@ static void* InputThread(void*) {
 
 struct BootArgs { const char* xbe; bool ok; };
 static void* BootThread(void* pv) {
+    // NOTE: pinning the sim thread to the upper-half cores was TRIED (session 29) and
+    // reverted — sim time was unchanged (the scheduler already places the hot thread
+    // well) and the pin contended with the app's render thread.
     BootArgs* a = (BootArgs*)pv;
     a->ok = tj::hybrid::HybridBootSequence(a->xbe);
     return nullptr;

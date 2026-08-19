@@ -515,7 +515,13 @@ void* RenderThread(void* pv) {
     tj::gfx::SetAndroidDisplaySize(g_gameW, g_gameH);
     tj::gfx::GlesSetGameSize(g_gameW, g_gameH);   // 16:9 present rect, centered per attach
     tj::gfx::PresentParams pp;
-    pp.backWidth = g_gameW; pp.backHeight = g_gameH; pp.vsync = true;
+    pp.backWidth = g_gameW; pp.backHeight = g_gameH;
+    // vsync OFF for the compositor swap: SurfaceFlinger still displays at vsync, but the
+    // replay thread must not BLOCK on the display clock — a blocked swap quantizes the
+    // ring-consume cadence to 30 fps and the game queues behind it (measured session-29
+    // morning: swap 16-21 ms with vsync on). The game's own 60 Hz limiter (ipc Present)
+    // is the pacing authority.
+    pp.vsync = false;
     for (;;) {
         if (g_stop.load()) return nullptr;
         // Service the TERM handshake even while no device exists: the glue thread is

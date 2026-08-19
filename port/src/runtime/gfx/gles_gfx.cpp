@@ -151,31 +151,37 @@ struct Device::Impl {
         if (prW > 0) glViewport(prX, prY, prW, prH);
         else glViewport(0, 0, w, h);
     }
-    // Dynamic geometry RING buffers (the d3d8.cpp AppendVB/AppendIB design on GLES):
-    // one persistent allocation each, appended with MAP_UNSYNCHRONIZED, orphaned only on
-    // wrap. The first pass did glBufferData per draw — ~700 driver reallocations/frame,
-    // the exact churn that made the Windows build slow-motion (session 21), and the prime
-    // suspect for the on-device in-match slowness.
-    static constexpr uint32_t kRingVB = 16u << 20;   // ~1.5 MB/frame measured -> ~10 frames
-    static constexpr uint32_t kRingIB = 4u << 20;
+    // Dynamic geometry streaming, the ADRENO-CANONICAL way (measured on the OnePlus's
+    // Adreno 840, session 29 morning): orphan each buffer ONCE PER FRAME (Present), then
+    // plain glBufferSubData appends — the driver inlines small copies into the command
+    // stream against a fresh allocation, no syncs, no maps. Per-draw UNSYNCHRONIZED maps
+    // (the previous pass) measured ~60 ms/frame app-side on this driver; per-draw
+    // glBufferData orphaning (the pass before) was the session-21 slow-motion pattern.
+    static constexpr uint32_t kRingVB = 4u << 20;    // ~1.5 MB/frame measured + slack
+    static constexpr uint32_t kRingIB = 1u << 20;
     GLuint vao = 0, vbo = 0, ibo = 0;
     uint32_t vboOff = 0, iboOff = 0;
 
-    // Append into a ring buffer; returns the byte offset of the copy.
+    // Append into this frame's buffer; returns the byte offset of the copy.
     uint32_t Append(GLenum target, GLuint buf, uint32_t cap, uint32_t& off,
                     const void* data, uint32_t bytes, uint32_t align) {
         glBindBuffer(target, buf);
         uint32_t at = (off + (align - 1)) & ~(align - 1);
-        if (at + bytes > cap) {                        // wrap: orphan (fresh allocation)
+        if (at + bytes > cap) {                        // mid-frame wrap: orphan, restart
             glBufferData(target, cap, nullptr, GL_STREAM_DRAW);
             at = 0;
         }
-        void* p = glMapBufferRange(target, at, bytes,
-            GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
-        if (p) { memcpy(p, data, bytes); glUnmapBuffer(target); }
-        else   { glBufferSubData(target, at, bytes, data); }   // fallback: still no realloc
+        glBufferSubData(target, at, bytes, data);
         off = at + bytes;
         return at;
+    }
+    void OrphanFrameBuffers() {                        // called at Present: fresh per frame
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, kRingVB, nullptr, GL_STREAM_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);    // VAO-attached
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, kRingIB, nullptr, GL_STREAM_DRAW);
+        vboOff = iboOff = 0;
     }
     uint32_t AppendVB(const void* d, uint32_t n) { return Append(GL_ARRAY_BUFFER, vbo, kRingVB, vboOff, d, n, 16); }
     uint32_t AppendIB(const void* d, uint32_t n) { return Append(GL_ELEMENT_ARRAY_BUFFER, ibo, kRingIB, iboOff, d, n, 4); }
