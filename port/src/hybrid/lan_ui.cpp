@@ -945,10 +945,27 @@ static const CardRect kRectTt[13] = {
 // FUN_00079260, which takes the UV rect explicitly. Calling the inner one directly is the same
 // code path, and it is what lets an overscanning layer be CROPPED to the card rather than
 // squashed into it (and so kept out of the rest of the menu).
-struct Blit2D { const void* mat; float u0, v0, u1, v1; };
+// ⚠ 4-BYTE-SLOT RULE. The guest reads this descriptor as {u32 material, 4 floats} = 20
+// bytes. `const void* mat` was 4 bytes on the 32-bit Windows host and is EIGHT on
+// aarch64 — which would silently move every float to the wrong offset and hand the 2D
+// painter garbage UVs. A guest-visible field is a uint32_t, never a host pointer.
+struct Blit2D { uint32_t mat; float u0, v0, u1, v1; };
+static_assert(sizeof(Blit2D) == 20, "the guest reads this as u32 + 4 floats");
 using FnDraw2DUV = void (__cdecl*)(Blit2D* desc, float x0, float y0, float x1, float y1,
                                    const uint32_t* rgba);
 #define Draw2DUV(...) GCALL(Cdecl, FnDraw2DUV, 0x79260, __VA_ARGS__)
+
+// THE NEUTRAL TINT retail's own items use. GUEST ARENA, not a host static, for the same
+// reason the descriptor below is: the guest 2D painter DEREFERENCES this pointer, and a
+// host-image address is above 4 GB on ARM.
+static const uint32_t* NeutralTint() {
+    static uint32_t* p = nullptr;
+    if (!p) {
+        p = (uint32_t*)GuestObjAlloc(4 * sizeof(uint32_t), 4);
+        p[0] = p[1] = p[2] = p[3] = 0x80;
+    }
+    return p;
+}
 
 static void CardBlit(uint32_t scene, uint16_t mat, const CardRect& r,
                      float X0, float Y0, float X1, float Y1, const uint32_t* rgba) {
@@ -957,9 +974,16 @@ static void CardBlit(uint32_t scene, uint16_t mat, const CardRect& r,
     const float cu0 = r.u0 < 0.0f ? 0.0f : r.u0, cu1 = r.u1 > 1.0f ? 1.0f : r.u1;
     const float cv0 = r.v0 < 0.0f ? 0.0f : r.v0, cv1 = r.v1 > 1.0f ? 1.0f : r.v1;
     if (cu1 <= cu0 || cv1 <= cv0) return;                  // entirely overscan
-    Blit2D d;
-    d.mat = (const void*)(uintptr_t)(*(uint32_t*)(uintptr_t)(scene + 0x24) +
-                                     (uint32_t)mat * 0x50);
+    // ⚠ GUEST-ARENA SCRATCH, NOT A STACK LOCAL. FUN_00079260 DEREFERENCES this descriptor,
+    // so its address must be guest-visible. A host stack local works on x86 (the host stack
+    // is below 4 GB) and FATALs on the device with `guest-call arg 0 above 4 GB calling
+    // guest 00079260` — which is precisely what killed HOSTING a LAN game on the phone.
+    // The qemu leg CANNOT catch this class: its whole image is below 4 GB (gate S5c's
+    // lesson), so the device is the only detector. Same fix shape as Fit()'s ellipsize
+    // buffer. Single-threaded UI render path (Screen::Render walks the widget list on the
+    // game thread), so a static is safe.
+    static Blit2D& d = *(Blit2D*)GuestObjAlloc(sizeof(Blit2D), 8);
+    d.mat = *(uint32_t*)(uintptr_t)(scene + 0x24) + (uint32_t)mat * 0x50;
     d.u0 = (cu0 - r.u0) / w; d.u1 = (cu1 - r.u0) / w;      // the still-visible source window
     d.v0 = (cv0 - r.v0) / h; d.v1 = (cv1 - r.v0) / h;
     const float W = X1 - X0, H = Y1 - Y0;
@@ -977,7 +1001,7 @@ static void __fastcall PicRender(uint32_t self, uint32_t) {
     const int arena = (int)LanConfigArena();
     if (arena < 0 || arena >= 13) return;
     const uint32_t scene = fe + 0x38C;                    // the LEVEL.XMF scene
-    static const uint32_t kRgba[4] = { 0x80, 0x80, 0x80, 0x80 };   // the neutral tint items use
+    const uint32_t* kRgba = NeutralTint();   // guest arena — the guest reads these 4 words
     const float x0 = kArenaPicX - kArenaPicW * 0.5f, x1 = kArenaPicX + kArenaPicW * 0.5f;
     const float y0 = kArenaPicY - kArenaPicH * 0.5f, y1 = kArenaPicY + kArenaPicH * 0.5f;
     // Retail's own painter order. The queue is strictly insertion-ordered -- no sort key, no
