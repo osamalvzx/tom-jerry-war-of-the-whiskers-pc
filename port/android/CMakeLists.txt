@@ -46,8 +46,11 @@ add_library(tj_engine STATIC
     # promise. Ninja still rebuilds x86_interp.cpp when it changes (clang -MD lists it).
     ${ENG}/jit/jit.h
     ${ENG}/jit/jit_blocks.cpp
+    ${ENG}/jit/jit_arm64.h
+    ${ENG}/jit/jit_emit.cpp
 )
 set_source_files_properties(${ENG}/jit/jit_blocks.cpp ${ENG}/jit/jit.h
+                            ${ENG}/jit/jit_arm64.h ${ENG}/jit/jit_emit.cpp
                             PROPERTIES HEADER_FILE_ONLY TRUE)
 target_include_directories(tj_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(tj_engine PRIVATE tj_softfloat)

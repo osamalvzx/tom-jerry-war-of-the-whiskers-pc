@@ -43,6 +43,12 @@ constexpr uint32_t kMaxBlockOps = 64;      // §1.1.3 instruction cap
 constexpr uint32_t kMaxPages    = 4;       // §1.1.3 distinct code pages per block
 constexpr int      kBlkBits     = 17;      // 131,072 block slots, direct-mapped
 constexpr uint32_t kOpArenaCap  = 1u << 19; // 524,288 ops x 20 B = 10 MB (~110k blocks)
+// M2b: the longest instruction run one dispatcher entry may execute before handing
+// control back to Run's loop. The device and the det legs run maxSteps = ~0ull, so this
+// is what actually bounds a chain; at ~1.2M in-match instructions per FRAME it costs one
+// extra round-trip per ~200 frames, and it keeps a spinning guest from making the stop /
+// escape / MaxSteps checks unreachable.
+constexpr uint64_t kSliceCap    = 1ull << 28;   // 268M instructions
 
 // One decoded instruction. Field-for-field a HotDec minus the cache bookkeeping
 // (eip is the key there, here it is just the instruction's address) — filled by
@@ -100,6 +106,14 @@ struct Block {
     uint32_t ordinal;    // compile ordinal — the TJ_ENG_JIT_MAXBLOCKS bisect key
     uint32_t page[kMaxPages];   // page indices into g_pageGen (window-relative)
     uint32_t gen [kMaxPages];   // g_pageGen at compile time (§1.3.1)
+    // --- M2: emitted aarch64. `code` is the PROLOGUE (the only thing a link may bind
+    // to, so a stale block still revalidates — §1.3.1); `body` is the post-revalidation
+    // entry the dispatcher jumps to, having just checked the same list itself. Both null
+    // => this block runs on M1's threaded executor (TJ_ENG_JIT_NOEMIT, or a form with no
+    // stencil). The emitted image is SELF-CONTAINED — it never reads this record — so an
+    // evicted block whose code is still reachable through a link stays correct.
+    void*    code;
+    void*    body;
 };
 
 Block*   g_blk = nullptr;
@@ -175,10 +189,25 @@ inline void JitReentrancyCheck(const char* what) {
     }
 }
 
+// --------------------------------------------------------------- M2: the aarch64 emitter
+// Included HERE, inside this anonymous namespace: it needs JitOp/Block/g_stats/g_stress/
+// g_dumpVa above, and (through this file's own include point) the interpreter's
+// st8/st16/st32, g_parity, g_pageGen/g_smcBits and X87Exec — the same helpers, not copies.
+inline bool IsTerminator(uint8_t form);        // defined just below; used by EmitBlockCode
+#include "engine/jit/jit_emit.cpp"
+
+// A block image never exceeds the emitter's own buffer; reserve that much before
+// compiling so CodePlace can never fail mid-block.
+constexpr size_t kCodeReserve = (size_t)a64::Asm::kMaxWords * 4 + 4096;
+
 void FlushAll() {
     JitReentrancyCheck("FlushAll");           // would dangle a running block's ops
     if (g_blk) memset(g_blk, 0, sizeof(Block) << kBlkBits);
     g_opUsed = 0;
+    // M2: the code cache is flushed WITH the block cache, never apart from it. That is
+    // what makes M2b's links safe to leave un-tracked: a link lives inside emitted code,
+    // so every link dies with the code that contains it, and no back-references exist.
+    CodeCacheReset();
     ++g_nFlushes;
 }
 
@@ -201,6 +230,21 @@ void StatsLine(const char* why) {
            g_nEntries ? 100.0 * (double)g_nFellThrough / (double)g_nEntries : 0.0,
            (unsigned long long)g_nStale, (unsigned long long)g_nSideExits,
            (unsigned long long)g_nFlushes, g_opUsed, kOpArenaCap);
+    if (g_emitOn) {
+        // `entries` above counts DISPATCHER entries -- with M2b, one of those can run a
+        // whole CHAIN. g_jitBlockEnters (emitted only under TJ_ENG_JIT_STATS, so it
+        // perturbs timing and is measured on its own leg) counts every block entry, so
+        // the linked fraction is 1 - dispatcherEntries/blockEntries.
+        printf("[jit] %s: emitted=%llu declined=%llu codeKB=%llu links=%llu "
+               "blockEnters=%llu linkedExits=%.1f%% insns/blk=%.2f codeFlushes=%llu\n",
+               why, (unsigned long long)g_nEmitted, (unsigned long long)g_nEmitFail,
+               (unsigned long long)(g_codeBytes >> 10), (unsigned long long)g_linksMade,
+               (unsigned long long)g_jitBlockEnters,
+               g_jitBlockEnters ? 100.0 * (double)(g_jitBlockEnters - g_nEntries) /
+                                  (double)g_jitBlockEnters : 0.0,
+               g_jitBlockEnters ? (double)g_nInsns / (double)g_jitBlockEnters : 0.0,
+               (unsigned long long)g_codeFlushes);
+    }
     fflush(stdout);
 }
 
@@ -253,7 +297,8 @@ bool Compile(uint32_t entry, Block& b) {
     scratch[n].rm = 0; scratch[n].base = scratch[n].idx = -1;
     scratch[n].scale = scratch[n].flags = 0;
 
-    if (g_opUsed + n + 1 > kOpArenaCap) {
+    if (g_opUsed + n + 1 > kOpArenaCap ||
+        (g_emitOn && g_codeUsed + kCodeReserve > g_codeCap)) {
         // Correctness first: rather than track which blocks own which ops, throw the
         // whole cache away and start over. A recompile is microseconds; a stale block
         // is a silent wrong answer.
@@ -268,6 +313,12 @@ bool Compile(uint32_t entry, Block& b) {
     b.nPages = (uint8_t)nPages; b.pad = 0; b.ordinal = (uint32_t)g_nCompiled;
     for (uint32_t i = 0; i < nPages; ++i) { b.page[i] = page[i]; b.gen[i] = gen[i]; }
     ++g_nCompiled;
+
+    // M2: emit aarch64 for this block. Failure is not an error -- the block simply keeps
+    // running on M1's threaded executor, which stays the complete fallback (and is what
+    // TJ_ENG_JIT_NOEMIT=1 forces for every block).
+    b.code = b.body = nullptr;
+    if (g_emitOn) EmitBlockCode(b, g_ops + off, &b.code, &b.body);
 
     if (g_dumpVa && g_dumpVa == entry) {
         printf("[jit] block #%u @%08X: %u insns, %u page(s), ends at %08X\n",
@@ -525,9 +576,11 @@ bool EnsureArenas() {
     if (g_blk && g_ops) return true;
     g_blk = (Block*)calloc((size_t)1 << kBlkBits, sizeof(Block));
     g_ops = (JitOp*)malloc((size_t)kOpArenaCap * sizeof(JitOp));
-    if (!g_blk || !g_ops) {
+    if (!g_jitGuard) g_jitGuard = (uint8_t*)calloc(kGuardPages, 1);   // M2's store guard
+    if (!g_blk || !g_ops || !g_jitGuard) {
         printf("[jit] REFUSED: block cache alloc failed — staying on the interpreter\n");
-        free(g_blk); free(g_ops); g_blk = nullptr; g_ops = nullptr;
+        free(g_blk); free(g_ops); free(g_jitGuard);
+        g_blk = nullptr; g_ops = nullptr; g_jitGuard = nullptr;
         return false;
     }
     const uintptr_t lo = 0x11000u, hi = 0x10000000u;      // the guest window
@@ -556,6 +609,21 @@ void JitInit() {
     if (const char* d = getenv("TJ_ENG_JIT_DUMP"))
         g_dumpVa = (uint32_t)strtoul(d, nullptr, 16);
     if (const char* st = getenv("TJ_ENG_JIT_STATS")) g_stats = (*st == '1');
+    // ---- M2 controls. Emission is ON by default once the tier is armed; NOEMIT is the
+    // A/B leg that proves the block substrate itself is unchanged (M1 semantics, M2
+    // plumbing), NOLINK isolates M2b from M2a, GUARDCHK proves the store-guard mirror.
+    if (const char* ne = getenv("TJ_ENG_JIT_NOEMIT")) {
+        if (*ne == '1') printf("[jit] NOEMIT: M1 threaded executor for every block\n");
+    }
+    if (const char* nl = getenv("TJ_ENG_JIT_NOLINK")) {
+        if (*nl == '1') { g_linkOn = false; printf("[jit] NOLINK: every block exit returns "
+                                                   "to the dispatcher (M2a only)\n"); }
+    }
+    if (const char* gc = getenv("TJ_ENG_JIT_GUARDCHK")) {
+        g_guardCheck = (*gc == '1');
+        if (g_guardCheck) printf("[jit] GUARDCHK: the store guard is re-proved a superset "
+                                 "of g_smcBits at every dispatcher entry\n");
+    }
     if (const char* sx = getenv("TJ_ENG_JIT_STRESS")) {
         g_stress = (*sx == '1');
         if (g_stress)
@@ -568,8 +636,27 @@ void JitInit() {
         uint32_t r = 0, f = 0;
         ExecBlock(&prime, nullptr, 0, &r, &f);
     }
+    if (const char* cc = getenv("TJ_ENG_JIT_CODECAP")) {
+        size_t kb = (size_t)strtoul(cc, nullptr, 0);
+        if (kb >= 256) { g_codeCap = kb << 10;
+                         printf("[jit] CODECAP=%zu KB (forces flush-all cycles)\n", kb); }
+    }
+    {   // The code cache is the one resource that can refuse (risk #1). If it does, the
+        // tier still runs - on M1's threaded executor, exactly as the plan requires.
+        const char* ne = getenv("TJ_ENG_JIT_NOEMIT");
+        g_emitOn = !(ne && *ne == '1') && CodeCacheAlloc();
+    }
+    if (const char* stv = getenv("TJ_ENG_JIT_SELFTEST")) {
+        if (*stv == '1' && g_emitOn && !JitSelfTest()) {
+            printf("[jit] FATAL: emitted flags disagree with the interpreter\n");
+            fflush(stdout); _Exit(0xED);
+        }
+    }
     g_on = true;
-    printf("[jit] M1 block tier ON (threaded, %u block slots, %u op arena, %zu KB)\n",
+    printf("[jit] M%d block tier ON (%s, %u block slots, %u op arena, %zu KB)\n",
+           g_emitOn ? 2 : 1, g_emitOn ? (g_linkOn ? "aarch64 emission + linking"
+                                                  : "aarch64 emission, no linking")
+                           : "threaded",
            1u << kBlkBits, kOpArenaCap,
            (((size_t)1 << kBlkBits) * sizeof(Block) +
             (size_t)kOpArenaCap * sizeof(JitOp)) >> 10);
@@ -582,10 +669,17 @@ void JitReset() {
     if (!g_inited) JitInit();
     if (!g_on) return;
     FlushAll();
+    RebuildGuard();          // M2: EngineSetExecRange just cleared g_smcBits; re-derive
     g_engaged = g_cacheOn && g_auditN == 0;
     if (!g_engaged)
         printf("[jit] standing aside (decode cache off, or taint audit armed)\n");
 }
+
+// M2's store-guard mirror, called by x86_interp.cpp's TryCacheSite on the line after it
+// sets the g_smcBits bit for `relPage`. See g_jitGuard in jit_emit.cpp for the invariant
+// and TJ_ENG_JIT_GUARDCHK for the leg that proves it rather than asserting it. Safe
+// before init (no guard array yet => nothing to mirror; RebuildGuard covers it later).
+void JitNoteCodePage(uint32_t relPage) { JitNoteCodePageImpl(relPage); }
 
 // The A/B switches are re-tested HERE, not just snapshotted at reset: TJ_ENG_NOCACHE and
 // the taint audit are both set through their own seams, and an ordering change (a
@@ -603,7 +697,7 @@ bool JitArmed() { return g_engaged && g_cacheOn && g_auditN == 0; }
 void JitSetEnabled(bool on) {
     if (!g_inited) JitInit();
     if (on && !EnsureArenas()) return;
-    if (on && !g_on) FlushAll();          // nothing compiled under the old world survives
+    if (on && !g_on) { FlushAll(); RebuildGuard(); }   // nothing from the old world survives
     g_on = on;
     g_engaged = g_on && g_cacheOn && g_auditN == 0;
     printf("[jit] M1 block tier %s (programmatic)\n", g_engaged ? "ON" : "OFF");
@@ -627,17 +721,51 @@ int JitStep(CpuState& s, uint32_t fsBase, uint64_t stepsUsed, uint64_t maxSteps,
     // the evicted block recompiled the next time it is reached. Compiling is a few
     // hundred instructions, so eviction costs throughput, never correctness — and the
     // slot's tag (entry) plus the generation list make a WRONG block unreachable.
+    if (__builtin_expect(g_guardCheck, 0)) GuardVerify();      // M2 debug leg only
     Block& b = g_blk[BlockHash(eip)];
     if (__builtin_expect(b.entry != eip || BlockStale(b), 0)) {
         if (b.entry == eip) ++g_nStale;     // §1.3.1 rejected it: the code bytes moved
-        if (!Compile(eip, b)) { ++g_nDeclines; return 0; }
+        if (!Compile(eip, b)) { ++g_nDeclines; g_jitLinkReq.site = nullptr; return 0; }
     }
-    // EXACT MaxSteps (better than the plan's block-granular +-64): a block that would
-    // overrun the budget is declined and the caller single-steps into it.
-    if (__builtin_expect(stepsUsed + b.nOps > maxSteps, 0)) { ++g_nDeclines; return 0; }
+    // MaxSteps for the FIRST block stays EXACT (better than the plan's block-granular
+    // +-64): a block that would overrun the budget is declined and the caller single-steps
+    // into it. Inside a CHAIN the budget is enforced at block granularity by the prologue
+    // (see the slice below), which is what §1.2 specifies.
+    if (__builtin_expect(stepsUsed + b.nOps > maxSteps, 0)) {
+        ++g_nDeclines; g_jitLinkReq.site = nullptr; return 0;
+    }
+
+    // ---- M2b: bind a pending link. The request was written by an exit stub INSIDE
+    // emitted code and carried out here, where nothing is executing, so Compile/FlushAll
+    // can never run under a live block (the M1 review's ExecGuard invariant, which
+    // chaining makes more important, not less). Binding to `code` — the PROLOGUE — is
+    // what keeps a later invalidation self-healing (§1.3.1).
+    if (__builtin_expect(g_jitLinkReq.site != nullptr, 0)) {
+        ++g_linkReqs;
+        if (b.code && g_jitLinkReq.target == (uint64_t)eip)
+            PatchLink(g_jitLinkReq.site, b.code);
+        g_jitLinkReq.site = nullptr;
+    }
 
     int k;
-    { ExecGuard eg; k = ExecBlock(&s, &b, fsBase, retired, faultEip); }
+    if (b.body) {
+        // One dispatcher entry can now run a whole CHAIN of linked blocks. The slice cap
+        // bounds it so the Run loop still gets control back on a schedule (stop check,
+        // escape check, MaxSteps) even if the guest spins inside emitted code.
+        uint64_t left = maxSteps - stepsUsed;
+        if (left > kSliceCap) left = kSliceCap;
+        g_jitFsBase = fsBase;
+        int code;
+        { ExecGuard eg; code = ((EnterFn)g_enterThunk)(&s, b.body, -(int64_t)left); }
+        *retired = (uint32_t)(uint64_t)(g_jitRetOut + (int64_t)left);
+        k = 1;
+        if (__builtin_expect(code == (int)EX_X87, 0)) {
+            *faultEip = s.eip;                       // the exit stub already stored it
+            k = X87TakeFault() ? 3 : 2;
+        }
+    } else {
+        ExecGuard eg; k = ExecBlock(&s, &b, fsBase, retired, faultEip);
+    }
     if (__builtin_expect(k == 1 && *retired == 0, 0)) {
         // Impossible by construction (Compile never emits a zero-instruction block),
         // and a silent zero would underflow the caller's step accounting into an

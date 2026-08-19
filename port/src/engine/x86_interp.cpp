@@ -497,6 +497,14 @@ static void TryCacheSite(uint32_t eipVal) {
     // Default: a negative entry, so this site is not re-classified every visit.
     e.eip = eipVal; e.form = F_NONE; e.gen = g_pageGen[pg];
     g_smcBits[pg >> 3] |= (uint8_t)(1u << (pg & 7));
+#if defined(__aarch64__)
+    // ⚠ MUST STAY ON THE LINE AFTER THE BIT-SET. The Stage-4 JIT's emitted store barrier
+    // reads a byte-per-page mirror of this bitmap instead of re-deriving the span+bit test
+    // inline; the mirror is only allowed to be a SUPERSET, and this is the ONE place a bit
+    // is ever added. jit/jit_emit.cpp's g_jitGuard states the invariant; TJ_ENG_JIT_GUARDCHK
+    // re-proves it at every dispatcher entry. Windows compiles nothing of this.
+    jit::JitNoteCodePage(pg);
+#endif
 
     const uint8_t* p = (const uint8_t*)(uintptr_t)eipVal;
     uint8_t flags = 0;
