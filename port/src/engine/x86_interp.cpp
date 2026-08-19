@@ -13,6 +13,9 @@
 // guest's x87 state between gate boundaries.
 #include "engine/engine_priv.h"
 #include "engine/engine_host.h"
+#if defined(__aarch64__)
+#include "engine/jit/jit.h"          // Stage-4 M1 block tier — aarch64 ONLY (JIT_PLAN.md)
+#endif
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -126,6 +129,9 @@ void EngineSetExecRange(uint32_t lo, uint32_t hi) {
     memset(g_hotTab, 0, sizeof g_hotTab);
     memset(g_smcBits, 0, sizeof g_smcBits);
     memset(g_pageGen, 0, sizeof g_pageGen);
+#if defined(__aarch64__)
+    jit::JitReset();      // the block cache rides the same reset (JIT_PLAN.md §1.3)
+#endif
 }
 
 static AuditRange g_audit[8];
@@ -690,6 +696,15 @@ inline void StrAdvance(CpuState& s, int regIdx, int bits) {
 
 } // namespace
 
+#if defined(__aarch64__)
+// THE BLOCK JIT (Stage 4 M1). Included INTO this translation unit deliberately, right
+// here — after every helper above, before Run below — so its executor calls the SAME
+// AluOp/Flags/ld/st/Push/Cond/X87Exec definitions rather than copies of them, and
+// decodes with the SAME TryCacheSite. See jit/jit.h for the full argument. On Windows
+// the preprocessor never opens the file.
+#include "engine/jit/jit_blocks.cpp"
+#endif
+
 // ---------------------------------------------------------------- the core loop
 RunResult Run(CpuState& s, uint32_t stopEip, uint64_t maxSteps) {
     static const bool p2init = Prof2Init(); (void)p2init;   // TJ_ENG_PROF2 (once)
@@ -724,6 +739,25 @@ RunResult Run(CpuState& s, uint32_t stopEip, uint64_t maxSteps) {
             rr.steps = steps; g_instrTotal += steps;
             return rr;
         };
+
+#if defined(__aarch64__)
+        // ---- [JIT] the Stage-4 M1 block tier, ABOVE the form cache (JIT_PLAN.md §1.2).
+        // Every invariant for this EIP was just checked by the loop head — stop, EIP
+        // ring, exec-range/escape, step budget — and a block adds none and skips none.
+        // A block that would overrun the budget is declined, so MaxSteps stays EXACT.
+        // Declining costs a hash + two compares and lands on the untouched paths below.
+        if (jit::JitArmed()) {
+            uint32_t nRet = 0, fEip = 0;
+            int k = jit::JitStep(s, fsBase, steps - 1, maxSteps, &nRet, &fEip);
+            if (k) {
+                // `steps` already counted one instruction (the block's first).
+                steps += (k == 1) ? nRet - 1 : nRet;
+                if (k == 1) continue;
+                insnStart = (const uint8_t*)(uintptr_t)fEip;   // the refusing x87 insn
+                return k == 2 ? BAD() : FAULT(0x10);
+            }
+        }
+#endif
 
         // ---- hot-form decode cache: decoded-once dispatch for the common forms.
         // Handlers call the SAME helpers as the switch below; F_NONE and stale entries

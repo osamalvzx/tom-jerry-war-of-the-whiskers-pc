@@ -36,7 +36,19 @@ add_library(tj_engine STATIC
     ${ENG}/x87_exact.cpp
     ${ENG}/x87_fast.cpp
     ${ENG}/fpu_host.cpp
+    # --- Stage 4, the BLOCK JIT (port/JIT_PLAN.md). aarch64-ONLY by construction: this
+    # is the ONLY CMakeLists that ever mentions port/src/engine/jit/, and the Windows
+    # port/CMakeLists.txt must never gain a line about it.
+    # jit_blocks.cpp is HEADER_FILE_ONLY on purpose — it is #included into
+    # x86_interp.cpp (inside #if defined(__aarch64__)) so the block executor calls the
+    # interpreter's own inline helpers instead of copies of them, which is what makes
+    # "semantics shared, never re-implemented" a structural property rather than a
+    # promise. Ninja still rebuilds x86_interp.cpp when it changes (clang -MD lists it).
+    ${ENG}/jit/jit.h
+    ${ENG}/jit/jit_blocks.cpp
 )
+set_source_files_properties(${ENG}/jit/jit_blocks.cpp ${ENG}/jit/jit.h
+                            PROPERTIES HEADER_FILE_ONLY TRUE)
 target_include_directories(tj_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(tj_engine PRIVATE tj_softfloat)
 

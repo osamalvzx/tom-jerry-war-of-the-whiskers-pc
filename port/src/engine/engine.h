@@ -139,10 +139,38 @@ void EngineSetDecodeCache(bool on);
 void EngineCacheStats(uint64_t* hits, uint64_t* misses);
 void EngineInvalidateCode(uint32_t va, uint32_t len);
 
+#if defined(__aarch64__)
+// THE BLOCK JIT (port/JIT_PLAN.md Stage 4). aarch64-ONLY BY CONSTRUCTION — no Windows
+// target compiles a token of port/src/engine/jit/, so the x86 interpreter + form cache
+// (and the 49,935,104-instruction eng_test fingerprint) are untouched by definition.
+// Default OFF; TJ_ENG_JIT=1 arms it, TJ_ENG_JIT_MAXBLOCKS=N bisects a divergence to one
+// block, TJ_ENG_JIT_STATS=1 prints the counters. Milestone M1 is a threaded executor
+// over pre-decoded blocks: it emits no machine code and shares every semantic helper
+// with the interpreter, so a det leg with it on must be byte-identical to one with it
+// off. The block cache is flushed by EngineSetExecRange and revalidated per block entry
+// against the SAME page generations the form cache uses (EngineInvalidateCode and the
+// guest store barrier both reach it).
+// EngineSetJit is the programmatic arm/disarm the phone will use to flip the default
+// once M2's device gates pass (the TJ_ENG_FAST rollout shape, plan D5); the env var
+// stays the control for every headless det leg. EngineJitStats reports the run's block
+// counters for a caller that wants them in its own summary line.
+void EngineSetJit(bool on);
+bool EngineJitArmed();
+void EngineJitStats(uint64_t* blocksCompiled, uint64_t* blockEntries,
+                    uint64_t* insnsInBlocks, uint64_t* sideExits);
+#endif
+
 // Interpreted-EIP ring for crash forensics: the engine records every instruction's EIP
 // (cheap: one store each). Copies the most recent n entries into out (oldest first),
 // returns how many were available. Read from a fault handler to see how EIP reached a
 // bad region — information no stack walk can recover once the guest went astray.
+// ⚠ WITH THE M1 BLOCK TIER ARMED (aarch64, TJ_ENG_JIT=1) the granularity changes: one
+// entry per BLOCK ENTRY, not per instruction, so the ring spans ~4.4x more code and the
+// faulting instruction itself is not in it (jit_blocks.cpp reports that separately).
+// TJ_ENG_PROF2's EIP heat map reads this ring and is block-entry-weighted for the same
+// reason. Likewise EngineCacheStats' hit/miss counters only see instructions the
+// INTERPRETER decoded — with the tier on that is ~11% of them, so a low hit count there
+// is the tier working, not a decode-cache regression.
 constexpr uint32_t kEipRingCap = 256;
 uint32_t EngineEipRing(uint32_t* out, uint32_t n);
 
