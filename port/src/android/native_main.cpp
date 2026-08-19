@@ -167,13 +167,41 @@ bool SpawnGame(android_app* app) {
     // separate from the external extraction target, with NO game-side changes.
     snprintf(lad, sizeof lad, "LOCALAPPDATA=%s", internal ? internal : ".");
 
+    // OPTIONAL FLAGS FILE: <external>/tj_flags.txt, one KEY=VALUE per line (# comments,
+    // blank lines ignored), merged into the game's environment. The engine's switches are
+    // all env-driven (TJ_ENG_JIT, TJ_ENG_FAST, TJ_ENG_PROF2, TJ_ENG_NOCACHE...), but an
+    // exec'd child of an APK has no shell to set them from — so an on-device A/B would
+    // otherwise need a rebuild per leg. One `adb push` per leg instead. Absent file =
+    // nothing added, which is the shipping path.
+    static char flagBuf[2048];
+    char* flagEnv[24];
+    int nFlags = 0;
+    {
+        char fp[512];
+        snprintf(fp, sizeof fp, "%s/tj_flags.txt", ext ? ext : ".");
+        if (FILE* f = fopen(fp, "r")) {
+            size_t n = fread(flagBuf, 1, sizeof flagBuf - 1, f);
+            fclose(f);
+            flagBuf[n] = 0;
+            char* save = nullptr;
+            for (char* ln = strtok_r(flagBuf, "\r\n", &save);
+                 ln && nFlags < 24; ln = strtok_r(nullptr, "\r\n", &save)) {
+                while (*ln == ' ' || *ln == '\t') ++ln;
+                if (*ln == '#' || !*ln || !strchr(ln, '=')) continue;
+                LOGI("flag: %s", ln);
+                flagEnv[nFlags++] = ln;
+            }
+        }
+    }
+
     int nEnv = 0; while (environ[nEnv]) ++nEnv;
-    char** envp = (char**)malloc(sizeof(char*) * (nEnv + 7));
+    char** envp = (char**)malloc(sizeof(char*) * (size_t)(nEnv + 7 + nFlags));
     int k = 0;
     for (int i = 0; i < nEnv; ++i) envp[k++] = environ[i];
     envp[k++] = shmFd; envp[k++] = tw; envp[k++] = th; envp[k++] = lad;
     envp[k++] = (char*)"TJ_FE_NOVID=1";       // no PC video menu on Android (§2.7)
     envp[k++] = (char*)"TJ_FE_NOROW=1";
+    for (int i = 0; i < nFlags; ++i) envp[k++] = flagEnv[i];   // last wins: overrides above
     envp[k] = nullptr;
     char* argv[3] = { bin, xbe, nullptr };
 
