@@ -546,17 +546,11 @@ int ReplayRing() {
             // ring — the backbuffer must always hold a finished frame when the caller
             // swaps, never a half-replayed one. Bounded so a fast producer can't starve
             // the swap forever.
-            if (presents >= 4) break;
-            head = g_hdr->head.load(std::memory_order_acquire);
-            bool more = false;
-            for (uint64_t t2 = tail; t2 < head; ) {
-                uint32_t p2 = (uint32_t)(t2 % N);
-                CmdHdr h2; memcpy(&h2, g_ring + p2, sizeof h2);
-                if (h2.op == OP_WRAP) { t2 += sizeof(CmdHdr) + h2.bytes; continue; }
-                if (h2.op == OP_PRESENT) { more = true; break; }
-                t2 += CmdTotal(h2.bytes);
-            }
-            if (!more) break;
+            // ONE present per swap. Draining several frames before swapping (the
+            // session-30 "frame drop") shows the display whatever the last drained frame
+            // left in the backbuffer and is a second way to put a half-built picture on
+            // screen. The sim is paced by its own 60 Hz limiter, not by this.
+            break;
         }
     }
     return presents;
@@ -569,12 +563,10 @@ void* RenderThread(void* pv) {
     tj::gfx::GlesSetGameSize(g_gameW, g_gameH);   // 16:9 present rect, centered per attach
     tj::gfx::PresentParams pp;
     pp.backWidth = g_gameW; pp.backHeight = g_gameH;
-    // vsync OFF for the compositor swap: SurfaceFlinger still displays at vsync, but the
-    // replay thread must not BLOCK on the display clock — a blocked swap quantizes the
-    // ring-consume cadence to 30 fps and the game queues behind it (measured session-29
-    // morning: swap 16-21 ms with vsync on). The game's own 60 Hz limiter (ipc Present)
-    // is the pacing authority.
-    pp.vsync = false;
+    // vsync ON. It was turned OFF (session 30) to stop the swap blocking the replay
+    // thread; it bought no measurable frame time and it TEARS — the user reported
+    // flickering, which is what an unsynchronised swap looks like. Correct picture first.
+    pp.vsync = true;
     for (;;) {
         if (g_stop.load()) return nullptr;
         // Service the TERM handshake even while no device exists: the glue thread is
