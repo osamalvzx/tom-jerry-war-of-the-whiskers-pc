@@ -59,6 +59,11 @@ namespace {
 // The whole hybrid layer (in the SUBPROCESS) logs via printf; the app does too. Pipe both
 // this process's stdout/stderr to logcat — and because the subprocess INHERITS fd 1/2
 // across exec, its output lands in the same pump. Tag: wotw-game.
+uint64_t NowNs() {
+    timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
 void* LogPump(void* pv) {
     int fd = (int)(intptr_t)pv;
     char buf[1024]; int pos = 0;
@@ -401,6 +406,13 @@ std::atomic<bool> g_surfaceDown{true};                  // render -> glue: relea
 
 tj::gfx::Device g_dev;
 int g_texMap[4096];
+bool     g_compProf = false;                  // TJ_COMP_PROF=1 in the flags file
+// TJ_GAME_SCALE=<f> (0.35..1.0): render the game at a fraction of the 16:9 rect, scaled up
+// on present. Two purposes: it is the decisive CPU-vs-GPU experiment for the replay cost
+// (fill rate scales with it, driver call count does not), and if the display leg is
+// fill-bound it is also the fix — a 2002 game's art does not need every phone pixel.
+float    g_gameScale = 1.0f;
+uint64_t g_clsNs[4] = {}, g_clsN[4] = {};     // draw / texture / rendertarget / state
 
 // Replays until the ring is EMPTY, counting completed frames; the CALLER swaps once for
 // the whole batch. Draining past intermediate presents is the frame-drop path: when replay
@@ -423,6 +435,10 @@ int ReplayRing() {
         memcpy(&ch, g_ring + pos, sizeof ch);
         if (ch.op == OP_WRAP) { tail += sizeof(CmdHdr) + ch.bytes; g_hdr->tail.store(tail, std::memory_order_release); continue; }
         const uint8_t* pl = g_ring + pos + sizeof(CmdHdr);
+        // Replay cost by op class. The VAO/baseVertex rework did not move the 38 ms/frame
+        // replay, so the per-draw CALL COUNT is not the bound — find what is instead of
+        // guessing again.
+        uint64_t opT0 = g_compProf ? NowNs() : 0;
         switch (ch.op) {
             case OP_CLEAR: {
                 uint32_t v[4]; memcpy(v, pl, 16);
@@ -514,6 +530,15 @@ int ReplayRing() {
                 g_stop.store(true);                                // RingWrite backpressure
                 return -1;
         }
+        if (g_compProf) {
+            uint64_t d = NowNs() - opT0;
+            int cls = (ch.op == OP_DRAW_PC || ch.op == OP_DRAW_PTC || ch.op == OP_DRAW_SHINY) ? 0
+                    : (ch.op == OP_CREATE_TEX || ch.op == OP_UPDATE_TEX) ? 1
+                    : (ch.op == OP_CREATE_RT || ch.op == OP_CREATE_CAPTURE ||
+                       ch.op == OP_COPY_BACKBUFFER || ch.op == OP_SET_RT ||
+                       ch.op == OP_SET_RT_BACKBUFFER) ? 2 : 3;
+            g_clsNs[cls] += d; ++g_clsN[cls];
+        }
         tail += CmdTotal(ch.bytes);
         g_hdr->tail.store(tail, std::memory_order_release);   // free space promptly
         if (ch.op == OP_PRESENT) {
@@ -584,8 +609,32 @@ void* RenderThread(void* pv) {
             else LOGE("surface attach failed");
         }
         if (!haveSurface) { usleep(20000); continue; }   // ring backpressure pauses the game
+        // Compositor cost, per 400 presented frames. The GAME's own `swap` figure is the
+        // time it BLOCKS in Present, which conflates the 60 Hz limiter with waiting for
+        // this thread — so the replay+swap split has to be measured on this side to know
+        // whether the display leg or the sim is the frame's real bound.
+        uint64_t t0 = NowNs();
         int frames = ReplayRing();
-        if (frames > 0) g_dev.Present();                 // ONE swap per drained batch
+        uint64_t t1 = NowNs();
+        if (frames > 0) {
+            g_dev.Present();                             // ONE swap per drained batch
+            uint64_t t2 = NowNs();
+            static uint64_t rN = 0, rReplay = 0, rSwap = 0, rBatch = 0;
+            rReplay += t1 - t0; rSwap += t2 - t1; rBatch += (uint64_t)frames;
+            if (((++rN) % 400) == 0) {
+                LOGI("comp: replay %.2f ms swap %.2f ms batch %.2f frames/drain (per present)",
+                     rReplay / 400.0 / 1e6, rSwap / 400.0 / 1e6, rBatch / 400.0);
+                if (g_compProf) {
+                    static const char* kCls[4] = { "draw", "tex", "rt", "state" };
+                    for (int i = 0; i < 4; ++i) {
+                        LOGI("comp:   %-5s %8.2f ms/present  n=%.1f/present",
+                             kCls[i], g_clsNs[i] / 400.0 / 1e6, g_clsN[i] / 400.0);
+                        g_clsNs[i] = g_clsN[i] = 0;
+                    }
+                }
+                rReplay = rSwap = rBatch = 0;
+            }
+        }
         else if (frames == 0) usleep(1000);              // nothing complete: idle briefly
     }
     return nullptr;
@@ -612,6 +661,11 @@ void OnCmd(android_app* app, int32_t cmd) {
                 int W = w > h ? w : h, H = w > h ? h : w;
                 if (W * 9 > H * 16) W = (H * 16 / 9) & ~1;   // wider than 16:9 -> pillarbox
                 else if (W * 9 < H * 16) H = (W * 9 / 16) & ~1;  // taller -> letterbox
+                if (g_gameScale < 0.999f) {                  // render smaller, scale on present
+                    W = ((int)((float)W * g_gameScale)) & ~1;
+                    H = ((int)((float)H * g_gameScale)) & ~1;
+                    LOGI("game render scale %.2f -> %dx%d", (double)g_gameScale, W, H);
+                }
                 g_gameW = W; g_gameH = H;
                 if (!CreateShm(g_gameW, g_gameH)) break;
                 if (!SpawnGame(app)) break;
@@ -671,6 +725,22 @@ static void MakeImmersive(android_app* app) {
 
 void android_main(android_app* app) {
     RedirectStdio();
+    {   // TJ_COMP_PROF=1 in <external>/tj_flags.txt turns on per-op replay accounting.
+        char fp[512];
+        const char* ex = app->activity->externalDataPath;
+        snprintf(fp, sizeof fp, "%s/tj_flags.txt", ex ? ex : ".");
+        if (FILE* f = fopen(fp, "r")) {
+            char line[256];
+            while (fgets(line, sizeof line, f)) {
+                if (strstr(line, "TJ_COMP_PROF=1")) g_compProf = true;
+                if (const char* sc = strstr(line, "TJ_GAME_SCALE=")) {
+                    float v = (float)atof(sc + 14);
+                    if (v >= 0.35f && v <= 1.0f) g_gameScale = v;
+                }
+            }
+            fclose(f);
+        }
+    }
     app->onAppCmd = OnCmd;
     app->onInputEvent = OnInput;
     g_activity = app->activity;        // ReapThread finishes the activity on a game crash

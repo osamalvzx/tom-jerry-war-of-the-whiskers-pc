@@ -159,8 +159,21 @@ struct Device::Impl {
     // glBufferData orphaning (the pass before) was the session-21 slow-motion pattern.
     static constexpr uint32_t kRingVB = 4u << 20;    // ~1.5 MB/frame measured + slack
     static constexpr uint32_t kRingIB = 1u << 20;
-    GLuint vao = 0, vbo = 0, ibo = 0;
+    // ONE VAO PER VERTEX FORMAT. The first pass re-specified every attribute on every
+    // draw (3 glVertexAttribPointer + 3 enable + 1 disable + a VAO bind, ~15 GL calls per
+    // draw); at 730 draws that is ~7,300 driver calls per frame and it MEASURED 38 ms of
+    // replay per game frame on the device — nearly the whole frame budget, with swap at
+    // 0.35 ms proving it was submission cost, not the GPU. A VAO records the attribute
+    // layout once; the per-draw vertex offset then rides in glDrawElements' baseVertex
+    // (offsets are stride-aligned so the division is exact), leaving ~2 calls per draw.
+    GLuint vao = 0;                    // legacy/no-baseVertex path
+    GLuint vaoPC = 0, vaoPTC = 0, vaoPT2C = 0, curVao = 0;
+    GLuint vbo = 0, ibo = 0;
     uint32_t vboOff = 0, iboOff = 0;
+    bool haveBaseVertex = false;
+    void (*pDrawElementsBaseVertex)(GLenum, GLsizei, GLenum, const void*, GLint) = nullptr;
+
+    void BindVao(GLuint v) { if (curVao != v) { glBindVertexArray(v); curVao = v; } }
 
     // Append into this frame's buffer; returns the byte offset of the copy.
     uint32_t Append(GLenum target, GLuint buf, uint32_t cap, uint32_t& off,
@@ -176,14 +189,21 @@ struct Device::Impl {
         return at;
     }
     void OrphanFrameBuffers() {                        // called at Present: fresh per frame
+        // Orphan through the legacy VAO, then restore the binding cache: the format VAOs
+        // reference these same buffer objects, and glBufferData on an orphaned name keeps
+        // every VAO's attribute bindings valid (they bind the NAME, not the storage).
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, kRingVB, nullptr, GL_STREAM_DRAW);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);    // VAO-attached
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, kRingIB, nullptr, GL_STREAM_DRAW);
+        curVao = vao;
         vboOff = iboOff = 0;
     }
-    uint32_t AppendVB(const void* d, uint32_t n) { return Append(GL_ARRAY_BUFFER, vbo, kRingVB, vboOff, d, n, 16); }
+    // align = the VERTEX STRIDE so baseVertex (off/stride) is exact.
+    uint32_t AppendVB(const void* d, uint32_t n, uint32_t stride) {
+        return Append(GL_ARRAY_BUFFER, vbo, kRingVB, vboOff, d, n, stride);
+    }
     uint32_t AppendIB(const void* d, uint32_t n) { return Append(GL_ELEMENT_ARRAY_BUFFER, ibo, kRingIB, iboOff, d, n, 4); }
 
     void BindTexUnit(int unit, GLuint id) {
@@ -353,6 +373,49 @@ bool Device::Create(HWND hwnd, const PresentParams& pp) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, p_->ibo);   // VAO-attached: stays bound with it
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, Impl::kRingIB, nullptr, GL_STREAM_DRAW);
 
+    // glDrawElementsBaseVertex: core in GLES 3.2, and an EXT/OES extension before that.
+    // Without it we fall back to re-specifying pointers per draw (still inside a VAO, so
+    // the enable/disable churn is gone either way).
+    {
+        const char* ext = (const char*)glGetString(GL_EXTENSIONS);
+        auto get = (void*(*)(const char*))eglGetProcAddress;
+        void* fn = (void*)eglGetProcAddress("glDrawElementsBaseVertex");
+        if (!fn) fn = (void*)eglGetProcAddress("glDrawElementsBaseVertexEXT");
+        if (!fn) fn = (void*)eglGetProcAddress("glDrawElementsBaseVertexOES");
+        (void)get; (void)ext;
+        if (fn) {
+            p_->pDrawElementsBaseVertex =
+                (void (*)(GLenum, GLsizei, GLenum, const void*, GLint))fn;
+            p_->haveBaseVertex = true;
+        }
+        printf("[gles] baseVertex draws: %s\n", p_->haveBaseVertex ? "yes" : "no (fallback)");
+    }
+    // One VAO per vertex format: attributes recorded ONCE against the ring VBO/IBO.
+    {
+        struct AttrDesc { int loc, size; GLenum type; GLboolean norm; int off; };
+        auto build = [&](GLuint& vao, int stride, const AttrDesc* a, int n) {
+            glGenVertexArrays(1, &vao);
+            glBindVertexArray(vao);
+            glBindBuffer(GL_ARRAY_BUFFER, p_->vbo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, p_->ibo);
+            for (int i = 0; i < n; ++i) {
+                glEnableVertexAttribArray(a[i].loc);
+                glVertexAttribPointer(a[i].loc, a[i].size, a[i].type, a[i].norm,
+                                      stride, (void*)(uintptr_t)a[i].off);
+            }
+        };
+        const AttrDesc pc[]  = { {0,3,GL_FLOAT,GL_FALSE,0}, {1,4,GL_UNSIGNED_BYTE,GL_TRUE,12} };
+        const AttrDesc ptc[] = { {0,3,GL_FLOAT,GL_FALSE,0}, {1,2,GL_FLOAT,GL_FALSE,12},
+                                 {2,4,GL_UNSIGNED_BYTE,GL_TRUE,20} };
+        const AttrDesc pt2[] = { {0,3,GL_FLOAT,GL_FALSE,0}, {1,2,GL_FLOAT,GL_FALSE,12},
+                                 {2,2,GL_FLOAT,GL_FALSE,20}, {3,4,GL_UNSIGNED_BYTE,GL_TRUE,28} };
+        build(p_->vaoPC,   (int)sizeof(VertexPC),   pc,  2);
+        build(p_->vaoPTC,  (int)sizeof(VertexPTC),  ptc, 3);
+        build(p_->vaoPT2C, (int)sizeof(VertexPT2C), pt2, 4);
+        glBindVertexArray(p_->vao);
+        p_->curVao = p_->vao;
+    }
+
     // Samplers: [uClamp][vClamp]. Trilinear + anisotropic (if the EXT is present, like the
     // Xbox init). WRAP vs CLAMP_TO_EDGE per axis.
     float maxAniso = 1.0f;
@@ -453,35 +516,34 @@ void Device::SetTransform(const float m[16]) { if (p_) memcpy(p_->wvp, m, sizeof
 // --- Draw paths -------------------------------------------------------------------------
 void Device::DrawTriangleList(const VertexPC* verts, int vertexCount) {
     if (!p_ || vertexCount <= 0) return;
-    glBindVertexArray(p_->vao);
-    uint32_t off = p_->AppendVB(verts, (uint32_t)sizeof(VertexPC) * vertexCount);
+    p_->BindVao(p_->vaoPC);
+    uint32_t off = p_->AppendVB(verts, (uint32_t)sizeof(VertexPC) * vertexCount,
+                                (uint32_t)sizeof(VertexPC));
     p_->ApplyWVP(p_->color);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPC), (void*)(uintptr_t)(off + 0));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPC), (void*)(uintptr_t)(off + 12));
-    glDisableVertexAttribArray(2);
-    glDisableVertexAttribArray(3);
-    glDrawArrays(GL_TRIANGLES, 0, vertexCount);
+    // first = the vertex index of this draw's data — no attribute re-specification.
+    glDrawArrays(GL_TRIANGLES, (GLint)(off / sizeof(VertexPC)), vertexCount);
 }
 
 void Device::DrawIndexed(const VertexPTC* verts, int vertexCount,
                          const uint16_t* indices, int indexCount) {
     if (!p_ || vertexCount <= 0 || indexCount <= 0) return;
-    glBindVertexArray(p_->vao);
-    uint32_t vbOff = p_->AppendVB(verts, (uint32_t)sizeof(VertexPTC) * vertexCount);
+    p_->BindVao(p_->vaoPTC);
+    uint32_t vbOff = p_->AppendVB(verts, (uint32_t)sizeof(VertexPTC) * vertexCount,
+                                  (uint32_t)sizeof(VertexPTC));
     uint32_t ibOff = p_->AppendIB(indices, (uint32_t)indexCount * 2);
     p_->ApplyWVP(p_->tex);
     p_->BindTexUnit(0, p_->TexId(p_->curTex));
     p_->BindSampUnit(0, p_->curSamp);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPTC), (void*)(uintptr_t)(vbOff + 0));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPTC), (void*)(uintptr_t)(vbOff + 12));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPTC), (void*)(uintptr_t)(vbOff + 20));
-    glDisableVertexAttribArray(3);
-    glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_SHORT, (void*)(uintptr_t)ibOff);
+    if (p_->haveBaseVertex) {
+        p_->pDrawElementsBaseVertex(GL_TRIANGLES, indexCount, GL_UNSIGNED_SHORT,
+                                    (void*)(uintptr_t)ibOff,
+                                    (GLint)(vbOff / sizeof(VertexPTC)));
+    } else {                                   // pre-3.2 fallback: 3 pointers, no churn
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPTC), (void*)(uintptr_t)(vbOff + 0));
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPTC), (void*)(uintptr_t)(vbOff + 12));
+        glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPTC), (void*)(uintptr_t)(vbOff + 20));
+        glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_SHORT, (void*)(uintptr_t)ibOff);
+    }
 }
 
 void Device::DrawShinyIndexed(const VertexPT2C* verts, int vertexCount,
@@ -489,22 +551,25 @@ void Device::DrawShinyIndexed(const VertexPT2C* verts, int vertexCount,
                               TextureHandle t0, TextureHandle t1,
                               TextureHandle t2, TextureHandle t3) {
     if (!p_ || vertexCount <= 0 || indexCount <= 0) return;
-    glBindVertexArray(p_->vao);
-    uint32_t vbOff = p_->AppendVB(verts, (uint32_t)sizeof(VertexPT2C) * vertexCount);
+    p_->BindVao(p_->vaoPT2C);
+    uint32_t vbOff = p_->AppendVB(verts, (uint32_t)sizeof(VertexPT2C) * vertexCount,
+                                  (uint32_t)sizeof(VertexPT2C));
     uint32_t ibOff = p_->AppendIB(indices, (uint32_t)indexCount * 2);
     p_->ApplyWVP(p_->shiny);
     TextureHandle ts[4] = { t0, t1, t2, t3 };
     for (int i = 0; i < 4; ++i) { p_->BindTexUnit(i, p_->TexId(ts[i]));
                                   p_->BindSampUnit(i, p_->curSamp); }
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOff + 0));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOff + 12));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOff + 20));
-    glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOff + 28));
-    glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_SHORT, (void*)(uintptr_t)ibOff);
+    if (p_->haveBaseVertex) {
+        p_->pDrawElementsBaseVertex(GL_TRIANGLES, indexCount, GL_UNSIGNED_SHORT,
+                                    (void*)(uintptr_t)ibOff,
+                                    (GLint)(vbOff / sizeof(VertexPT2C)));
+    } else {
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOff + 0));
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOff + 12));
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOff + 20));
+        glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPT2C), (void*)(uintptr_t)(vbOff + 28));
+        glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_SHORT, (void*)(uintptr_t)ibOff);
+    }
 }
 
 // --- Textures ---------------------------------------------------------------------------
