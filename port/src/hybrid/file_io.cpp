@@ -417,17 +417,27 @@ extern "C" int32_t __stdcall Hy_NtClose(uint32_t handle) {
 // STATUS_NO_SUCH_FILE on an empty first scan, STATUS_NO_MORE_FILES at the end --
 // both negative, which is what makes the XAPI find-wrapper bail cleanly when there are
 // no saves (the old always-success stub made it parse an unfilled buffer and crash).
+// ⚠ `fileMask` IS A uint32_t, NOT A void*, AND THAT IS LOAD-BEARING — see the 4-byte-slot
+// rule at InvokeArgBytes (dispatch.cpp). The kernel table is UNTYPED: the marshaler calls
+// every shim through an all-uint32_t prototype. Arguments 1-8 survive a pointer declaration
+// by luck (AAPCS64 passes them in registers, and a `w` write zero-extends into `x`), but
+// argument 9 onward go ON THE STACK, where the caller writes a 4-byte slot and a `void*`
+// callee reads EIGHT — assembling the pointer out of two adjacent argument slots.
+// This is the tenth-argument function, so it is the one shim in the table where that bites.
+// It cost a crash on Save Game: `fileMask` arrived as 0x487a60_00000000 and the deref of
+// fileMask+4 faulted at 0x487a60_00000004. x86 never saw it (both types are 4 bytes there).
 extern "C" int32_t __stdcall Hy_NtQueryDirectoryFile(uint32_t handle, uint32_t event, void* apc,
         void* apcCtx, void* iosb, void* info, uint32_t length, uint32_t infoClass,
-        void* fileMask, uint32_t restart) {
+        uint32_t fileMask, uint32_t restart) {
     (void)event; (void)apc; (void)apcCtx; (void)infoClass;
     FileObj* f = Resolve(handle);
     if (!f || !f->path[0]) { SetIosb(iosb, NT_INVALID_HANDLE, 0); return NT_INVALID_HANDLE; }
     if (restart && f->findOpen) { FindClose(f->find); f->findOpen = false; }
     char mask[128] = "*";
     if (fileMask) {
-        uint16_t ml = *(uint16_t*)fileMask;
-        char* mb = (char*)(uintptr_t)*(uint32_t*)((char*)fileMask + 4);   // gptr
+        const char* fm = (const char*)(uintptr_t)fileMask;   // guest OBJECT_STRING
+        uint16_t ml = *(const uint16_t*)fm;
+        char* mb = (char*)(uintptr_t)*(const uint32_t*)(fm + 4);   // gptr
         if (mb && ml && ml < sizeof(mask) - 1) { memcpy(mask, mb, ml); mask[ml] = 0; }
     }
     WIN32_FIND_DATAA fd;

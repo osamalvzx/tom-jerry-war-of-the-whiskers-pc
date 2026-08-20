@@ -147,6 +147,22 @@ uint32_t AddEntry(const DispatchEntry& e) {
 // Kernel-table shims: convention recorded as DATA (argBytes stack dwords, stdcall
 // cleanup; the four fastcall ordinals all take zero marshaled args). Args are passed
 // as 4-byte values — every kernel shim parameter is a 32-bit scalar or guest pointer.
+//
+// ⚠⚠ THE 4-BYTE-SLOT RULE IS A HARD REQUIREMENT ON THE SHIM'S C SIGNATURE, NOT A
+// DESCRIPTION. This table is UNTYPED — `host` is a void* and the call below goes through an
+// all-uint32_t prototype — so nothing checks that a shim agrees. On x86 nothing had to:
+// void* and uint32_t are both 4 bytes. On AArch64 they are not, and the two halves of the
+// ABI disagree differently:
+//   * ARGUMENTS 1-8 travel in x0-x7. A shim may declare those `void*` and get away with it,
+//     because the caller's `w` write zero-extends into the full `x` the callee reads.
+//   * ARGUMENT 9 ONWARD travels ON THE STACK, and there the sizes must match exactly. The
+//     caller lays down a 4-byte slot per argument; a `void*` parameter reads EIGHT, so it
+//     assembles its pointer from two adjacent argument slots and every later argument is
+//     read at the wrong offset.
+// Only two shims in this table have more than eight arguments (NtCreateFile 9,
+// NtQueryDirectoryFile 10). NtQueryDirectoryFile declared its 9th `void*` and crashed Save
+// Game on the device — `fileMask` arrived as 0x487a60_00000000. If you add a 9th argument to
+// any shim here, IT MUST BE A uint32_t and the pointer cast belongs inside the body.
 void InvokeArgBytes(CpuState& s, const DispatchEntry& e) {
     const uint32_t esp = s.r[tj::engine::ESP];
     const uint32_t ret = GuestLd32(esp);

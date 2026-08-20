@@ -25,7 +25,7 @@ extern "C" int32_t __stdcall Hy_NtCreateFile(uint32_t*, uint32_t, void*, void*, 
 extern "C" int32_t __stdcall Hy_NtOpenFile(uint32_t*, uint32_t, void*, void*, uint32_t, uint32_t);
 extern "C" int32_t __stdcall Hy_NtReadFile(uint32_t, uint32_t, void*, void*, void*, void*, uint32_t, int64_t*);
 extern "C" int32_t __stdcall Hy_NtClose(uint32_t);
-extern "C" int32_t __stdcall Hy_NtQueryDirectoryFile(uint32_t, uint32_t, void*, void*, void*, void*, uint32_t, uint32_t, void*, uint32_t);
+extern "C" int32_t __stdcall Hy_NtQueryDirectoryFile(uint32_t, uint32_t, void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t);
 extern "C" int32_t __stdcall Hy_NtQueryInformationFile(uint32_t, void*, void*, uint32_t, uint32_t);
 extern "C" int32_t __stdcall Hy_NtQueryVolumeInformationFile(uint32_t, void*, void*, uint32_t, uint32_t);
 extern "C" int32_t __stdcall Hy_NtWriteFile(uint32_t, uint32_t, void*, void*, void*, const void*, uint32_t, int64_t*);

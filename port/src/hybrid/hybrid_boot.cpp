@@ -10,6 +10,8 @@
 #include <sys/mman.h>
 #include <signal.h>
 #include <errno.h>
+#include <dlfcn.h>
+#include <ucontext.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -30,8 +32,72 @@ void EngineModeCrashDump();             // engine_mode.cpp
 
 // A host fault is fatal and must leave forensics: the engine's EIP ring and the dispatch
 // stack say how guest execution got here — a plain SIGSEGV would not.
-static void FaultDump(int sig, siginfo_t* si, void*) {
+//
+// ...and the EIP ring alone is NOT enough, which the save-game crash taught: it named the
+// shim the guest had escaped into (NtQueryDirectoryFile) but not which HOST line inside it
+// dereferenced what. So the handler now also reports the host pc/lr and walks the frame
+// chain. `dladdr` gives the module and nearest exported symbol; the module-relative OFFSET
+// is the exact answer, resolved offline with
+//   llvm-addr2line -f -C -e port/build-arm64/libtjgame.so <offset>
+// x19..x26 come along free: under the Stage-4 JIT those registers ARE the guest GPRs
+// (JIT_PLAN §2.2), so a fault inside emitted code prints the guest register file too.
+//
+// ⚠ Ordering is deliberate: pc/lr/sp/fp are printed and FLUSHED BEFORE the frame walk,
+// because the walk dereferences stack memory and can itself fault — and a nested fault in
+// a handler whose signal is blocked kills the process silently. The re-entry guard catches
+// the case where it is not blocked.
+// dladdr lives in libdl, which the STATIC binary (tj_headless_static — the qemu det leg)
+// does not link. Declared WEAK so a static link resolves it to null: the frame walk then
+// prints raw addresses there and full names in the dynamic Android build, instead of the
+// whole file failing to link.
+extern "C" __attribute__((weak)) int dladdr(const void* addr, Dl_info* info);
+
+static volatile sig_atomic_t g_inFault = 0;
+
+static void FaultDump(int sig, siginfo_t* si, void* ucv) {
+    if (g_inFault) _Exit(0xF0 + (sig & 0xF));      // fault inside the dump: take what we have
+    g_inFault = 1;
     fprintf(stderr, "\n[boot] FATAL signal %d at %p\n", sig, si ? si->si_addr : nullptr);
+#if defined(__aarch64__)
+    if (ucv) {
+        const mcontext_t& mc = ((ucontext_t*)ucv)->uc_mcontext;
+        const uint64_t pc = mc.pc, lr = mc.regs[30], fp = mc.regs[29];
+        fprintf(stderr, "[boot] host pc=%016llx lr=%016llx sp=%016llx fp=%016llx\n",
+                (unsigned long long)pc, (unsigned long long)lr,
+                (unsigned long long)mc.sp, (unsigned long long)fp);
+        fprintf(stderr, "[boot] w19-w26 (guest GPRs under the JIT) "
+                        "%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                (unsigned)mc.regs[19], (unsigned)mc.regs[20], (unsigned)mc.regs[21],
+                (unsigned)mc.regs[22], (unsigned)mc.regs[23], (unsigned)mc.regs[24],
+                (unsigned)mc.regs[25], (unsigned)mc.regs[26]);
+        fflush(nullptr);                            // everything above survives a nested fault
+
+        uint64_t frame[24]; int n = 0;
+        frame[n++] = pc;
+        if (lr && lr != pc) frame[n++] = lr;
+        for (uint64_t f = fp; n < 24 && f && !(f & 15); ) {
+            const uint64_t next = *(const uint64_t*)f;
+            const uint64_t ret  = *(const uint64_t*)(f + 8);
+            if (!ret) break;
+            frame[n++] = ret;
+            if (next <= f || next - f > (1u << 20)) break;   // stacks grow down; bound the hop
+            f = next;
+        }
+        for (int i = 0; i < n; ++i) {
+            Dl_info di{};
+            if (dladdr && dladdr((void*)frame[i], &di) && di.dli_fname) {
+                const char* base = strrchr(di.dli_fname, '/');
+                fprintf(stderr, "[boot]   #%-2d %016llx  %s+0x%llx  %s\n", i,
+                        (unsigned long long)frame[i], base ? base + 1 : di.dli_fname,
+                        (unsigned long long)(frame[i] - (uint64_t)di.dli_fbase),
+                        di.dli_sname ? di.dli_sname : "");
+            } else {
+                fprintf(stderr, "[boot]   #%-2d %016llx  <unmapped>\n",
+                        i, (unsigned long long)frame[i]);
+            }
+        }
+    }
+#endif
     fflush(nullptr);
     EngineModeCrashDump();
     fflush(nullptr);
