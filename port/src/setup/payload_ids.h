@@ -13,6 +13,10 @@
 #define IDR_VCRUNTIME140_THR   108
 #define IDR_CONCRT140          109
 #define IDR_README             110
+// The Android half: an UNSIGNED, all-STORED template apk — ours, no game data. Absent when
+// the installer is built on a machine with no Android SDK (see TJ_HAVE_APK). The SIGNING KEY
+// is deliberately not here: it is generated per player at first use (apk_build.cpp).
+#define IDR_APK_TEMPLATE       111
 
 #define IDD_MAIN               200
 #define IDC_ISO_PATH           201

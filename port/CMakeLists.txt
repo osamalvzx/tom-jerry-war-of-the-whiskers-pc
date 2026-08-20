@@ -173,6 +173,25 @@ set(TJ_README_TXT  "${CMAKE_CURRENT_SOURCE_DIR}/tools/dist_README.txt")
 set(TJ_LOADER_EXE  "${CMAKE_BINARY_DIR}/bin/Release/tj_loader.exe")
 set(TJ_HYBRID_DLL  "${CMAKE_BINARY_DIR}/bin/Release/tj_hybrid.dll")
 
+# THE ANDROID HALF. The installer builds a self-contained apk on the PLAYER'S machine with
+# no Android SDK, by adding their extracted game files to a template apk and signing the
+# result itself (src/setup/apk_build.cpp). The template is OURS and carries no game data,
+# so embedding it is the same footing as embedding tj_hybrid.dll.
+#
+# It is produced OUTSIDE cmake, by:  port/tools/build_apk.ps1 -Template
+# which needs the Android SDK/NDK — on THIS machine, once, not on any player's. When it is
+# absent the installer still builds and simply offers no Android option (TJ_HAVE_APK).
+set(TJ_APK_TEMPLATE "${CMAKE_CURRENT_SOURCE_DIR}/build-apk/WOTW-template.apk")
+if(EXISTS "${TJ_APK_TEMPLATE}")
+    set(TJ_APK_RC "IDR_APK_TEMPLATE       RCDATA  \"${TJ_APK_TEMPLATE}\"")
+    set(TJ_HAVE_APK 1)
+    message(STATUS "installer: Android template found, the Android option is available")
+else()
+    set(TJ_APK_RC "// no Android template at configure time (run build_apk.ps1 -Template)")
+    set(TJ_HAVE_APK 0)
+    message(STATUS "installer: NO Android template — the installer will be PC-only")
+endif()
+
 # Same VC++ redist the dist folder ships. Windows does not include it; app-local copies are
 # the supported way to avoid making the player install a redist.
 file(GLOB TJ_CRT_DIRS "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Redist/MSVC/*/x86/Microsoft.VC*.CRT")
@@ -197,12 +216,14 @@ if(TJ_CRT_DIRS)
     add_executable(tj_setup WIN32
         src/setup/setup_main.cpp
         src/setup/payload.cpp
+        src/setup/apk_build.cpp
         ${CMAKE_BINARY_DIR}/payload.rc
     )
     add_dependencies(tj_setup tj_loader tj_hybrid)
     target_link_libraries(tj_setup PRIVATE tj_setup_core comctl32 shell32 ole32 shlwapi advapi32 uuid)
     target_include_directories(tj_setup PRIVATE src)
-    target_compile_definitions(tj_setup PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_definitions(tj_setup PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
+                               TJ_HAVE_APK=${TJ_HAVE_APK})
     set_property(TARGET tj_setup PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
     set_target_properties(tj_setup PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin

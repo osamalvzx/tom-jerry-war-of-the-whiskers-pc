@@ -14,6 +14,7 @@ IDR_VCRUNTIME140       RCDATA  "@CRT_VCRUNTIME140@"
 IDR_VCRUNTIME140_THR   RCDATA  "@CRT_VCRUNTIME140_THR@"
 IDR_CONCRT140          RCDATA  "@CRT_CONCRT140@"
 IDR_README             RCDATA  "@TJ_README_TXT@"
+@TJ_APK_RC@
 
 IDD_MAIN DIALOGEX 0, 0, 320, 214
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
@@ -34,7 +35,7 @@ BEGIN
                     BS_AUTOCHECKBOX | WS_TABSTOP, 10, 114, 140, 10
     CONTROL         "Add to the &Start menu", IDC_SC_STARTMENU, "Button",
                     BS_AUTOCHECKBOX | WS_TABSTOP, 160, 114, 140, 10
-    CONTROL         "Also prepare an &Android copy (side-load onto a phone)", IDC_ANDROID, "Button",
+    CONTROL         "Also build an &Android app (one .apk, side-load and play)", IDC_ANDROID, "Button",
                     BS_AUTOCHECKBOX | WS_TABSTOP, 10, 130, 300, 10
     CONTROL         "", IDC_PROGRESS, "msctls_progress32", WS_BORDER, 10, 150, 300, 12
     LTEXT           "", IDC_STATUS, 10, 168, 300, 18

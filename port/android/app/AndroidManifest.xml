@@ -1,16 +1,16 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <!-- WOTW (Tom & Jerry: War of the Whiskers) Android port. Side-load only; ships NO game
      data (the user supplies their own ISO via SAF; extraction happens on-device). No
-     MANAGE_EXTERNAL_STORAGE, no storage permission — SAF hands a file descriptor. -->
+     MANAGE_EXTERNAL_STORAGE, no storage permission â€” SAF hands a file descriptor. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.wotw.port"
     android:versionCode="1"
     android:versionName="0.1">
 
     <!-- minSdk 26: AAudio (the audio output path). The engine itself still targets 24. -->
-    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="29" />
 
-    <!-- LAN play: without INTERNET, socket() fails EPERM ("SOCKET FAILED (1)" — the
+    <!-- LAN play: without INTERNET, socket() fails EPERM ("SOCKET FAILED (1)" â€” the
          session-29 on-device finding). Local-subnet UDP only; nothing leaves the LAN. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -30,7 +30,7 @@
         <!-- configChanges MUST include keyboard|navigation: connecting a gamepad fires a
              keyboard/navigation configuration change, and without these the framework
              DESTROYS the activity mid-game (session-28 device crash: teardown aborted in
-             hwuiTask on a destroyed mutex — the "crash when I connect the controller"). -->
+             hwuiTask on a destroyed mutex â€” the "crash when I connect the controller"). -->
         <activity
             android:name="android.app.NativeActivity"
             android:label="@string/app_name"

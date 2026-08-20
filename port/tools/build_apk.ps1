@@ -11,7 +11,7 @@
 # the app's external files dir (/sdcard/Android/data/com.wotw.port/files/extracted) — the
 # stand-in until the SAF ISO picker + on-device extraction land.
 param([switch]$Install, [string]$Adb = "", [switch]$SkipNative, [switch]$SkipAssets,
-      [switch]$ForceAssets)
+      [switch]$ForceAssets, [switch]$Template)
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path (Split-Path $PSScriptRoot)          # port/tools -> project root
@@ -55,14 +55,33 @@ Write-Host "== aapt2 compile + link =="
 if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed" }
 & $aapt2 link -o "$build\app-unsigned.apk" -I $androidJar `
     --manifest "$appdir\AndroidManifest.xml" `
-    --min-sdk-version 26 --target-sdk-version 34 `
+    --min-sdk-version 26 --target-sdk-version 29 $(if ($Template) { "--no-compress" }) `
     "$build\res.zip"
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
 
 # 3) add the native libs (extractNativeLibs=true, so compression is fine) --------------------
 Write-Host "== packing native libs =="
-& $jar uf "$build\app-unsigned.apk" -C $stage "lib/arm64-v8a/libtjapp.so" -C $stage "lib/arm64-v8a/libtjgame.so"
+# -0 for the template: the INSTALLER re-signs the apk after adding the player's game data,
+# and a v1 (JAR) signature digests every entry's UNCOMPRESSED bytes. Storing everything means
+# the installer never needs an inflate implementation to hash what it copies - it is byte
+# copying and SHA-256, nothing more. Costs ~600 KB in a file about to gain 223 MB of game data.
+$jarFlags = if ($Template) { "u0f" } else { "uf" }
+& $jar $jarFlags "$build\app-unsigned.apk" -C $stage "lib/arm64-v8a/libtjapp.so" -C $stage "lib/arm64-v8a/libtjgame.so"
 if ($LASTEXITCODE -ne 0) { throw "jar add failed" }
+
+# 3b) TEMPLATE MODE: an UNSIGNED, all-STORED apk with NO game data, for the Windows installer
+# to embed. The installer adds the player's own assets/game.pak and writes its own v1
+# signature, so signing here would only be thrown away. This is the artifact that lets the
+# installer build a self-contained apk with NO Android SDK on the player's machine.
+if ($Template) {
+    $tpl = "$build\WOTW-template.apk"
+    # aapt2 honours --no-compress for resources but ALWAYS deflates AndroidManifest.xml;
+    # this pass makes every entry STORED so the installer needs no inflate to hash them.
+    & python "$root\port\tools\apk_store_all.py" "$build\app-unsigned.apk" $tpl
+    if ($LASTEXITCODE -ne 0) { throw "apk_store_all failed" }
+    Write-Host "TEMPLATE: $tpl"
+    return
+}
 
 # 4) align + sign (debug keystore) ----------------------------------------------------------
 Write-Host "== zipalign + apksigner =="

@@ -22,6 +22,7 @@
 #include <android/keycodes.h>
 #include <android/native_window.h>
 #include <android/window.h>        // AWINDOW_FLAG_KEEP_SCREEN_ON / _FULLSCREEN
+#include <android/asset_manager.h>
 #include <aaudio/AAudio.h>         // speaker output for the game's shm PCM ring (minSdk 26)
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -40,6 +41,10 @@
 #include <atomic>
 #include <new>
 #include <vector>
+#include <string>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include "runtime/gfx/d3d8.h"
 #include "android/ipc_protocol.h"
 
@@ -176,6 +181,145 @@ void* ReapThread(void*) {
     return nullptr;
 }
 
+// ---------------------------------------------------------------- first-run game data
+//
+// A self-contained APK carries the player's OWN game files, packed by the installer out of
+// their own disc image. They arrive as ONE uncompressed asset, `assets/game.pak`, and are
+// unpacked here on first launch into the same <external>/extracted/ tree the app has always
+// read. After that the app is byte-for-byte in the state a manual `adb push` would have left
+// it, so nothing downstream — not the game, not the LAN data hash — can tell the difference.
+//
+// WHY ONE PACK FILE INSTEAD OF LOOSE ASSETS. Two reasons, both practical:
+//   * AAssetManager cannot reliably enumerate directories (AAssetDir lists files, not
+//     subdirectories), so walking a 450-file tree of loose assets needs an index anyway;
+//   * a pack lets the INSTALLER stay trivial: it appends one STORED (uncompressed) zip entry
+//     and never needs a deflate implementation. Game textures and audio barely compress, so
+//     this costs almost nothing in size.
+//
+// FORMAT (little-endian): "TJPK", u32 version=1, u32 fileCount,
+//   then fileCount x { u16 pathLen, path bytes ('/'-separated, relative), u64 size },
+//   then every file's bytes back to back in the same order.
+//
+// ⚠ The completeness marker is default.xbe existing at the END of a successful unpack, so a
+// half-finished extraction (killed app, full disk) is retried rather than half-trusted: the
+// pack is unpacked to a .part directory that is only renamed into place once every byte is
+// written.
+namespace {
+
+bool WriteAll(int fd, const void* buf, size_t n) {
+    const uint8_t* p = (const uint8_t*)buf;
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w <= 0) { if (errno == EINTR) continue; return false; }
+        p += w; n -= (size_t)w;
+    }
+    return true;
+}
+
+bool MakeDirsFor(const std::string& path) {
+    for (size_t i = 1; i < path.size(); ++i) {
+        if (path[i] != '/') continue;
+        std::string dir = path.substr(0, i);
+        if (mkdir(dir.c_str(), 0770) != 0 && errno != EEXIST) return false;
+    }
+    return true;
+}
+
+void RemoveTree(const std::string& dir) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    while (dirent* e = readdir(d)) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        std::string sub = dir + "/" + e->d_name;
+        struct stat st {};
+        if (!stat(sub.c_str(), &st) && S_ISDIR(st.st_mode)) RemoveTree(sub);
+        else unlink(sub.c_str());
+    }
+    closedir(d);
+    rmdir(dir.c_str());
+}
+
+// Unpack assets/game.pak into <ext>/extracted/. Returns false only when the pack EXISTS but
+// could not be unpacked; a missing pack is not an error (the dev flow pushes files by adb).
+bool UnpackGameData(android_app* app, const char* ext) {
+    AAssetManager* am = app->activity->assetManager;
+    if (!am) return true;
+    AAsset* pak = AAssetManager_open(am, "game.pak", AASSET_MODE_STREAMING);
+    if (!pak) { LOGI("no packed game data in the apk (expecting pushed files)"); return true; }
+
+    struct Guard { AAsset* a; ~Guard() { AAsset_close(a); } } guard{ pak };
+    char magic[4] = {};
+    uint32_t ver = 0, count = 0;
+    if (AAsset_read(pak, magic, 4) != 4 || memcmp(magic, "TJPK", 4) != 0 ||
+        AAsset_read(pak, &ver, 4) != 4 || ver != 1 ||
+        AAsset_read(pak, &count, 4) != 4 || count == 0 || count > 100000) {
+        LOGE("game.pak header is not valid — refusing to unpack");
+        return false;
+    }
+    struct Ent { std::string path; uint64_t size; };
+    std::vector<Ent> ents;
+    ents.reserve(count);
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint16_t len = 0;
+        if (AAsset_read(pak, &len, 2) != 2 || len == 0 || len > 512) { LOGE("game.pak index"); return false; }
+        std::string path((size_t)len, '\0');
+        if (AAsset_read(pak, &path[0], len) != (int)len) { LOGE("game.pak index"); return false; }
+        uint64_t sz = 0;
+        if (AAsset_read(pak, &sz, 8) != 8) { LOGE("game.pak index"); return false; }
+        if (path.find("..") != std::string::npos || path[0] == '/') { LOGE("game.pak path"); return false; }
+        ents.push_back({ path, sz });
+        total += sz;
+    }
+
+    const std::string dest = std::string(ext) + "/extracted";
+    const std::string part = dest + ".part";
+    RemoveTree(part);
+    LOGI("unpacking %u game files (%llu MB) — first launch only",
+         count, (unsigned long long)(total >> 20));
+
+    std::vector<uint8_t> buf(1u << 20);
+    uint64_t done = 0;
+    int lastPct = -1;
+    for (const Ent& e : ents) {
+        std::string out = part + "/" + e.path;
+        if (!MakeDirsFor(out)) { LOGE("mkdir failed for %s", out.c_str()); RemoveTree(part); return false; }
+        int fd = open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0660);
+        if (fd < 0) { LOGE("create failed for %s (errno %d)", out.c_str(), errno); RemoveTree(part); return false; }
+        uint64_t left = e.size;
+        bool ok = true;
+        while (left) {
+            int want = (int)(left < buf.size() ? left : buf.size());
+            int got = AAsset_read(pak, buf.data(), (size_t)want);
+            if (got != want || !WriteAll(fd, buf.data(), (size_t)got)) { ok = false; break; }
+            left -= (uint64_t)got;
+            done += (uint64_t)got;
+            int pct = total ? (int)(done * 100 / total) : 100;
+            if (pct != lastPct && pct % 10 == 0) { LOGI("unpacking %d%%", pct); lastPct = pct; }
+        }
+        close(fd);
+        if (!ok) { LOGE("short write unpacking %s", e.path.c_str()); RemoveTree(part); return false; }
+    }
+
+    RemoveTree(dest);
+    if (rename(part.c_str(), dest.c_str()) != 0) {
+        LOGE("could not move the unpacked data into place (errno %d)", errno);
+        RemoveTree(part);
+        return false;
+    }
+    LOGI("game data unpacked to %s", dest.c_str());
+    return true;
+}
+
+// default.xbe present == the data is there. Cheap, and it is the file the game is handed.
+bool GameDataPresent(const char* ext) {
+    std::string xbe = std::string(ext) + "/extracted/default.xbe";
+    struct stat st {};
+    return stat(xbe.c_str(), &st) == 0 && st.st_size > 0;
+}
+
+} // namespace
+
 bool SpawnGame(android_app* app) {
     char bin[512];
     if (!GameBinaryPath(bin, sizeof bin)) { LOGE("cannot locate libtjgame.so"); return false; }
@@ -228,6 +372,11 @@ bool SpawnGame(android_app* app) {
     for (int i = 0; i < nFlags; ++i) envp[k++] = flagEnv[i];   // last wins: overrides above
     envp[k] = nullptr;
     char* argv[3] = { bin, xbe, nullptr };
+
+    // Self-contained APK: unpack the player's own game files on first launch. A dev build
+    // whose files were pushed by adb already has them, and skips straight through.
+    if (!GameDataPresent(ext ? ext : ".") && !UnpackGameData(app, ext ? ext : "."))
+        LOGE("game data could not be unpacked — the game will fail to find default.xbe");
 
     LOGI("spawning game: %s %s (game res %dx%d)", bin, xbe, g_gameW, g_gameH);
     pid_t pid = fork();
