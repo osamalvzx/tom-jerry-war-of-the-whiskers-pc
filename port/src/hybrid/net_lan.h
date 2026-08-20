@@ -65,7 +65,9 @@ struct LanGameInfo {           // one row of the server browser
     uint8_t  arena;
     uint8_t  locked;           // password required (the password itself never rides here)
     uint8_t  inMatch;
-    uint8_t  compatible;       // build + data hashes match ours
+    uint8_t  compatible;       // SIM CONTRACT + data hashes match ours -- this gates joining
+    uint8_t  sameBuild;        // advisory: identical module bytes (false for PC<->phone)
+    uint8_t  notedBuild;       // internal: the "different build" line has been printed
     uint32_t rttMs;
     uint32_t ageMs;
 };

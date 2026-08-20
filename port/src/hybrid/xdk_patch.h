@@ -19,6 +19,10 @@ namespace tj::hybrid {
 // Overwrite the 5 bytes at `va` with `jmp rel32 -> target`. The original prologue is
 // destroyed (we never call the original after patching). Returns false if va isn't in
 // the mapped image. `label` is for logging.
+// An automatic, platform-independent fingerprint of every patch site installed so far
+// (see the long note at its definition). Read AFTER all Install*() have run.
+uint32_t PatchSetFingerprint();
+
 bool PatchJump(uint32_t va, const Hook& h, const char* label);
 bool PatchJump(uint32_t va, const void* target, const char* label);   // escape-only
 

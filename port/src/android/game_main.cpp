@@ -91,6 +91,18 @@ int main(int argc, char** argv) {
     // reference over a full 149k-frame MEAT leg (session 29) — the in-match interpreter
     // was the ~18 fps bound. no-overwrite: TJ_ENG_FAST=0 in the environment forces EXACT.
     setenv("TJ_ENG_FAST", "1", 0);
+    // JIT M2 by default ON THE PHONE (JIT_PLAN D5's rollout, same shape as FAST above).
+    // MEASURED, and the measurement is the whole point: with the phone at FULL clocks both
+    // JIT-on and JIT-off sit against the 16.67 ms pacing cap and the JIT looks worthless
+    // (1.05-1.12x). But the phone caps its own prime cores to ~1.63 GHz of 4.61 GHz on
+    // battery, and THAT is the state a player is actually in — there, frame-aligned on an
+    // identical scene, M2 is 1.44-1.54x on the heavy frames and pulls 25-29 ms/f back to
+    // 16.6-19.8 ms. It is the difference between slow motion and 60 fps when it matters.
+    // Gates: qemu det byte-identical over 8,400 frames (and the M2 battery's six
+    // configurations across two arenas), TJ_ENG_JIT_SELFTEST 75,424 cases / 0 mismatches,
+    // device-verified 86.7% of instructions from emitted blocks with ZERO declines.
+    // no-overwrite: TJ_ENG_JIT=0 in tj_flags.txt forces the interpreter back, no rebuild.
+    setenv("TJ_ENG_JIT", "1", 0);
     printf("[game] shm attached: surface %ux%u ring %u MB\n",
            g_hdr->surfW, g_hdr->surfH, g_hdr->ringBytes >> 20);
 

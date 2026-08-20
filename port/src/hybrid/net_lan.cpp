@@ -28,6 +28,7 @@
 // is what makes two windows on one machine discover each other without any extra config.
 #include "net_lan.h"
 #include "hybrid/meat_rush.h"
+#include "hybrid/xdk_patch.h"   // PatchSetFingerprint (the sim-contract hash)
 #include "net_sync.h"
 
 #ifdef _WIN32
@@ -124,7 +125,13 @@ static const uint32_t kMagic     = 0x314E4A54;   // 'TJN1'
 // 6: JOIN carries the number of players sitting at one PC and the reply grants a seat MASK, so
 // two people can share a machine. Both packets grew, so an older peer must be refused at JOIN
 // rather than left to misparse them.
-static const uint8_t  kProtoVer  = 6;
+// 7: CROSS-PLATFORM PLAY. buildHash stopped being a hash of the module's own bytes (which a
+// Windows .dll and an Android .so can never agree on, so a PC and a phone were refused as
+// "DIFFERENT VERSION" by construction) and became a SIM-CONTRACT hash — see ComputeHashes.
+// The beacon and both JOIN packets also grew the advisory moduleHash/patchFp, so the meaning
+// of an existing field changed AND the layout grew: a peer on 6 must be refused at the
+// version check, where it gets a message that says what to do.
+static const uint8_t  kProtoVer  = 7;
 static const int      kBasePort  = 27100;
 static const int      kPortSpan  = 8;
 static const int      kRing      = 256;          // frames of input history (power of two)
@@ -151,6 +158,7 @@ struct Hdr { uint32_t magic; uint8_t ver, type; uint16_t pad; };
 struct PktBeacon {
     Hdr h; uint32_t sessionId; uint32_t buildHash, dataHash;
     char host[16]; uint8_t players, maxPlayers, mode, arena, locked, inMatch; uint16_t rsv;
+    uint32_t moduleHash, patchFp;      // proto 7, ADVISORY: never gates anything, see below
 };
 struct PktProbe { Hdr h; uint32_t nonce; };
 // ⚠ THE TWO JOIN PACKETS MUST STAY READABLE BY AN OLDER BUILD, or a version mismatch has no
@@ -162,14 +170,18 @@ struct PktProbe { Hdr h; uint32_t nonce; };
 struct PktJoinReq {
     Hdr h; uint32_t sessionId, buildHash, dataHash, pwHash; char name[16];
     uint8_t players, rsv[3];       // how many people are sitting at THIS PC (proto 6)
+    uint32_t moduleHash, patchFp;  // proto 7, ADVISORY
 };
 struct PktJoinRsp {
     Hdr h; uint32_t sessionId; uint8_t ok, nak, slot, players;
     uint32_t buildHash, dataHash;
     uint8_t slotMask, rsv[3];      // every seat granted to this PC, bit s = seat s (proto 6)
+    uint32_t moduleHash, patchFp;  // proto 7, ADVISORY
 };
-static const int kJoinReqV5 = (int)(sizeof(PktJoinReq) - 4);
-static const int kJoinRspV5 = (int)(sizeof(PktJoinRsp) - 4);
+// The old-size floors stay measured from the CURRENT struct so an older packet still parses
+// far enough to be refused with a message. Proto 6 added 4 bytes, proto 7 another 8.
+static const int kJoinReqV5 = (int)(sizeof(PktJoinReq) - 12);
+static const int kJoinRspV5 = (int)(sizeof(PktJoinRsp) - 12);
 struct PktLobby {
     Hdr h; uint32_t sessionId, lobbyVer;
     uint8_t players, mode, arena, hostReadyMask;
@@ -264,6 +276,10 @@ static uint32_t g_joinPwHash = 0;            // client: hash we are offering
 static LanNak   g_lastNak = NAK_NONE;
 static char     g_status[96] = "";
 static uint32_t g_buildHash = 0, g_dataHash = 0;
+// ADVISORY ONLY — carried, logged and shown, never used to refuse anyone. moduleHash is the
+// old buildHash (this module's own bytes); patchFp is xdk_patch's automatic fingerprint of
+// every installed patch site.
+static uint32_t g_moduleHash = 0, g_patchFp = 0;
 
 struct Peer {
     sockaddr_in addr; uint32_t lastRecv, rtt; uint8_t slot; bool active; char name[16];
@@ -384,14 +400,44 @@ static void ScanTree(const char* dir, uint32_t& acc, int depth, int& files) {
 const char* AssetRoot();      // file_io.cpp
 static void ComputeHashes() {
     if (g_buildHash) return;
-    // buildHash = our DLL's actual bytes + the patch-set version + the sim-relevant env
-    // flags. "Same original bytes, same inputs" is the whole determinism argument, so version
-    // skew or a different env-flag set has to be refused at JOIN rather than desync later.
+    // ⚠ buildHash IS A SIM-CONTRACT HASH, NOT A BINARY HASH — and that distinction is what
+    // makes PC<->phone play possible at all.
+    //
+    // It used to be `HashFileContent(our own module)`. That is the strongest possible proxy
+    // for "both peers run identical sim logic" — automatic, impossible to forget — and it is
+    // exactly right between two Windows PCs. But a Windows tj_hybrid.dll and an Android
+    // libtjgame.so are different binaries BY CONSTRUCTION, so it refused every cross-platform
+    // pair as "DIFFERENT VERSION" no matter how identical the simulation was. And it IS
+    // identical: the determinism log is byte-for-byte the same on the physical phone over
+    // 75,601 frames (gate S5c), and an interpreted joiner completed a full lockstep match
+    // against a native host identical over 36,001 frames (gate S3e). The binaries differ; the
+    // simulation does not.
+    //
+    // So the contract is now hashed from the things that ARE the simulation, all of which are
+    // platform-independent:
+    //   * kSimContract   — a version for changes a machine cannot see (a hook BODY changing
+    //                      behaviour at the same site). ⚠ THE ONE MANUAL PIECE: bump it on any
+    //                      sim-affecting change. This is the risk this design accepts.
+    //   * patchFp        — xdk_patch's automatic fingerprint of every installed patch SITE, so
+    //                      adding, removing or moving a hook is caught without anyone
+    //                      remembering anything.
+    //   * kProtoVer      — wire compatibility.
+    //   * the sim env flags — different inputs, different sim.
+    // dataHash (below) already covers the game content, and is XOR-combined and case-folded
+    // precisely so two filesystems agree.
+    //
+    // The module bytes are still computed and still travel, as moduleHash — ADVISORY. It is
+    // logged on both sides and printed when a peer differs, so build skew stays visible and
+    // diagnosable; it just no longer refuses the join.
     char dll[MAX_PATH] = {};
     GetModuleFileNameA((HMODULE)&ComputeHashes, dll, MAX_PATH);
-    uint32_t h = HashFileContent(dll);
-    static const uint32_t kPatchSetVersion = 8;      // bump on ANY sim-affecting patch change
-    h = Fnv32(&kPatchSetVersion, 4, h);
+    g_moduleHash = HashFileContent(dll);
+    g_patchFp = tj::hybrid::PatchSetFingerprint();
+
+    static const uint32_t kSimContract = 9;   // ⚠ BUMP ON ANY SIM-AFFECTING CHANGE
+    uint32_t h = Fnv32(&kSimContract, 4);
+    h = Fnv32(&kProtoVer, 1, h);
+    h = Fnv32(&g_patchFp, 4, h);
     const char* simEnv[] = { "TJ_UNLOCK", "TJ_NOINPUT" };
     for (const char* e : simEnv) {
         char* v = nullptr; size_t n = 0; _dupenv_s(&v, &n, e);
@@ -420,7 +466,8 @@ static void ComputeHashes() {
     }
     d = Fnv32(&files, 4, d ? d : 1u);                // count guards the XOR against pairing
     g_dataHash = d ? d : 1;
-    printf("[lan] build=%08X data=%08X (%d asset files)\n", g_buildHash, g_dataHash, files);
+    printf("[lan] contract=%08X data=%08X (%d asset files)  [advisory module=%08X patch=%08X]\n",
+           g_buildHash, g_dataHash, files, g_moduleHash, g_patchFp);
 }
 
 // ---------------------------------------------------------------- fault injection
@@ -809,6 +856,7 @@ static void SendJoinReq();
 static void FillBeacon(PktBeacon& b) {
     Hdrs(b.h, P_BEACON);
     b.sessionId = g_sessionId; b.buildHash = g_buildHash; b.dataHash = g_dataHash;
+    b.moduleHash = g_moduleHash; b.patchFp = g_patchFp;
     memcpy(b.host, g_gameName, 16);
     b.players = (uint8_t)HostPlayerCount(); b.maxPlayers = kSlots;
     b.mode = g_ruleMode; b.arena = g_ruleArena;
@@ -841,6 +889,16 @@ static void OnBeacon(const PktBeacon& b, const sockaddr_in& from) {
     g.players = b.players; g.maxPlayers = b.maxPlayers; g.mode = b.mode; g.arena = b.arena;
     g.locked = b.locked; g.inMatch = b.inMatch;
     g.compatible = (b.buildHash == g_buildHash && b.dataHash == g_dataHash) ? 1 : 0;
+    g.sameBuild  = (b.moduleHash == g_moduleHash) ? 1 : 0;
+    // A joinable peer running a DIFFERENT BINARY is the normal cross-platform case, not a
+    // fault — but it is worth saying out loud exactly once per session, because if a desync
+    // ever does turn up this line is the first thing anyone will want to see.
+    if (g.compatible && !g.sameBuild && !g.notedBuild) {
+        g.notedBuild = 1;
+        printf("[lan] '%s' runs a different BUILD (module %08X vs %08X, patch %08X vs %08X) "
+               "but the same SIM CONTRACT %08X — joining allowed\n",
+               g.host, b.moduleHash, g_moduleHash, b.patchFp, g_patchFp, g_buildHash);
+    }
     g.ageMs = Now();
     // Joining by address is aimed at a HOST, not at a port -- the other PC took the first
     // free port in the range, which is usually but not always 27100. Its unicast beacon
@@ -858,6 +916,7 @@ static void OnJoinReq(const PktJoinReq& q, const sockaddr_in& from, int len) {
     if (!g_isHost) return;
     PktJoinRsp r{}; Hdrs(r.h, P_JOIN_RSP);
     r.sessionId = g_sessionId; r.buildHash = g_buildHash; r.dataHash = g_dataHash;
+    r.moduleHash = g_moduleHash; r.patchFp = g_patchFp;
     auto nak = [&](LanNak n) { r.ok = 0; r.nak = (uint8_t)n; Send(&r, sizeof r, from); };
     if (q.h.ver != kProtoVer)          { nak(NAK_PROTO); return; }
     if (q.buildHash != g_buildHash)    { nak(NAK_BUILD); return; }
@@ -1375,7 +1434,9 @@ LanNak LanLastNak() { return g_lastNak; }
 const char* LanNakText() {
     switch (g_lastNak) {
     case NAK_FULL:     return "THAT GAME IS FULL";
-    case NAK_BUILD:    return "THAT PLAYER HAS A DIFFERENT VERSION";
+    // Reachable now only when the SIM CONTRACT differs — a real gameplay-affecting mismatch,
+    // not merely a different binary, which cross-platform play makes routine.
+    case NAK_BUILD:    return "THAT PLAYER HAS A DIFFERENT GAME VERSION";
     case NAK_DATA:     return "THAT PLAYER HAS DIFFERENT GAME FILES";
     // The player sees this when the two PCs are on different releases. Say what to DO about it
     // -- "incompatible LAN protocol" is true and completely useless to somebody in a lobby.
@@ -1491,6 +1552,7 @@ const LanGameInfo* LanGameAt(int i) { return (i >= 0 && i < g_gameN) ? &g_games[
 static void SendJoinReq() {
     PktJoinReq q{}; Hdrs(q.h, P_JOIN_REQ);
     q.sessionId = g_sessionId; q.buildHash = g_buildHash; q.dataHash = g_dataHash;
+    q.moduleHash = g_moduleHash; q.patchFp = g_patchFp;
     q.pwHash = g_joinPwHash;
     memcpy(q.name, g_myName, 16);
     q.players = (uint8_t)GetLocalPlayerCount();

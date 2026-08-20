@@ -6,6 +6,26 @@
 
 namespace tj::hybrid {
 
+// THE PATCH-SET FINGERPRINT — an AUTOMATIC, platform-independent identity for the shape of
+// the sim contract. Every successful patch install XORs in Fnv32(label) mixed with its VA, so
+// the value changes the moment a hook is added, removed, or moved, WITHOUT anyone having to
+// remember to bump a constant. XOR because install order is not part of the contract, and the
+// inputs (label text, guest VA) are identical on every platform by construction — unlike the
+// module bytes, which can never match across a .dll and a .so.
+//
+// ⚠ WHAT IT DOES NOT CATCH: a change INSIDE a hook body — same site, same label, different
+// behaviour. That is what net_lan.cpp's kSimContract constant is for. The two are hashed
+// together, and this one exists so the constant is only load-bearing for the cases a machine
+// genuinely cannot see.
+static uint32_t g_patchFp = 0;
+static void NotePatch(uint32_t va, const char* label) {
+    uint32_t h = 2166136261u;
+    for (const char* c = label; c && *c; ++c) { h ^= (uint8_t)*c; h *= 16777619u; }
+    for (int i = 0; i < 4; ++i) { h ^= (uint8_t)(va >> (i * 8)); h *= 16777619u; }
+    g_patchFp ^= h;
+}
+uint32_t PatchSetFingerprint() { return g_patchFp; }
+
 static bool PatchJumpBytes(uint32_t va, const void* target, const char* label) {
     if (!InImage(va, 5)) { printf("[patch] %s: va %08x not in image\n", label, va); return false; }
     DWORD old;
@@ -19,6 +39,7 @@ static bool PatchJumpBytes(uint32_t va, const void* target, const char* label) {
     memcpy(p + 1, &rel, 4);
     VirtualProtect((void*)(uintptr_t)va, 8, old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, 8);
+    NotePatch(va, label);
     return true;
 }
 
@@ -42,6 +63,7 @@ static bool PatchCallBytes(uint32_t va, const void* target, const char* label) {
     memcpy(p + 1, &rel, 4);
     VirtualProtect(p, 8, old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, 8);
+    NotePatch(va, label);
     return true;
 }
 
