@@ -48,6 +48,7 @@ struct InstallJob {
     HWND         dlg = nullptr;
     std::wstring iso, dest;
     bool         scDesktop = true, scStartMenu = true;
+    bool         android = false;      // also write the side-load folder
     volatile LONG cancel = 0;
 
     CRITICAL_SECTION lock;
@@ -209,6 +210,158 @@ static bool Fail(InstallJob* job, const std::wstring& why) {
     return false;
 }
 
+static bool RunToCompletion(const std::wstring& cmdline, const std::wstring& workDir,
+                            DWORD& exitCode, DWORD timeoutMs) {
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+    std::wstring mutableCmd = cmdline;          // CreateProcessW may write to this buffer
+    if (!CreateProcessW(nullptr, &mutableCmd[0], nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr,
+                        workDir.empty() ? nullptr : workDir.c_str(), &si, &pi))
+        return false;
+    DWORD w = WaitForSingleObject(pi.hProcess, timeoutMs);
+    if (w == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+    if (!GetExitCodeProcess(pi.hProcess, &exitCode)) exitCode = 1;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return w != WAIT_TIMEOUT;
+}
+
+// Walk up from `start` looking for the source tree that holds port\tools\build_apk.ps1.
+// The installer is normally run from wherever it was downloaded, so this finds a tree only on
+// a machine that HAS one — which is exactly the machine that can build an APK.
+static bool FindSourceTree(const std::wstring& start, std::wstring& root) {
+    std::wstring dir = start;
+    for (int up = 0; up < 8; ++up) {
+        size_t slash = dir.find_last_of(L'\\');
+        if (slash == std::wstring::npos) break;
+        dir = dir.substr(0, slash);
+        if (GetFileAttributesW((dir + L"\\port\\tools\\build_apk.ps1").c_str())
+                != INVALID_FILE_ATTRIBUTES) { root = dir; return true; }
+    }
+    return false;
+}
+
+static bool WriteTextFileUtf8(const std::wstring& path, const std::string& text) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    BOOL ok = WriteFile(h, text.data(), (DWORD)text.size(), &put, nullptr);
+    CloseHandle(h);
+    return ok && put == text.size();
+}
+
+// ---------------------------------------------------------------- the Android copy
+//
+// Writes <install>\Android\ — the folder a player carries to an ARM64 phone by hand.
+//
+// WHERE THE APK COMES FROM, in order:
+//   1. one sitting beside the installer executable (a machine that already built one);
+//   2. otherwise BUILD IT, by invoking port\tools\build_apk.ps1 out of a source tree found by
+//      walking up from the installer. This is the case that matters: the app is deliberately
+//      NOT bundled (the installer is published and a published APK is ruled out), so building
+//      locally is how a real APK gets made. It needs the Android SDK + NDK and takes a few
+//      minutes;
+//   3. and if there is no source tree or the build fails, the README explains how to build one
+//      by hand. A public download lands here, and says so, instead of pretending.
+//
+// IT COPIES NO GAME ASSETS. The phone needs default.xbe and the three asset trees, and those
+// are already in the install folder one level up — meat-injected and byte-identical to what
+// the phone expects. Duplicating ~220 MB inside the install we just made, to save one
+// drag-and-drop, is a bad trade; the README names the exact items and destination instead.
+static bool PrepareAndroidCopy(InstallJob* job, const std::wstring& dest,
+                               bool& apkIncluded, std::wstring& buildNote) {
+    apkIncluded = false;
+    buildNote.clear();
+    const std::wstring dir = dest + L"\\Android";
+    if (!MakeDirs(dir)) return false;
+    const std::wstring apkOut = dir + L"\\WOTW.apk";
+
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring selfDir(self);
+    size_t slash = selfDir.find_last_of(L'\\');
+    selfDir = (slash == std::wstring::npos) ? L"." : selfDir.substr(0, slash);
+
+    // 1. an APK beside the installer
+    std::wstring beside = selfDir + L"\\WOTW.apk";
+    if (GetFileAttributesW(beside.c_str()) != INVALID_FILE_ATTRIBUTES)
+        apkIncluded = CopyFileW(beside.c_str(), apkOut.c_str(), FALSE) != 0;
+
+    // 2. build one from a source tree
+    std::wstring root;
+    if (!apkIncluded && FindSourceTree(self, root)) {
+        if (job) job->Set(94, L"Building the Android app (a few minutes)\x2026");
+        std::wstring cmd = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" +
+                           root + L"\\port\\tools\\build_apk.ps1\"";
+        DWORD rc = 1;
+        bool ran = RunToCompletion(cmd, root, rc, 15 * 60 * 1000);
+        std::wstring built = root + L"\\port\\build-apk\\WOTW.apk";
+        if (ran && rc == 0 && GetFileAttributesW(built.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            apkIncluded = CopyFileW(built.c_str(), apkOut.c_str(), FALSE) != 0;
+            if (!apkIncluded) buildNote = L"The app was built but could not be copied.";
+        } else if (!ran) {
+            buildNote = L"The Android build did not finish in time.";
+        } else {
+            buildNote = L"The Android build failed (is the Android SDK + NDK installed?).";
+        }
+    } else if (!apkIncluded) {
+        buildNote = L"No source tree beside the installer, so no app could be built.";
+    }
+
+    std::string r;
+    r += "TOM & JERRY: WAR OF THE WHISKERS - ANDROID COPY\r\n";
+    r += "===============================================\r\n\r\n";
+    r += "This folder prepares the game for an ARM64 Android phone. As on the PC, it carries\r\n";
+    r += "NO game data: the files you copy in step 2 come from your own disc image.\r\n\r\n";
+    r += "WHAT YOUR PHONE NEEDS\r\n";
+    r += "  * 64-bit ARM (arm64-v8a). Any modern chip works - Snapdragon, Exynos, Tensor,\r\n";
+    r += "    Dimensity, Kirin. 32-bit-only phones and x86 emulators are NOT supported.\r\n";
+    r += "  * Android 8.0 or newer, and OpenGL ES 3.0 (universal on 64-bit Android).\r\n";
+    r += "  * A gamepad is optional; touch controls work.\r\n\r\n";
+    if (apkIncluded) {
+        r += "STEP 1 - INSTALL THE APP\r\n";
+        r += "  Copy WOTW.apk (in this folder) to the phone and open it. Android will ask you to\r\n";
+        r += "  allow installing from this source; that is the normal side-load prompt.\r\n\r\n";
+    } else {
+        r += "STEP 1 - BUILD THE APP\r\n";
+        r += "  No WOTW.apk could be produced on this machine. The app is not distributed in the\r\n";
+        r += "  installer, so it is built from source: with the Android SDK + NDK installed, run\r\n\r\n";
+        r += "      port\\tools\\build_apk.ps1\r\n\r\n";
+        r += "  from the source tree. That produces port\\build-apk\\WOTW.apk. Copy it to the\r\n";
+        r += "  phone and open it.\r\n\r\n";
+    }
+    r += "STEP 2 - COPY THE GAME FILES\r\n";
+    r += "  Launch the app once first, so it creates its folder. Then, with the phone connected\r\n";
+    r += "  by USB, copy these FOUR items from the install folder (the one containing this\r\n";
+    r += "  Android folder):\r\n\r\n";
+    r += "      default.xbe        GFX\\        AUDMUSIC\\        AUDSoundFX\\\r\n\r\n";
+    r += "  into this folder on the phone:\r\n\r\n";
+    r += "      Android/data/com.wotw.port/files/extracted/\r\n\r\n";
+    r += "  When you are done, the phone should have:\r\n";
+    r += "      Android/data/com.wotw.port/files/extracted/default.xbe\r\n";
+    r += "      Android/data/com.wotw.port/files/extracted/GFX/...\r\n";
+    r += "      Android/data/com.wotw.port/files/extracted/AUDMUSIC/...\r\n";
+    r += "      Android/data/com.wotw.port/files/extracted/AUDSoundFX/...\r\n\r\n";
+    r += "  (If you use adb instead, one push does it:\r\n";
+    r += "      adb push default.xbe GFX AUDMUSIC AUDSoundFX \\\r\n";
+    r += "          /sdcard/Android/data/com.wotw.port/files/extracted/  )\r\n\r\n";
+    r += "STEP 3 - PLAY\r\n";
+    r += "  Open the app. It runs fullscreen in landscape and keeps the screen awake.\r\n\r\n";
+    r += "LAN PLAY WITH THE PC\r\n";
+    r += "  The phone and the PC can play each other over the same Wi-Fi, but ONLY when both\r\n";
+    r += "  were installed from the SAME build and the SAME disc image - the join handshake\r\n";
+    r += "  compares a simulation contract and a data hash and refuses otherwise, naming the\r\n";
+    r += "  reason. If a listed game shows DIFFERENT VERSION, that is what it means.\r\n\r\n";
+    r += "SAVES\r\n";
+    r += "  The phone keeps its saves in the app's own private storage, so uninstalling the app\r\n";
+    r += "  removes them. They are separate from the PC's saves.\r\n";
+    return WriteTextFileUtf8(dir + L"\\README.txt", r);
+}
+
 static bool RunInstall(InstallJob* job) {
     std::string err;
 
@@ -288,6 +441,17 @@ static bool RunInstall(InstallJob* job) {
     MeatInjectResult mr = InjectMeatIntoAllArenas(job->dest.c_str());
     if (mr.failed)
         return Fail(job, L"The game files could not be prepared: " + Widen(mr.firstError));
+
+    if (job->android) {
+        job->Set(93, L"Preparing the Android copy\x2026");
+        bool apk = false;
+        std::wstring note;
+        if (!PrepareAndroidCopy(job, job->dest, apk, note))
+            return Fail(job, L"The Android folder could not be written.");
+        // A failed APK build is NOT a failed install — the PC game is fine and the folder
+        // explains what to do. Say so plainly rather than silently leaving a README.
+        if (!apk) job->Set(96, L"Android: no app built \x2014 " + note);
+    }
 
     job->Set(97, L"Creating shortcuts\x2026");
     // The installer copies itself in as the uninstaller, so Add/Remove Programs has a stable
@@ -400,7 +564,7 @@ static bool       g_running = false;
 
 static void SetControlsEnabled(HWND dlg, bool on) {
     for (int id : { IDC_ISO_PATH, IDC_ISO_BROWSE, IDC_DEST_PATH, IDC_DEST_BROWSE,
-                    IDC_SC_DESKTOP, IDC_SC_STARTMENU, IDC_INSTALL })
+                    IDC_SC_DESKTOP, IDC_SC_STARTMENU, IDC_ANDROID, IDC_INSTALL })
         EnableWindow(GetDlgItem(dlg, id), on);
 }
 
@@ -453,6 +617,7 @@ static INT_PTR CALLBACK MainProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
             g_job.dest = dest;
             g_job.scDesktop = IsDlgButtonChecked(dlg, IDC_SC_DESKTOP) == BST_CHECKED;
             g_job.scStartMenu = IsDlgButtonChecked(dlg, IDC_SC_STARTMENU) == BST_CHECKED;
+            g_job.android = IsDlgButtonChecked(dlg, IDC_ANDROID) == BST_CHECKED;
             g_job.cancel = 0;
             SetControlsEnabled(dlg, false);
             g_running = true;
@@ -655,9 +820,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
     bool amUninstaller = _wcsicmp(selfName, kUninstallExe) == 0 || HasArg(cmdline, L"/uninstall");
 
     int rc = 0;
-    // /silent <iso> <destination>  -- the same install with no UI, and a log next to the exe.
-    // This is what makes the installer testable without a human clicking through UAC, and it
-    // doubles as an unattended install for anyone who wants one.
+    // /silent <iso> <destination> [/android]  -- the same install with no UI, and a log next
+    // to the exe. This is what makes the installer testable without a human clicking through
+    // UAC, and it doubles as an unattended install for anyone who wants one. /android adds the
+    // side-load folder, so the Android path is testable the same way the rest of it is.
     if (HasArg(cmdline, L"/silent")) {
         int argc = 0;
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -684,6 +850,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
         g_job.iso = iso;
         g_job.dest = dest;
         g_job.scDesktop = g_job.scStartMenu = false;   // unattended: no shortcuts by default
+        g_job.android = HasArg(cmdline, L"/android");
         g_job.log = CreateFileW(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (g_job.log != INVALID_HANDLE_VALUE) {

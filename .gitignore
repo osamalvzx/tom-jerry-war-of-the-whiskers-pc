@@ -43,6 +43,9 @@ port/build-null/
 tj_log.txt
 capture_*.*
 *.items.txt
+# ...but the Android launcher icons ARE source. `*.png` above exists to keep captures
+# and screenshots out, and it silently swallowed these the first time they were added.
+!port/android/app/res/**/*.png
 
 # Saves -- never commit, never delete
 _SAVES/

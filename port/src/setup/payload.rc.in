@@ -15,7 +15,7 @@ IDR_VCRUNTIME140_THR   RCDATA  "@CRT_VCRUNTIME140_THR@"
 IDR_CONCRT140          RCDATA  "@CRT_CONCRT140@"
 IDR_README             RCDATA  "@TJ_README_TXT@"
 
-IDD_MAIN DIALOGEX 0, 0, 320, 196
+IDD_MAIN DIALOGEX 0, 0, 320, 214
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Install Tom & Jerry: War of the Whiskers"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -34,10 +34,12 @@ BEGIN
                     BS_AUTOCHECKBOX | WS_TABSTOP, 10, 114, 140, 10
     CONTROL         "Add to the &Start menu", IDC_SC_STARTMENU, "Button",
                     BS_AUTOCHECKBOX | WS_TABSTOP, 160, 114, 140, 10
-    CONTROL         "", IDC_PROGRESS, "msctls_progress32", WS_BORDER, 10, 134, 300, 12
-    LTEXT           "", IDC_STATUS, 10, 152, 300, 18
-    DEFPUSHBUTTON   "&Install", IDC_INSTALL, 196, 174, 54, 16
-    PUSHBUTTON      "Cancel", IDCANCEL, 256, 174, 54, 16
+    CONTROL         "Also prepare an &Android copy (side-load onto a phone)", IDC_ANDROID, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 10, 130, 300, 10
+    CONTROL         "", IDC_PROGRESS, "msctls_progress32", WS_BORDER, 10, 150, 300, 12
+    LTEXT           "", IDC_STATUS, 10, 168, 300, 18
+    DEFPUSHBUTTON   "&Install", IDC_INSTALL, 196, 192, 54, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 256, 192, 54, 16
 END
 
 IDD_UNINSTALL DIALOGEX 0, 0, 268, 110

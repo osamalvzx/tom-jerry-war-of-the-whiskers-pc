@@ -27,6 +27,7 @@
 #define IDC_INTRO              210
 #define IDC_ISO_LABEL          211
 #define IDC_DEST_LABEL         212
+#define IDC_ANDROID            213
 
 #define IDD_UNINSTALL          220
 #define IDC_UN_TEXT            221
