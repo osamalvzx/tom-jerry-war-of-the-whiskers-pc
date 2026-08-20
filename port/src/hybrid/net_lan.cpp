@@ -418,26 +418,44 @@ static void ComputeHashes() {
     //   * kSimContract   — a version for changes a machine cannot see (a hook BODY changing
     //                      behaviour at the same site). ⚠ THE ONE MANUAL PIECE: bump it on any
     //                      sim-affecting change. This is the risk this design accepts.
-    //   * patchFp        — xdk_patch's automatic fingerprint of every installed patch SITE, so
-    //                      adding, removing or moving a hook is caught without anyone
-    //                      remembering anything.
     //   * kProtoVer      — wire compatibility.
     //   * the sim env flags — different inputs, different sim.
     // dataHash (below) already covers the game content, and is XOR-combined and case-folded
     // precisely so two filesystems agree.
     //
-    // The module bytes are still computed and still travel, as moduleHash — ADVISORY. It is
-    // logged on both sides and printed when a peer differs, so build skew stays visible and
-    // diagnosable; it just no longer refuses the join.
+    // ⚠ WHY THE PATCH-SET FINGERPRINT IS *NOT* IN THE CONTRACT, though it is tempting and was
+    // in the first version of this: the two platforms legitimately install DIFFERENT patch
+    // sets. The sound backend differs (dsound shims vs the software mixer), the display path
+    // differs, and the entry binary differs — so a fingerprint over every patch SITE encodes
+    // host plumbing, not simulation, and refuses a cross-platform pair for reasons that have
+    // nothing to do with whether the two sims agree. Measured: PC 114 sites, and the ARM build
+    // does not install the same set. It is also ORDER- and TIMING-dependent (ComputeHashes can
+    // run before every installer has), which a contract must never be.
+    //
+    // It still travels as patchFp — ADVISORY, exactly like moduleHash — so a genuine hook-set
+    // difference between two peers of the SAME platform stays visible and diagnosable. Making
+    // it authoritative would require classifying every site as sim-affecting or not, and
+    // getting that classification wrong is a worse failure than the manual constant below.
     char dll[MAX_PATH] = {};
-    GetModuleFileNameA((HMODULE)&ComputeHashes, dll, MAX_PATH);
+#if defined(_WIN32)
+    // A code address is not an HMODULE: ask for the module CONTAINING this function.
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&ComputeHashes, &self);
+    GetModuleFileNameA(self, dll, MAX_PATH);
+#else
+    GetModuleFileNameA(nullptr, dll, MAX_PATH);   // host_compat: this process's own image
+#endif
     g_moduleHash = HashFileContent(dll);
     g_patchFp = tj::hybrid::PatchSetFingerprint();
 
-    static const uint32_t kSimContract = 9;   // ⚠ BUMP ON ANY SIM-AFFECTING CHANGE
+    // ⚠ BUMP ON ANY SIM-AFFECTING CHANGE. 10: the contract dropped patchFp (see above), so
+    // its VALUE changed even though nothing about the simulation did — and two peers must not
+    // disagree silently about what a contract number means.
+    static const uint32_t kSimContract = 10;
     uint32_t h = Fnv32(&kSimContract, 4);
     h = Fnv32(&kProtoVer, 1, h);
-    h = Fnv32(&g_patchFp, 4, h);
     const char* simEnv[] = { "TJ_UNLOCK", "TJ_NOINPUT" };
     for (const char* e : simEnv) {
         char* v = nullptr; size_t n = 0; _dupenv_s(&v, &n, e);
@@ -1499,6 +1517,17 @@ static void LoadName() {
 #endif
     }
     SanitizeName(g_myName, sizeof g_myName, v);
+}
+
+// TJ_LAN_HASHDUMP=1 — compute and print the contract at STARTUP rather than waiting for the
+// first LanOpen. ComputeHashes is deliberately lazy (it scans 453 asset files), which means a
+// machine that never opens the LAN screen never logs its hashes — and comparing two machines
+// then requires driving BOTH through their menus. This makes "do these two peers agree?" a
+// one-line answer on each side. Off by default; costs nothing when unset.
+void LanContractDump() {
+    char* e = nullptr; size_t n = 0; _dupenv_s(&e, &n, "TJ_LAN_HASHDUMP");
+    const bool on = e && *e && atoi(e) != 0; free(e);
+    if (on) ComputeHashes();
 }
 
 bool LanOpen(bool host, const char* gameName, const char* password) {

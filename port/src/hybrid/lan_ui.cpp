@@ -1675,6 +1675,7 @@ int InstallLanUi() {
     for (int i = 0; i < kTextN; ++i) g_txt[i][0] = 0;
     Txt(T_TITLE5, "LAN GAME");
     printf("[lan] UI installed (%d/6 screen hooks)\n", n);
+    LanContractDump();          // TJ_LAN_HASHDUMP=1 only: log the contract at startup
     return n;
 }
 

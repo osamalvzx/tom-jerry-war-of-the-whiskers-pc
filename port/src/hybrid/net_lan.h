@@ -83,6 +83,8 @@ struct LanSlotInfo {
 // otherwise the browser starts listening. Safe to call repeatedly.
 bool LanOpen(bool host, const char* gameName, const char* password);
 void LanClose(const char* why);
+// TJ_LAN_HASHDUMP=1: print the sim contract at startup (diagnostic; see net_lan.cpp).
+void LanContractDump();
 LanState LanGetState();
 bool LanIsHost();
 

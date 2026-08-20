@@ -1,4 +1,5 @@
 #include "hybrid/xdk_patch.h"
+#include <cstdlib>
 #include "hybrid/xbe_image.h"
 #include "hybrid/guest_call.h"
 #include "hybrid/host_compat.h"
@@ -18,11 +19,21 @@ namespace tj::hybrid {
 // together, and this one exists so the constant is only load-bearing for the cases a machine
 // genuinely cannot see.
 static uint32_t g_patchFp = 0;
+// TJ_LAN_PATCHDUMP=1 prints every site as it is installed, so two platforms whose
+// fingerprints disagree can be DIFFED instead of guessed about — which is the whole point of
+// having a fingerprint rather than a version constant.
+static int PatchDumpOn() {
+    static int on = -1;
+    if (on < 0) { char* e = nullptr; size_t n = 0; _dupenv_s(&e, &n, "TJ_LAN_PATCHDUMP");
+                  on = (e && *e && atoi(e)) ? 1 : 0; free(e); }
+    return on;
+}
 static void NotePatch(uint32_t va, const char* label) {
     uint32_t h = 2166136261u;
     for (const char* c = label; c && *c; ++c) { h ^= (uint8_t)*c; h *= 16777619u; }
     for (int i = 0; i < 4; ++i) { h ^= (uint8_t)(va >> (i * 8)); h *= 16777619u; }
     g_patchFp ^= h;
+    if (PatchDumpOn()) printf("[patchfp] %08x %s\n", va, label ? label : "(null)");
 }
 uint32_t PatchSetFingerprint() { return g_patchFp; }
 
