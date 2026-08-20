@@ -7,6 +7,7 @@
 // draw / present / textures) is wired in as the crash-by-crash bring-up reaches it,
 // guided by the D3D8 device-model RE.
 #include "hybrid/xdk_patch.h"
+#include "hybrid/lan_match.h"   // LanFeMgr(), for the arena-select log
 #include "hybrid/guest_call.h"
 #include "hybrid/dsound_stubs.h"
 #include "hybrid/net_lan.h"
@@ -1830,6 +1831,24 @@ static void __stdcall Br_Swap(uint32_t flags) {
     static uint8_t lastMode = 0xFF;
     uint8_t mode = *(volatile uint8_t*)(uintptr_t)0x184661;
     if (mode != lastMode) { printf("[d3d8] frame %d: frontend mode %u -> %u\n", g_frame, lastMode, mode); lastMode = mode; }
+    // WHICH ARENA IS SELECTED. The map carousel index-to-arena mapping has now been wrong
+    // three times (ring size, then direction, then press count), and each time it silently
+    // tested the WRONG map for a whole leg. The game knows the answer -- FE+0x501 is the id
+    // the arena descriptor table is indexed by -- so it reports it instead of being
+    // dead-reckoned from how many presses we think we sent.
+    {
+        static int lastArena = -1;
+        uint32_t fe = LanFeMgr();
+        int a = fe ? (int)*(uint8_t*)(uintptr_t)(fe + 0x501) : -1;
+        if (a != lastArena) {
+            static const char* const kNames[13] = { "KITCHEN","HAUNTED","SCRAPYARD","SHIP",
+                "CABIN","BANQUET","BEACH","SKYSCRAPER","LAB","WILDWEST","BOXING","MARKET",
+                "HELL" };
+            printf("[fe] arena select -> %d (%s)\n", a,
+                   (a >= 0 && a < 13) ? kNames[a] : "?");
+            lastArena = a;
+        }
+    }
     if (g_frame % 400 == 0) {
         // tex/mem census rides along: the live-texture count and working set are the
         // leak canaries (a climb here = the slow-motion-then-crash class of bug).
@@ -2017,6 +2036,8 @@ static const uint32_t kDevTypeGamepad = 0xe7d2c;
 struct ScriptPress { int frame, hold; uint16_t btn; int analogIdx; int16_t lx, ly;
                      int gate;        // -1 = legacy frame token, else required screen id
                      int mapTgt;      // >=0: @map target cursor (gate implied 0x10)
+                     int mapRight;    // >=0: @mapr — press RIGHT exactly this many times
+                     int arenaId;     // >=0: @arena — press RIGHT until FE+0x501 == this
                      int menuOff; };  // >=0: @menu target sel offset (gate implied 4)
 static ScriptPress g_script[160]; static int g_scriptN = -1;   // -1 = not parsed yet
 static void ParseInputScript() {
@@ -2026,12 +2047,27 @@ static void ParseInputScript() {
     for (char* tok = strtok(e, ","); tok && g_scriptN < 160; tok = strtok(nullptr, ",")) {
         ScriptPress& s = g_script[g_scriptN];
         s.frame = 0; s.hold = 12; s.btn = 0; s.analogIdx = -1; s.lx = s.ly = 0;
-        s.gate = -1; s.mapTgt = -1; s.menuOff = -1;
+        s.gate = -1; s.mapTgt = -1; s.menuOff = -1; s.mapRight = -1; s.arenaId = -1;
         char* b;
         if (tok[0] == '@') {
             char* colon = strchr(tok, ':'); if (!colon) continue;
             *colon = 0; b = colon + 1;
             if (!_stricmp(tok + 1, "map"))     { s.mapTgt = atoi(b); s.gate = 0x10; b = nullptr; }
+            // "@mapr:<N>" — press RIGHT exactly N times on the carousel, then A. @map's
+            // shortest-path walk cannot express this, and the arena a given count lands on is
+            // something the USER reads off the screen; counting presses in the direction they
+            // actually pressed is the only description that survives a carousel whose ring
+            // size and direction have both been wrong before.
+            else if (!_stricmp(tok + 1, "mapr")) { s.mapRight = atoi(b); s.gate = 0x10; b = nullptr; }
+            // "@arena:<id>" — THE ONE THAT ACTUALLY WORKS. Press RIGHT until the game says
+            // the selected arena IS the one asked for, then A. Every counting scheme tried
+            // before this got the wrong map: the ring excludes two arenas, RIGHT and LEFT
+            // were inverted, and a press landing during a fade is simply eaten. Reading
+            // FE+0x501 makes all three irrelevant -- it is feedback, not dead reckoning.
+            // ids: 0 KITCHEN 1 HAUNTED 2 SCRAPYARD 3 SHIP 4 CABIN 5 BANQUET 6 BEACH
+            //      7 SKYSCRAPER 8 LAB 9 WILDWEST 10 BOXING 11 MARKET 12 HELL
+            //      (BOXING and HELL are excluded from versus mode and cannot be reached)
+            else if (!_stricmp(tok + 1, "arena")) { s.arenaId = atoi(b); s.gate = 0x10; b = nullptr; }
             else if (!_stricmp(tok + 1, "qg")) { s.menuOff = 1; s.gate = 4; b = nullptr; }
             else                               { s.gate = atoi(tok + 1); }
         } else {
@@ -2061,7 +2097,9 @@ static void ParseInputScript() {
         }
         if (s.gate >= 0)
             printf("[input] script[%d]: gate scr=%d %s\n", g_scriptN,
-                   s.gate, s.mapTgt >= 0 ? "map" : s.menuOff >= 0 ? "menu" : "press");
+                   s.gate, s.mapTgt >= 0 ? "map" : s.arenaId >= 0 ? "arena"
+                                        : s.mapRight >= 0 ? "mapr"
+                                        : s.menuOff >= 0 ? "menu" : "press");
         else
             printf("[input] script[%d]: frame %d hold %d\n", g_scriptN, s.frame, s.hold);
         ++g_scriptN;
@@ -2206,7 +2244,7 @@ static void MergeScript(tj::input::XboxGamepad& gp) {
     if (scr != s.gate) {
         // Screen changed after an activation fired -> token done. Or the flow reached
         // the NEXT token's screen without ever showing ours -> optional-screen skip.
-        bool activation = s.mapTgt >= 0 || s.menuOff >= 0 ||
+        bool activation = s.mapTgt >= 0 || s.mapRight >= 0 || s.arenaId >= 0 || s.menuOff >= 0 ||
                           s.analogIdx == 0 || s.btn == 0x10;
         if (firedOnce && activation) { advance(); return; }
         int ni = nextGated(gi);
@@ -2225,6 +2263,30 @@ static void MergeScript(tj::input::XboxGamepad& gp) {
             firedOnce = 0;            // a watchdog press is not the token firing
         }
         return;                       // not our screen yet -- wait
+    }
+    if (s.arenaId >= 0) {             // @arena:N -- press RIGHT until the game agrees
+        uint32_t fe = LanFeMgr();
+        int cur = fe ? (int)*(uint8_t*)(uintptr_t)(fe + 0x501) : -1;
+        // 120-frame spacing, not the 500 the dead-reckoned walk needs: overshooting is
+        // self-correcting here (keep pressing RIGHT and the ring comes back around), so the
+        // walk can run at the carousel's own pace instead of the pace that guarantees every
+        // press is counted. A 13-arena ring then settles in ~26 s instead of ~110.
+        if (cur == s.arenaId) {
+            if (g_frame - lastAct >= 300) beginPress(0, 0);    // A = SELECT (retries)
+        } else if (g_frame - lastAct >= 120) {
+            beginPress(0x08, -1);                              // 0x08 = RIGHT
+        }
+        return;
+    }
+    if (s.mapRight >= 0) {            // @mapr:N -- N presses RIGHT, then select
+        if (g_mapReck < 0) g_mapReck = 0;                      // carousel resets on entry
+        if (g_mapReck >= s.mapRight) {
+            if (g_frame - lastAct >= 1200) beginPress(0, 0);   // A = SELECT (retries)
+        } else if (g_frame - lastAct >= 500) {
+            beginPress(0x08, -1);                              // 0x08 = RIGHT
+            ++g_mapReck;
+        }
+        return;
     }
     if (s.mapTgt >= 0) {              // @map:N -- dead-reckoned carousel walk
         // The RE'd cursor field (+0x1A6) is DEAD on the live carousel object (stuck at 0

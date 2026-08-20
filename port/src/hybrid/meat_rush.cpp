@@ -387,6 +387,7 @@ static void MeatFrameTick() {
 // lands at the same point in every peer's frame.  A render-phase hook would not -- the render
 // phase can run a different number of times per simulated frame.
 static void MeatDebugTick(uint32_t level);       // TJ_MEATDBG, defined below
+static bool MeatDbgOn();                         // TJ_MEATDBG, shared with the score dump
 
 static void __fastcall Hk_PropSpawner(uint32_t level, uint32_t edx) {
     if (g_applied) { MeatDebugTick(level); MeatFrameTick(); return; }
@@ -439,11 +440,15 @@ static uint32_t LevelBlock() {
 //     bl = (spawn points in state 1,2,4,5) + (item records with kind==1 and state != 0)
 // -- plus the raw per-point states. When the meat stops appearing, this says which half is
 // stuck, which is the difference between a leaked item record and a stuck spawn point.
-static void MeatDebugTick(uint32_t level) {
+static bool MeatDbgOn() {
     static int on = -1;
     if (on < 0) { char* e = nullptr; size_t n = 0; _dupenv_s(&e, &n, "TJ_MEATDBG");
                   on = (e && *e && atoi(e)) ? 1 : 0; free(e); }
-    if (!on || !level) return;
+    return on != 0;
+}
+
+static void MeatDebugTick(uint32_t level) {
+    if (!MeatDbgOn() || !level) return;
     static uint32_t tick = 0;
     if (++tick % 60) return;
 
@@ -594,6 +599,17 @@ static void DrawMeatScores(uint32_t hud) {
         // BELOW the bar with real daylight between them. r[2]/r[3] are the bar's top and
         // bottom edges, so anchoring off r[3] keeps the gap correct at any resolution.
         GCALL(Cdecl, FnHudText, kHudText, hud + 0x10, (r[0] + r[1]) * 0.5f, r[3] + 0.075f, buf);
+        // TJ_MEATDBG=1: the score HUD has never been confirmed ON THE DEVICE (session 29
+        // verified it on Windows and qemu only, and the user reports it missing on Android).
+        // The two things that can make it draw nothing while everything reports success are
+        // an empty panel RECT (FnPanelRect not filling its out-param) and an off-screen
+        // anchor, so print both rather than guess between them.
+        static uint32_t dbgTick = 0;
+        if (i == 0) ++dbgTick;
+        if (MeatDbgOn() && (dbgTick % 60) == 0)
+            printf("[meatdbg] score p%u='%s' rect=%.3f,%.3f,%.3f,%.3f -> x=%.3f y=%.3f\n",
+                   *U8(f + kPlayerNum), buf, r[0], r[1], r[2], r[3],
+                   (r[0] + r[1]) * 0.5f, r[3] + 0.075f);
     }
 }
 

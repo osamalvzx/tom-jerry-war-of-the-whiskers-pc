@@ -90,5 +90,12 @@ uint32_t LanConfigCrc(const LanMatchConfig* c) {
     return ~crc;
 }
 
+// TJ_LAN_HASHDUMP's startup log. The headless leg has no LAN at all, so there is no contract
+// to print — but lan_ui.cpp calls this unconditionally at install, and WITHOUT this stub the
+// aarch64 headless link fails. It did, silently, for part of session 31: `qemu_run.sh` only
+// RUNS the binary, so a broken link left the previous one on disk and det legs kept passing
+// against stale code. Every null-backend entry point lan_ui can reach must exist here.
+void LanContractDump() {}
+
 } // namespace tj::hybrid
 #endif // !_WIN32

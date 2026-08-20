@@ -16,6 +16,11 @@
 #     below 4 GB, so a >4 GB guest-pointer bug is structurally invisible here (gate S5c's
 #     lesson). It also forgives missing icache maintenance, which is why JIT_PLAN §4.3
 #     makes the DEVICE leg mandatory per milestone rather than optional.
+#
+# TJ_QEMU_CPU=<model> emulates a SPECIFIC arm core (qemu-aarch64-static -cpu help lists them:
+# cortex-a53, cortex-a55, cortex-a76, neoverse-n1, ...). That is how "does this run on chips
+# other than the one phone we own" gets ANSWERED rather than argued: a core lacking an
+# instruction the JIT emits faults here, on this machine, in two minutes.
 #   * Never rebuild a binary while a leg is still running it.
 set -u
 ROOT="${TJ_ROOT:-/mnt/d/Projects/Tom and Jerry in War of the Whiskers (U)}"
@@ -33,7 +38,7 @@ cd "$ROOT/port/build-arm64" || exit 1
 env TJ_MMAP_TRUST_FIXED=1 TJ_FAST=1 TJ_NOINPUT=1 TJ_UNLOCK=1 TJ_MEAT=1 \
     TJ_INPUT="$INP" TJ_DETLOG="$OUT/$TAG.det" TJ_ITEMLOG="$OUT/$TAG.items.txt" \
     "$@" \
-    timeout "$SECS" qemu-aarch64-static -B 0x2000000000 "$BIN" "$XBE" \
+    timeout "$SECS" qemu-aarch64-static ${TJ_QEMU_CPU:+-cpu $TJ_QEMU_CPU} -B 0x2000000000 "$BIN" "$XBE" \
     > "$OUT/$TAG.log" 2>&1
 echo "[$TAG] exit=$? det=$(stat -c%s "$OUT/$TAG.det" 2>/dev/null) bytes  frames=$(grep -c '^' "$OUT/$TAG.det" 2>/dev/null)"
 grep -E "FATAL|\[jit\] M[12]|\[eng-mode\] STOPPED" "$OUT/$TAG.log" | tail -4

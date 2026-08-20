@@ -87,9 +87,24 @@ if ($Template) {
 Write-Host "== zipalign + apksigner =="
 & $zipalign -f -p 4 "$build\app-unsigned.apk" "$build\app-aligned.apk"
 if ($LASTEXITCODE -ne 0) { throw "zipalign failed" }
+# SIGN WITH THE INSTALLER'S KEY WHEN THE PLAYER HAS ONE. The installer generates a per-user
+# key at %LOCALAPPDATA%\TomJerryWOW\android-signing.pfx and signs its self-contained apk
+# with it. Android refuses to update an app whose signing certificate changed, so a dev
+# build signed with the debug keystore CANNOT install over an installer-built one --
+# INSTALL_FAILED_UPDATE_INCOMPATIBLE, and the only way out is uninstalling and re-pushing
+# 223 MB of assets. Sharing the identity makes the two interchangeable.
+$playerKey = "$env:LOCALAPPDATA\TomJerryWOW\android-signing.pfx"
 $ks = "$env:USERPROFILE\.android\debug.keystore"
-& $apksigner sign --ks $ks --ks-pass pass:android --ks-key-alias androiddebugkey `
-    --key-pass pass:android --out "$build\WOTW.apk" "$build\app-aligned.apk"
+$ksPass = "pass:android"
+$ksAlias = @("--ks-key-alias", "androiddebugkey")
+if (Test-Path $playerKey) {
+    $ks = $playerKey
+    $ksPass = "pass:tjwow"
+    $ksAlias = @()          # a PFX has one entry; apksigner finds it without an alias
+    Write-Host "   signing with the installer key ($playerKey)"
+}
+& $apksigner sign --ks $ks --ks-pass $ksPass @ksAlias `
+    --out "$build\WOTW.apk" "$build\app-aligned.apk"
 if ($LASTEXITCODE -ne 0) { throw "apksigner failed" }
 
 Write-Host "== verifying =="
