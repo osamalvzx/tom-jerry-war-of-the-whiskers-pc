@@ -149,6 +149,7 @@ inline uint32_t LDRB (uint32_t rt, uint32_t rn, uint32_t byteOff) { return LdStI
 inline uint32_t STRH (uint32_t rt, uint32_t rn, uint32_t byteOff) { return LdStImm(1, 0, rt, rn, byteOff >> 1); }
 inline uint32_t LDRH (uint32_t rt, uint32_t rn, uint32_t byteOff) { return LdStImm(1, 1, rt, rn, byteOff >> 1); }
 inline uint32_t LDRSBw(uint32_t rt, uint32_t rn, uint32_t byteOff){ return LdStImm(0, 3, rt, rn, byteOff); }
+inline uint32_t LDRSHw(uint32_t rt, uint32_t rn, uint32_t byteOff){ return LdStImm(1, 3, rt, rn, byteOff >> 1); }
 
 // ---------------------------------------------------------------- load/store reg offset
 // size | 111 | V=0 | 00 | opc | 1 | Rm | option(3) | S | 10 | Rn | Rt

@@ -379,7 +379,7 @@ struct BlockEmit {
     // contiguous. A tail is reached by exactly one branch, so the registers it reads are
     // live by construction at that point.
     struct Tail { uint8_t kind; bool sideExit; uint32_t lIn, lBack, a, b, c, d; };
-    enum { TK_STORE = 0, TK_X87 = 1 };
+    enum { TK_STORE = 0, TK_X87 = 1, TK_SSE = 2 };
     Tail tail[96];
     uint32_t nTail = 0;
 
@@ -705,6 +705,46 @@ struct BlockEmit {
             FlagsFromNZCV(r, o.form != F_INC_R, /*keepCF=*/true);
             return true;
         }
+        // ---- SSE: the shared SseExec does the work (one implementation of the float
+        // semantics, reached identically by the slow path, the hot path and here). What the
+        // stencil buys is that the BLOCK NO LONGER ENDS at these instructions -- the census
+        // put movaps/mulps/shufps/addps at ~30% of every remaining refusal, and a refusal
+        // costs a dispatcher round trip plus a full interpreter decode.
+        case F_MOV_R8_IMM: {
+            A.MovImm32(W_MEM, o.aux & 0xFF);
+            Reg8Write(o.a, W_MEM);
+            return true;
+        }
+        case F_MOVSX16:
+            if (isReg) A.Put(SBFX(GReg(o.a), GReg(o.rm), 0, 16));
+            else { uint32_t ea = EmitEA(o); A.Put(LDRSHw(GReg(o.a), ea, 0)); }
+            return true;
+        case F_TEST_RM32_IMM: {
+            uint32_t v;
+            if (isReg) v = GReg(o.rm);
+            else { uint32_t ea = EmitEA(o); A.Put(LDRw(W_MEM, ea, 0)); v = W_MEM; }
+            A.MovImm32(W_F2, o.aux);
+            A.Put(ANDS(W_RES, v, W_F2));
+            FlagsLogical(W_RES, true);
+            return true;
+        }
+        case F_SSE: {
+            uint32_t ea = 0;
+            const bool mem = !isReg;
+            if (mem) ea = EmitEA(o);
+            A.Put(MOVX(0, X_CPU));
+            A.Put(MOVZ(1, o.b));
+            A.Put(MOVZ(2, o.rm));
+            A.Put(mem ? MOV(3, ea) : MOV(3, WZR));
+            A.Put(MOVZ(4, o.aux & 0xFF));
+            A.LdLitX(X_P1, (uint64_t)(uintptr_t)(void*)&SseExec);
+            A.Put(BLR(X_P1));
+            guardLive = false;                         // the call clobbered x14
+            const uint32_t lFail = A.NewLabel();
+            A.Cbnz(0, lFail);                          // non-zero = alignment fault
+            AddTail(TK_SSE, false, lFail, 0, o.eip, i, 0, 0);
+            return true;
+        }
         case F_X87: {
             uint32_t ea = 0;
             const bool mem = !isReg;
@@ -814,6 +854,13 @@ struct BlockEmit {
                 }
                 A.LdLitX(X_GUARD, (uint64_t)(uintptr_t)g_jitGuard);   // the call clobbered it
                 A.Br(T.lBack);
+            } else if (T.kind == TK_SSE) {
+                // Alignment fault: leave with eip AT the instruction and nothing written, so
+                // the interpreter re-runs it and raises the fault with its own exact code.
+                // Compile refuses to start a block here, so this cannot spin.
+                EmitSetEip(T.a, W_F0);
+                EmitRetireBack(nOps - T.b);
+                EmitExit(EX_OK);
             } else {                                        // TK_X87: the unit refused
                 EmitSetEip(T.a, W_F0);
                 EmitRetireBack(nOps - T.b);

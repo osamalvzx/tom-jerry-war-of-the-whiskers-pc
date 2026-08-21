@@ -354,6 +354,11 @@ bool Compile(uint32_t entry, Block& b) {
         HotDec& e = g_hotTab[HotHash(eip)];
         if (e.eip != eip || e.gen != g_pageGen[pg]) TryCacheSite(eip);
         if (e.eip != eip || e.form == F_NONE) break;   // the classifier declined (§1.1.2.2)
+        // A memory-operand SSE instruction may appear INSIDE a block but must never be its
+        // ENTRY: its alignment-fault exit resumes at its own eip, and a block starting there
+        // would re-enter, re-fault and spin. Declining the entry hands it to the interpreter,
+        // which owns the fault.
+        if (n == 0 && e.form == F_SSE && !(e.flags & HF_ISREG)) break;
         if (!FormOk(e.form)) break;                   // no executor for it: end the block
 
         // Record the code page (bounded list => bounded prologue check).
@@ -447,7 +452,9 @@ int ExecBlock(CpuState* sp, const Block* bp, uint32_t fsBase,
         g_lbl[F_MOVZX8]      = &&L_MOVZX8;       g_lbl[F_MOVZX16]     = &&L_MOVZX16;
         g_lbl[F_MOVSX8]      = &&L_MOVSX8;       g_lbl[F_X87]         = &&L_X87;
         g_lbl[F_TEST_RM8_R]  = &&L_TEST_RM8_R;   g_lbl[F_TEST_RM8_IMM]= &&L_TEST_RM8_IMM;
-        g_lbl[F_TEST8_AL_IMM]= &&L_TEST8_AL_IMM;
+        g_lbl[F_TEST8_AL_IMM]= &&L_TEST8_AL_IMM; g_lbl[F_SSE]         = &&L_SSE;
+        g_lbl[F_MOV_R8_IMM]  = &&L_MOV_R8_IMM;   g_lbl[F_MOVSX16]     = &&L_MOVSX16;
+        g_lbl[F_TEST_RM32_IMM] = &&L_TEST_RM32_IMM;
         g_lbl[kFormEnd]      = &&L_END;
         g_lblReady = true;
     }
@@ -598,6 +605,37 @@ L_DEC_R: {
     uint32_t cf = s.eflags & F_CF;
     s.r[o->a] = FlagsSub(s, s.r[o->a], 1, 0, 32);
     s.eflags = (s.eflags & ~F_CF) | cf;
+    NEXT();
+}
+L_MOV_R8_IMM:
+    *Reg8(s, o->a) = (uint8_t)o->aux;
+    NEXT();
+L_MOVSX16:
+    s.r[o->a] = (uint32_t)(int32_t)(int16_t)
+                ((o->flags & HF_ISREG) ? (uint16_t)s.r[o->rm] : ld16(EA()));
+    NEXT();
+L_TEST_RM32_IMM: {
+    uint32_t v = (o->flags & HF_ISREG) ? s.r[o->rm] : ld32(EA());
+    FlagsLogic(s, v & o->aux, 32);
+    NEXT();
+}
+L_SSE: {
+    // Like L_X87: the shared SseExec does the work, so there is exactly one implementation
+    // of these semantics. A non-zero return is an alignment fault; it exits with eip AT the
+    // faulting instruction and NOTHING written (SseExec checks alignment before every
+    // store), so the interpreter re-runs it and raises the fault exactly as it always did.
+    uint32_t ea = 0;
+    if (!(o->flags & HF_ISREG)) { ea = EA(); Audit(ea); }
+    if (__builtin_expect(SseExec(s, o->b, o->rm, ea, (uint8_t)o->aux) != 0, 0)) {
+        // Alignment fault. Exit the block CLEANLY with eip AT this instruction and nothing
+        // written (SseExec checks alignment before every store). Run then resumes here, and
+        // because Compile refuses to START a block at a memory-operand SSE instruction, the
+        // dispatcher declines and the INTERPRETER raises the fault with its exact code --
+        // rather than the JIT inventing a second opinion about what the fault should be.
+        s.eip = o->eip;
+        *retired = (uint32_t)(o - ops);
+        return 1;
+    }
     NEXT();
 }
 L_X87: {

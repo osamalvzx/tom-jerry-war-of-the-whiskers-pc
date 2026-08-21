@@ -74,6 +74,16 @@ enum : uint8_t {
     // round trip AND a full slow decode (the hot table holds F_NONE for it), so 84/A8/F6-/0
     // alone were ~15% of all declined instructions in an in-match leg.
     F_TEST_RM8_R, F_TEST_RM8_IMM, F_TEST8_AL_IMM,
+    // SSE (movaps/addps/mulps/shufps). Shaped exactly like F_X87: the raw modrm travels in
+    // `rm`, the second opcode byte in `b`, and the work is done by the shared SseExec, so
+    // the JIT can cover these WITHOUT a second implementation of float semantics -- what it
+    // buys is the block no longer ending here, which is the expensive part.
+    F_SSE,
+    // More of the refusal census, all cheap: B0-B7 (mov r8,imm8), 0F BF (movsx r32,r/m16),
+    // F7 /0 and /1 (test r/m32,imm32). A1/A3 (mov eax,[moffs32]) needed NO new form at all --
+    // an absolute address is just base=-1, idx=-1, disp=addr, which both EA paths already
+    // compute -- so they are classified straight onto the existing mov forms.
+    F_MOV_R8_IMM, F_MOVSX16, F_TEST_RM32_IMM,
 };
 constexpr uint8_t HF_ISREG = 1;      // modrm mod==3: operand is register e.rm
 constexpr uint8_t HF_SEGFS = 2;      // EA adds the fs base
@@ -502,6 +512,51 @@ static const uint8_t* ParseHotModRM(const uint8_t* p, HotRec& r) {
     return p;
 }
 
+// The SSE subset the game's CRT actually uses, in ONE place. It was inline in the slow
+// switch, which meant the hot path and the JIT could not reach it without duplicating it --
+// and a second copy of floating-point semantics is exactly the kind of drift the det logs
+// would catch late and expensively. Shaped like X87Exec deliberately: raw modrm plus a
+// precomputed EA, no decoder state, so emitted code can call it directly.
+// Returns 0 on success, or the fault code the slow path used to raise (unchanged, including
+// its inconsistency: 58/59 fault as the bare op2, the others as 0x0F..). NOTHING is written
+// when a fault is returned -- the alignment check precedes every store, which is what lets
+// the JIT re-run the instruction through the interpreter to raise the fault properly.
+uint32_t SseExec(CpuState& s, uint8_t op2, uint8_t modrm, uint32_t ea, uint8_t imm) {
+    const int reg = (modrm >> 3) & 7, rm = modrm & 7;
+    const bool isReg = (modrm >> 6) == 3;
+    switch (op2) {
+    case 0x28:                                                   // movaps xmm, xmm/m128
+        if (isReg) memcpy(s.xmm[reg], s.xmm[rm], 16);
+        else { if (ea & 15) return 0x0F28; memcpy(s.xmm[reg], (const void*)(uintptr_t)ea, 16); }
+        return 0;
+    case 0x29:                                                   // movaps xmm/m128, xmm
+        if (isReg) memcpy(s.xmm[rm], s.xmm[reg], 16);
+        else { if (ea & 15) return 0x0F29; memcpy((void*)(uintptr_t)ea, s.xmm[reg], 16); }
+        return 0;
+    case 0x58: case 0x59: {                                      // addps / mulps
+        if (!isReg && (ea & 15)) return op2;
+        const void* b = isReg ? (const void*)s.xmm[rm] : (const void*)(uintptr_t)ea;
+        if (op2 == 0x58) HostAddPs(s.xmm[reg], s.xmm[reg], b);
+        else             HostMulPs(s.xmm[reg], s.xmm[reg], b);
+        return 0;
+    }
+    case 0xC6: {                                                 // shufps xmm, xmm/m128, imm8
+        uint8_t src[16];
+        if (isReg) memcpy(src, s.xmm[rm], 16);
+        else { if (ea & 15) return 0x0FC6; memcpy(src, (const void*)(uintptr_t)ea, 16); }
+        uint8_t dst[16]; memcpy(dst, s.xmm[reg], 16);
+        uint8_t out[16];                                          // pure byte moves, no FP
+        memcpy(out + 0,  dst + 4 * ((imm >> 0) & 3), 4);
+        memcpy(out + 4,  dst + 4 * ((imm >> 2) & 3), 4);
+        memcpy(out + 8,  src + 4 * ((imm >> 4) & 3), 4);
+        memcpy(out + 12, src + 4 * ((imm >> 6) & 3), 4);
+        memcpy(s.xmm[reg], out, 16);
+        return 0;
+    }
+    default: return 0xFFFFFFFFu;                                  // not ours
+    }
+}
+
 static void TryCacheSite(uint32_t eipVal) {
     if (g_form8 < 0) {                       // one getenv, on the first classify
         const char* e8 = getenv("TJ_ENG_NOFORM8");
@@ -564,8 +619,22 @@ static void TryCacheSite(uint32_t eipVal) {
     else if (op == 0x83) { WithModRM(F_ALU_RM32_IMM); b = r.reg;
                            aux = (uint32_t)(int32_t)(int8_t)*p++; }
     else if (op == 0x84) { if (!g_form8) return; WithModRM(F_TEST_RM8_R); }
+    else if (op == 0xA1 || op == 0xA3) {            // mov eax,[moffs32] / [moffs32],eax
+        if (!g_form8) return;
+        uint32_t off; memcpy(&off, p, 4); p += 4;
+        form = (op == 0xA1) ? F_MOV_R_RM32 : F_MOV_RM32_R;
+        a = EAX; rmIdx = 0; r.disp = (int32_t)off; r.base = -1; r.idx = -1; r.scale = 0;
+    }
+    else if (op >= 0xB0 && op <= 0xB7) {            // mov r8, imm8
+        if (!g_form8) return;
+        aux = *p++; form = F_MOV_R8_IMM; a = op - 0xB0;
+    }
     else if (op == 0x85) WithModRM(F_TEST_RM32_R);
     else if (op == 0xA8) { if (!g_form8) return; aux = *p++; form = F_TEST8_AL_IMM; }
+    else if (op == 0xF7) { if (!g_form8) return;
+                           WithModRM(F_TEST_RM32_IMM);
+                           if (r.reg > 1) return;        // /0 and /1 are TEST imm32; NOT/NEG/
+                           memcpy(&aux, p, 4); p += 4; } // MUL/DIV stay on the slow path
     else if (op == 0xF6) { if (!g_form8) return;
                            WithModRM(F_TEST_RM8_IMM);
                            if (r.reg > 1) return;        // /0 and /1 are TEST imm8; the rest
@@ -602,6 +671,12 @@ static void TryCacheSite(uint32_t eipVal) {
             form = F_JCC; b = op2 & 15;
             aux = (uint32_t)(uintptr_t)(p + rel);
         }
+        else if (op2 == 0x28 || op2 == 0x29 || op2 == 0x58 || op2 == 0x59 || op2 == 0xC6) {
+            if (!g_form8) return;                    // same A/B switch as the byte forms
+            WithModRM(F_SSE); b = op2; rmIdx = r.raw;
+            if (op2 == 0xC6) aux = *p++;             // shufps selector
+        }
+        else if (op2 == 0xBF) { if (!g_form8) return; WithModRM(F_MOVSX16); }
         else if (op2 == 0xB6) WithModRM(F_MOVZX8);
         else if (op2 == 0xB7) WithModRM(F_MOVZX16);
         else if (op2 == 0xBE) WithModRM(F_MOVSX8);
@@ -914,6 +989,26 @@ RunResult Run(CpuState& s, uint32_t stopEip, uint64_t maxSteps) {
                         case F_MOVSX8: {
                             uint32_t v = (e.flags & HF_ISREG) ? *Reg8(s, e.rm) : ld8(HotEa());
                             s.r[e.a] = (uint32_t)(int32_t)(int8_t)v;
+                            s.eip = e.next; continue;
+                        }
+                        case F_MOV_R8_IMM:
+                            *Reg8(s, e.a) = (uint8_t)e.aux;
+                            s.eip = e.next; continue;
+                        case F_MOVSX16:
+                            s.r[e.a] = (uint32_t)(int32_t)(int16_t)
+                                       ((e.flags & HF_ISREG) ? (uint16_t)s.r[e.rm]
+                                                             : ld16(HotEa()));
+                            s.eip = e.next; continue;
+                        case F_TEST_RM32_IMM: {
+                            uint32_t v = (e.flags & HF_ISREG) ? s.r[e.rm] : ld32(HotEa());
+                            FlagsLogic(s, v & e.aux, 32);
+                            s.eip = e.next; continue;
+                        }
+                        case F_SSE: {
+                            uint32_t ea = 0;
+                            if (!(e.flags & HF_ISREG)) { ea = HotEa(); Audit(ea); }
+                            uint32_t f = SseExec(s, e.b, e.rm, ea, (uint8_t)e.aux);
+                            if (f) return FAULT(f);
                             s.eip = e.next; continue;
                         }
                         case F_X87: {
@@ -1430,49 +1525,12 @@ RunResult Run(CpuState& s, uint32_t stopEip, uint64_t maxSteps) {
             }
             case 0x18: ReadModRM(s, d); break;                     // prefetch hints: no-op
             case 0x1F: ReadModRM(s, d); break;                     // long nop
-            case 0x28: { ReadModRM(s, d);                          // movaps xmm, xmm/m128
-                if (d.isReg) memcpy(s.xmm[d.reg], s.xmm[d.rm], 16);
-                else {
-                    if (d.ea & 15) return FAULT(0x0F28);           // movaps demands 16-align
-                    Audit(d.ea);
-                    memcpy(s.xmm[d.reg], (const void*)(uintptr_t)d.ea, 16);
-                }
-                break;
-            }
-            case 0x29: { ReadModRM(s, d);                          // movaps xmm/m128, xmm
-                if (d.isReg) memcpy(s.xmm[d.rm], s.xmm[d.reg], 16);
-                else {
-                    if (d.ea & 15) return FAULT(0x0F29);
-                    Audit(d.ea);
-                    memcpy((void*)(uintptr_t)d.ea, s.xmm[d.reg], 16);
-                }
-                break;
-            }
-            case 0x58: case 0x59: { ReadModRM(s, d);               // addps / mulps
-                if (!d.isReg && (d.ea & 15)) return FAULT(op2);    // m128 must be aligned
+            case 0x28: case 0x29: case 0x58: case 0x59: case 0xC6: {
+                ReadModRM(s, d);                                   // SSE: see SseExec
+                uint8_t imm = (op2 == 0xC6) ? (uint8_t)Fetch8(d) : 0;
                 if (!d.isReg) Audit(d.ea);
-                const void* b = d.isReg ? (const void*)s.xmm[d.rm]
-                                        : (const void*)(uintptr_t)d.ea;
-                if (op2 == 0x58) HostAddPs(s.xmm[d.reg], s.xmm[d.reg], b);
-                else             HostMulPs(s.xmm[d.reg], s.xmm[d.reg], b);
-                break;
-            }
-            case 0xC6: { ReadModRM(s, d);                          // shufps xmm, xmm/m128, imm8
-                uint8_t sel = Fetch8(d);
-                uint8_t src[16];
-                if (d.isReg) memcpy(src, s.xmm[d.rm], 16);
-                else {
-                    if (d.ea & 15) return FAULT(0x0FC6);
-                    Audit(d.ea);
-                    memcpy(src, (const void*)(uintptr_t)d.ea, 16);
-                }
-                uint8_t dst[16]; memcpy(dst, s.xmm[d.reg], 16);
-                uint8_t out[16];                                    // pure byte moves, no FP
-                memcpy(out + 0,  dst + 4 * ((sel >> 0) & 3), 4);
-                memcpy(out + 4,  dst + 4 * ((sel >> 2) & 3), 4);
-                memcpy(out + 8,  src + 4 * ((sel >> 4) & 3), 4);
-                memcpy(out + 12, src + 4 * ((sel >> 6) & 3), 4);
-                memcpy(s.xmm[d.reg], out, 16);
+                uint32_t f = SseExec(s, op2, d.modrm, d.isReg ? 0 : d.ea, imm);
+                if (f) return FAULT(f);
                 break;
             }
             case 0xBC: case 0xBD: { ReadModRM(s, d);               // bsf / bsr
