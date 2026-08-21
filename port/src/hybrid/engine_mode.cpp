@@ -475,6 +475,36 @@ bool RunGameMainEngine(uint32_t vaGameMain) {
 // engine's headers, and C linkage keeps the bridge free of any engine include -- the bridge
 // must build identically whether or not engine mode is even reachable. Zero on the native
 // path: nothing retires through Run there.
+#if defined(__aarch64__)
+namespace tj::engine::jit {
+void JitCauses(uint64_t* conflict, uint64_t* firstTime);
+}
+#endif
+
+extern "C" void BridgeJitCauses(unsigned long long* conflict) {
+#if defined(__aarch64__)
+    uint64_t c = 0; tj::engine::jit::JitCauses(&c, nullptr);
+    if (conflict) *conflict = (unsigned long long)c;
+#else
+    if (conflict) *conflict = 0;
+#endif
+}
+
+extern "C" void BridgeJitHealth(unsigned long long* compiled, unsigned long long* flushes,
+                                unsigned long long* stale, unsigned long long* declines) {
+#if defined(__aarch64__)
+    uint64_t c = 0, f = 0, s = 0, d = 0;
+    tj::engine::EngineJitHealth(&c, &f, &s, &d);
+    if (compiled) *compiled = (unsigned long long)c;
+    if (flushes)  *flushes  = (unsigned long long)f;
+    if (stale)    *stale    = (unsigned long long)s;
+    if (declines) *declines = (unsigned long long)d;
+#else   // no JIT on x86: the interpreter has no recompile/flush regime to report
+    if (compiled) *compiled = 0; if (flushes)  *flushes  = 0;
+    if (stale)    *stale    = 0; if (declines) *declines = 0;
+#endif
+}
+
 extern "C" void BridgeEngineStats(unsigned long long* insn, unsigned long long* gate) {
     uint64_t i = 0, g = 0;
     tj::engine::EngineStats(&i, &g);

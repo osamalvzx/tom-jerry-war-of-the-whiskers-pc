@@ -119,7 +119,8 @@ set(HYB_GAME_SRC
     ${HYB}/prof.cpp
     ${RT}/snd/xadpcm.cpp
     ${RT}/snd/wav_dump.cpp
-    ${RT}/assets/xmf_texture.cpp)
+    ${RT}/assets/xmf_texture.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/android/perf_hint.cpp)
 add_executable(tj_headless
     ${HYB}/headless_main.cpp
     ${RT}/gfx/null_gfx.cpp
@@ -140,6 +141,8 @@ target_include_directories(tj_headless PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../sr
 # every guest mapping clear of qemu's own low host memory; qemu 8.2 emulates
 # MAP_FIXED_NOREPLACE, so no TJ_MMAP_TRUST_FIXED needed).
 add_executable(tj_headless_static $<TARGET_PROPERTY:tj_headless,SOURCES>)
+# static bionic has no dlopen/dlsym -> the ADPF hint compiles to its no-op here.
+target_compile_definitions(tj_headless_static PRIVATE TJ_NO_DLOPEN=1)
 target_include_directories(tj_headless_static PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_options(tj_headless_static PRIVATE -static "-Wl,--image-base=0xF0000000")
 target_link_libraries(tj_headless_static PRIVATE tj_engine tj_softfloat)
@@ -163,7 +166,6 @@ target_link_libraries(tj_gles PRIVATE GLESv3 EGL android)
 # GLES/EGL — gfx is the ipc ring producer.
 add_executable(tjgame
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/android/game_main.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/android/perf_hint.cpp
     ${RT}/gfx/ipc_gfx.cpp
     ${RT}/snd/mix_snd.cpp
     ${HYB}/net_lan.cpp
@@ -198,6 +200,11 @@ target_link_options(tjapp PRIVATE -u ANativeActivity_onCreate)
 # TJ_MMAP_TRUST_FIXED=1, spawned by ipc_replay_host below.
 add_executable(tjgame_static $<TARGET_PROPERTY:tjgame,SOURCES>)
 target_include_directories(tjgame_static PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# ⚠ static bionic has NO dlopen/dlsym: without this the ADPF hint code (session 32,
+# perf_hint.cpp) leaves 5 undefined symbols and THIS TARGET ALONE fails to link, taking
+# the whole `cmake --build port/build-arm64` with it. perf_hint.cpp already carries the
+# TJ_NO_DLOPEN guard for exactly this case; it just was never wired up here.
+target_compile_definitions(tjgame_static PRIVATE TJ_NO_DLOPEN)
 target_link_options(tjgame_static PRIVATE -static "-Wl,--image-base=0xF0000000")
 target_link_libraries(tjgame_static PRIVATE tj_engine tj_softfloat)
 

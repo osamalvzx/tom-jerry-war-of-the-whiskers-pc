@@ -1,5 +1,9 @@
 #include "perf_hint.h"
-#ifndef _WIN32
+// TJ_NO_DLOPEN: the qemu det rig links -static, and static bionic has no dlopen/dlsym. The
+// hint API is an app-process affordance the headless rig has no use for, so it compiles to
+// the same no-op the Windows build gets. (Keeping the call sites identical everywhere is the
+// point -- the det legs must exercise the same code path shape as the phone.)
+#if !defined(_WIN32) && !defined(TJ_NO_DLOPEN)
 #include <dlfcn.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -71,7 +75,7 @@ void PerfHintReport(int64_t actualNs) {
 }
 
 } // namespace tj::android
-#else   // _WIN32 — the hint API is Android's; the Windows build keeps the same call sites.
+#else   // _WIN32 or a static link: same call sites, no-op body.
 namespace tj::android {
 bool PerfHintEnabled() { return false; }
 bool PerfHintInit(int64_t) { return false; }

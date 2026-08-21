@@ -107,6 +107,12 @@ int JitStep(CpuState& s, uint32_t fsBase, uint64_t stepsUsed, uint64_t maxSteps,
             uint32_t* retired, uint32_t* faultEip);
 
 // TJ_ENG_JIT_STATS / engine.h's EngineJitStats.
+// Runtime-health counters (recompiles / code-cache flushes / stale-block rejections /
+// declines); the frame log diffs them per window to catch a degraded regime.
+void JitHealth(uint64_t* compiled, uint64_t* flushes, uint64_t* stale, uint64_t* declines);
+// Why compiles happen: slot conflict (direct-mapped eviction) vs first-time vs rebuilt.
+void JitCauses(uint64_t* conflict, uint64_t* firstTime);
+
 void JitStats(uint64_t* blocksCompiled, uint64_t* blockEntries, uint64_t* insnsInBlocks,
               uint64_t* sideExits);
 

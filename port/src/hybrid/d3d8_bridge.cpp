@@ -289,6 +289,7 @@ static uint32_t g_drawCalls = 0;                 // DrawVerticesUP calls since l
 static int      g_frame = 0;                     // frames presented (advanced in Br_Swap)
 static uint32_t g_dbgUiDraws = 0, g_dbg3dDraws = 0, g_dbgFvfDraws = 0, g_dbgSkips = 0;  // per-frame path counters
 static uint32_t g_frmTexCreate = 0, g_frmTexUpdate = 0;   // per-frame texture create/update (perf)
+static uint32_t g_texEvict = 0;          // cache evictions per window (thrash canary)
 // --- phase timers (session 12 perf hunt) --------------------------------------
 // The 400-frame log reports ms/f split by phase so slow-motion is attributed by
 // MEASUREMENT, not guesswork (the texture-churn fixes cut GPU/memory cost hugely but
@@ -761,6 +762,11 @@ static tj::gfx::TextureHandle ResolveTexture(void* res) {
         if (g_texCache[slot].h >= 0) g_dev.ReleaseTexture(g_texCache[slot].h);
     } else if (g_texCacheN < 2048) slot = g_texCacheN++;
     else {
+        // EVICTION. Counted because a FULL cache whose working set no longer fits degrades
+        // into evict-and-recreate every frame -- a regime that persists until a level load
+        // rebuilds the cache, which is exactly the shape of "it went slow and stayed slow
+        // until I restarted the map". The scan itself is O(2048) per eviction on top.
+        ++g_texEvict;
         slot = 0;                                // evict least-recently-used
         for (int i = 1; i < g_texCacheN; ++i)
             if (g_texCache[i].lastUse < g_texCache[slot].lastUse) slot = i;
@@ -1410,6 +1416,7 @@ static tj::gfx::TextureHandle ResolvePbTexture(uint32_t texOff, uint32_t texFmt,
     int slot;
     if (g_pbTexCacheN < 2048) slot = g_pbTexCacheN++;
     else {
+        ++g_texEvict;                            // same thrash canary as the resource cache
         slot = 0;                                // evict least-recently-used
         for (int i = 1; i < g_pbTexCacheN; ++i)
             if (g_pbTexCache[i].lastUse < g_pbTexCache[slot].lastUse) slot = i;
@@ -1865,6 +1872,12 @@ extern "C" void BridgeCapture(const char* path) {
 // engine_mode.cpp: guest instructions retired + gate calls, for the frame log's workload
 // column. C linkage so this file needs no engine header (it must build the same either way).
 extern "C" void BridgeEngineStats(unsigned long long* insn, unsigned long long* gate);
+// engine_mode.cpp: JIT recompiles / flush-alls / stale rejections / declines (jit.h JitHealth).
+extern "C" void BridgeJitHealth(unsigned long long* compiled, unsigned long long* flushes,
+                                unsigned long long* stale, unsigned long long* declines);
+// Direct-mapped block-cache collisions (jit.h JitCauses): a self-sustaining recompile
+// regime, and the leading suspect for a match that goes slow and STAYS slow.
+extern "C" void BridgeJitCauses(unsigned long long* conflict);
 
 // D3DDevice_Swap(Flags) ret 4 -- the frame flip. Present + pump the window.
 static void __stdcall Br_Swap(uint32_t flags) {
@@ -1946,6 +1959,20 @@ static void __stdcall Br_Swap(uint32_t flags) {
         printf("[d3d8] captured -> %s\n", g_pendingCap);
         g_pendingCap[0] = 0;
     }
+    // TJ_FRAMES=N: exit cleanly after N presented frames. A wall-clock-bounded leg measures
+    // "frames in 300 s", which cannot compare two builds whose difference is a few percent;
+    // a FRAME-bounded leg measures "seconds for the same 7,800 frames", which can. Exit code
+    // 0 so a harness can tell a completed run from a timeout (124) or a crash.
+    {
+        static int frameCap = -1;
+        if (frameCap < 0) { char* e = nullptr; size_t n = 0; _dupenv_s(&e, &n, "TJ_FRAMES");
+                            frameCap = e ? atoi(e) : 0; free(e); }
+        if (frameCap > 0 && g_frame >= frameCap) {
+            printf("[d3d8] TJ_FRAMES=%d reached — exiting\n", frameCap);
+            fflush(nullptr);
+            _Exit(0);
+        }
+    }
     { extern void FeMenuFrameTick(int); FeMenuFrameTick(g_frame); }
     // Diagnostic: trace the frontend mode byte so we can see the legal->title->menu flow.
     static uint8_t lastMode = 0xFF;
@@ -1984,6 +2011,22 @@ static void __stdcall Br_Swap(uint32_t flags) {
         // Guest instructions retired per frame is workload in the guest's OWN units: flat
         // insn/f with rising ms/f is the DEVICE, rising insn/f is the GAME. Zero when engine
         // mode is off (the native x86 path retires nothing through Run).
+        // REGIME COUNTERS. Steady cost and a degraded regime look identical in ms/f, and
+        // the difference is what the user hit on SHIP: fine, then slow motion that persisted
+        // until the map was restarted. These four say whether work is being rebuilt rather
+        // than merely being slow -- JIT recompiles, code-cache flush-alls, stale-block
+        // rejections (page generations bumping under live blocks), texture-cache evictions.
+        // In a healthy in-match window every one of them is ~0 per frame.
+        static unsigned long long prevComp = 0, prevFlush = 0, prevStale = 0, prevDecl = 0;
+        unsigned long long jComp = 0, jFlush = 0, jStale = 0, jDecl = 0;
+        BridgeJitHealth(&jComp, &jFlush, &jStale, &jDecl);
+        static unsigned long long prevConf = 0;
+        unsigned long long jConf = 0;
+        BridgeJitCauses(&jConf);
+        unsigned long long dConf = jConf - prevConf; prevConf = jConf;
+        unsigned long long dComp = jComp - prevComp, dFlush = jFlush - prevFlush,
+                           dStale = jStale - prevStale, dDecl = jDecl - prevDecl;
+        prevComp = jComp; prevFlush = jFlush; prevStale = jStale; prevDecl = jDecl;
         static unsigned long long prevInsn = 0, prevGate = 0;
         unsigned long long insnNow = 0, gateNow = 0;
         BridgeEngineStats(&insnNow, &gateNow);
@@ -2006,7 +2049,7 @@ static void __stdcall Br_Swap(uint32_t flags) {
         printf("[d3d8] frame %d: %.2fms/f [pb %.2f draw %.2f tex %.2f swap %.2f rest %.2f] "
                "draws ui=%u 3d=%u tex=%d pool=%d cache=%d/%d acq=%u/%u skip=%u dedup=%u "
                "nullbind=%u arena=%uMB cpool=%u/%uMB ws=%zuMB insn=%.0fk/f gate=%.0f/f%s "
-               "texdec %.2f/texupl %.2f (%.0fkpx/f) "
+               "texdec %.2f/texupl %.2f (%.0fkpx/f) regime[recomp %llu conflict %llu flush %llu stale %llu decl %llu evict %u] "
                "stut %u/%u/%u max=%.1f\n",
                g_frame, msPer,
                g_tPb * kms, g_tDraw * kms, g_tTex * kms, g_tSwap * kms,
@@ -2018,10 +2061,11 @@ static void __stdcall Br_Swap(uint32_t flags) {
                ContigPoolLiveMB(), ContigPoolHighMB(),
                (size_t)(pmc.WorkingSetSize >> 20), insnPerF / 1000.0, gatePerF, netbuf,
                g_tTexDec * kms, g_tTexUpl * kms, (double)g_texDecPix / 400.0 / 1000.0,
+               dComp, dConf, dFlush, dStale, dDecl, g_texEvict,
                g_frmOver17, g_frmOver20, g_frmOver33, g_frmMax);
         g_frmTexCreate = g_frmTexUpdate = g_frmTexSkip = g_frmPbDedup = 0;
         g_tPb = g_tDraw = g_tTex = g_tSwap = 0;
-        g_tTexDec = g_tTexUpl = 0; g_texDecPix = 0;
+        g_tTexDec = g_tTexUpl = 0; g_texDecPix = 0; g_texEvict = 0;
         g_frmMax = 0.0; g_frmOver17 = g_frmOver20 = g_frmOver33 = 0;
         // TJ_ENG_PROF2 (session-30 temporary instrumentation): cumulative engine
         // counters + dispatch totals every 400 frames; diff consecutive snaps offline

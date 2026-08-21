@@ -35,11 +35,28 @@ ARENA="${TJ_ARENA:-3}"
 INP="@20:start,@1:start,@4:a,@14:down,@14:down,@14:a,@11:start,@map:$ARENA"
 
 cd "$ROOT/port/build-arm64" || exit 1
+# ⚠ SNAPSHOT THE BINARY BEFORE RUNNING IT. The build directory is shared: a rebuild
+# (another terminal, another agent, an IDE) REWRITES tj_headless_static in place while a
+# leg is executing it, and exec'ing a half-linked ELF is an INSTANT SIGSEGV with an empty
+# log and zero syscalls under -strace -- which reads exactly like "the flag under test
+# crashes the game". Measured: 5 of 6 TJ_ENG_JIT=1 legs died that way against the live
+# path, 3 of 3 ran clean from a private copy of the SAME bytes. Copying is ~7 MB.
+SNAP="$OUT/$TAG.bin"
+cp -f "$BIN" "$SNAP" || exit 1
 env TJ_MMAP_TRUST_FIXED=1 TJ_FAST=1 TJ_NOINPUT=1 TJ_UNLOCK=1 TJ_MEAT=1 \
     TJ_INPUT="$INP" TJ_DETLOG="$OUT/$TAG.det" TJ_ITEMLOG="$OUT/$TAG.items.txt" \
     "$@" \
-    timeout "$SECS" qemu-aarch64-static ${TJ_QEMU_CPU:+-cpu $TJ_QEMU_CPU} -B 0x2000000000 "$BIN" "$XBE" \
+    timeout "$SECS" qemu-aarch64-static ${TJ_QEMU_CPU:+-cpu $TJ_QEMU_CPU} -B 0x2000000000 "$SNAP" "$XBE" \
     > "$OUT/$TAG.log" 2>&1
-echo "[$TAG] exit=$? det=$(stat -c%s "$OUT/$TAG.det" 2>/dev/null) bytes  frames=$(grep -c '^' "$OUT/$TAG.det" 2>/dev/null)"
+RC=$?
+# ⚠ WHICH x87 UNIT RAN. TJ_FAST above is the game's PACING flag; the FPU unit is
+# TJ_ENG_FAST, which the phone's game_main setenv's but this script does not — so an
+# unqualified leg here is an EXACT (SoftFloat) leg, NOT the configuration the phone
+# ships. Both are legitimate det references (FAST must equal EXACT), but M3's x87
+# inlining is FAST-only BY CONSTRUCTION, so an M3 gate run without TJ_ENG_FAST=1
+# measures nothing. Pass it as a KEY=VALUE argument. Never file a leg without this line.
+grep -aq 'FAST unit enabled' "$OUT/$TAG.log" && FPU=FAST || FPU=EXACT
+JIT=$(grep -aoE '\[jit\] (M[12] block tier ON|OFF)' "$OUT/$TAG.log" | head -1)
+echo "[$TAG] exit=$RC fpu=$FPU jit=${JIT:-none} cpu=${TJ_QEMU_CPU:-default} arena=$ARENA det=$(stat -c%s "$OUT/$TAG.det" 2>/dev/null) bytes  frames=$(grep -c '^' "$OUT/$TAG.det" 2>/dev/null)"
 grep -E "FATAL|\[jit\] M[12]|\[eng-mode\] STOPPED" "$OUT/$TAG.log" | tail -4
 tail -2 "$OUT/$TAG.log"

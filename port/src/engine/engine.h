@@ -158,6 +158,8 @@ void EngineSetJit(bool on);
 bool EngineJitArmed();
 void EngineJitStats(uint64_t* blocksCompiled, uint64_t* blockEntries,
                     uint64_t* insnsInBlocks, uint64_t* sideExits);
+// Health counters for the frame log -- see jit.h JitHealth. Zeroed on builds without the JIT.
+void EngineJitHealth(uint64_t* compiled, uint64_t* flushes, uint64_t* stale, uint64_t* declines);
 #endif
 
 // Interpreted-EIP ring for crash forensics: the engine records every instruction's EIP

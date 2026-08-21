@@ -41,7 +41,16 @@ namespace {
 
 constexpr uint32_t kMaxBlockOps = 64;      // §1.1.3 instruction cap
 constexpr uint32_t kMaxPages    = 4;       // §1.1.3 distinct code pages per block
-constexpr int      kBlkBits     = 17;      // 131,072 block slots, direct-mapped
+constexpr int      kBlkBits     = 17;      // 131,072 block slots...
+constexpr uint32_t kBlkWays     = 2;       // ...as 65,536 SETS OF TWO.
+// WHY TWO WAYS, MEASURED: direct-mapped, two hot blocks that hash to one slot evict each
+// other on every visit and each eviction also destroys that block's emitted code and every
+// link bound to it. A qemu leg attributing compiles by cause found 41 of 41 steady-state
+// menu recompiles were slot collisions, and once a match was running, 21,536 of 26,550 in a
+// single 400-frame window -- 54 per frame, escalating, exactly the profile of a session that
+// gets slow and STAYS slow until the map is reloaded and the code lands elsewhere. A second
+// way lets a colliding PAIR coexist, which is the case that actually hurts; the total number
+// of blocks and the memory are unchanged.
 constexpr uint32_t kOpArenaCap  = 1u << 19; // 524,288 ops x 20 B = 10 MB (~110k blocks)
 // M2b: the longest instruction run one dispatcher entry may execute before handing
 // control back to Run's loop. The device and the det legs run maxSteps = ~0ull, so this
@@ -151,13 +160,32 @@ uint64_t g_nDeclines = 0;         // dispatches handed back to the interpreter. 
 uint64_t g_nStale = 0;            // prologue revalidations that REJECTED a matching
                                   // block (a guest store or EngineInvalidateCode bumped
                                   // one of its code pages) — §1.3.1 actually firing
+// WHY a compile happened -- the three causes are indistinguishable in g_nCompiled, and they
+// call for opposite fixes. A steady in-match window should be ~0 of all three.
+uint32_t g_ways = kBlkWays;       // TJ_ENG_JIT_WAYS=1 pins way 0 => the old direct-mapped
+                                  // behaviour, in the SAME binary, for the device A/B.
+uint64_t g_nConflict = 0;         // the slot held a DIFFERENT live entry: direct-mapped
+                                  // collision. Two hot blocks sharing a slot recompile each
+                                  // other forever -- a self-sustaining regime, and one whose
+                                  // occurrence depends on where the guest's code happens to
+                                  // live, i.e. random per match and cleared by a reload.
+uint64_t g_nFirstTime = 0;        // the slot was empty: genuinely new code. Should decay to
+                                  // ~0 once a match is warm.
 uint64_t g_nFellThrough = 0;      // block exits that ran OFF THE END (the next
                                   // instruction is one the classifier declines) rather
                                   // than at a control transfer — i.e. how much of the
                                   // block length is capped by form coverage, not flow
 uint64_t g_statsNext = 0;
 
-inline uint32_t BlockHash(uint32_t eip) { return (eip * 2654435761u) >> (32 - kBlkBits); }
+// The set index. One bit narrower than the old slot index, because each set holds two ways
+// side by side at [set*2] and [set*2+1].
+inline uint32_t BlockSet(uint32_t eip) {
+    return (eip * 2654435761u) >> (32 - kBlkBits + 1);
+}
+// Which way of the set to sacrifice next. NMRU in one byte of the way-0 record's existing
+// pad: a hit stores the way it hit, an eviction takes the other one. No extra memory, and
+// the store lands in a line the lookup already touched.
+inline Block* BlockWays(uint32_t set) { return g_blk + ((size_t)set << 1); }
 
 // §1.3.1 — the per-block generation list IS the form cache's per-instruction check,
 // hoisted to block entry. Stale => the block is never entered again (and, since links
@@ -230,6 +258,9 @@ void StatsLine(const char* why) {
            g_nEntries ? 100.0 * (double)g_nFellThrough / (double)g_nEntries : 0.0,
            (unsigned long long)g_nStale, (unsigned long long)g_nSideExits,
            (unsigned long long)g_nFlushes, g_opUsed, kOpArenaCap);
+    printf("[jit] %s: compile causes: conflict=%llu (direct-mapped slot held another block) "
+           "firstTime=%llu\n", why,
+           (unsigned long long)g_nConflict, (unsigned long long)g_nFirstTime);
     if (g_emitOn) {
         // `entries` above counts DISPATCHER entries -- with M2b, one of those can run a
         // whole CHAIN. g_jitBlockEnters (emitted only under TJ_ENG_JIT_STATS, so it
@@ -253,6 +284,12 @@ void StatsLine(const char* why) {
 // and the differential oracles already proved. Nothing here parses an x86 byte.
 bool Compile(uint32_t entry, Block& b) {
     if (g_nCompiled >= g_maxBlocks) return false;      // the bisect fence
+
+    // Remember what occupied the slot; the attribution happens only if we actually BUILD a
+    // block below. Compile runs on every dispatch miss, including the ~11% of EIPs the
+    // classifier declines -- counting those as conflicts made the number meaningless
+    // (277k "conflicts" against 5.5k compiles in one window).
+    const uint32_t prevEntry = b.entry;
 
     JitOp scratch[kMaxBlockOps + 1];
     uint32_t page[kMaxPages], gen[kMaxPages];
@@ -308,6 +345,11 @@ bool Compile(uint32_t entry, Block& b) {
     uint32_t off = g_opUsed;
     memcpy(g_ops + off, scratch, sizeof(JitOp) * (n + 1));
     g_opUsed += n + 1;
+
+    // A compile that EVICTS a different live block is a direct-mapped collision: the two
+    // will keep displacing each other for as long as both stay hot. An empty slot is simply
+    // new code, which should decay to ~0 once a match is warm.
+    if (prevEntry != 0 && prevEntry != entry) ++g_nConflict; else ++g_nFirstTime;
 
     b.entry = entry; b.opOff = off; b.nOps = (uint16_t)n;
     b.nPages = (uint8_t)nPages; b.pad = 0; b.ordinal = (uint32_t)g_nCompiled;
@@ -608,6 +650,13 @@ void JitInit() {
     }
     if (const char* d = getenv("TJ_ENG_JIT_DUMP"))
         g_dumpVa = (uint32_t)strtoul(d, nullptr, 16);
+    if (const char* w = getenv("TJ_ENG_JIT_WAYS")) {
+        g_ways = (uint32_t)strtoul(w, nullptr, 0);
+        if (g_ways < 1) g_ways = 1;
+        if (g_ways > kBlkWays) g_ways = kBlkWays;
+        printf("[jit] block cache: %u-way (%u sets)%s\n", g_ways, 1u << (kBlkBits - 1),
+               g_ways == 1 ? "  [A/B: direct-mapped, the pre-fix behaviour]" : "");
+    }
     if (const char* st = getenv("TJ_ENG_JIT_STATS")) g_stats = (*st == '1');
     // ---- M2 controls. Emission is ON by default once the tier is armed; NOEMIT is the
     // A/B leg that proves the block substrate itself is unchanged (M1 semantics, M2
@@ -703,6 +752,30 @@ void JitSetEnabled(bool on) {
     printf("[jit] M1 block tier %s (programmatic)\n", g_engaged ? "ON" : "OFF");
 }
 
+// The counters that distinguish a STEADY slow frame from a DEGRADED regime. A match that
+// suddenly runs in slow motion and stays there until the map is restarted is not the sim
+// costing more per instruction -- it is something invalidating and rebuilding work every
+// frame. These three say which: recompiles (blocks being built over and over), flushes (the
+// code cache filling and wiping everything), and stale rejections (page generations bumping
+// under blocks that were fine a moment ago). Deltas per frame window are what matter, so the
+// caller diffs them; all three are ~0/frame in a healthy match.
+void JitHealth(uint64_t* compiled, uint64_t* flushes, uint64_t* stale, uint64_t* declines) {
+    if (compiled) *compiled = g_nCompiled;
+    if (flushes)  *flushes  = g_nFlushes;
+    if (stale)    *stale    = g_nStale;
+    if (declines) *declines = g_nDeclines;
+}
+
+// ⚠ A diagnostic "have I compiled this EIP before" table lived here and SEGFAULTED the qemu
+// leg at boot: in this below-4GB static binary a plain calloc can land INSIDE the guest image
+// window (0x11000..0x10000000) and be wiped when the image is mapped over it. That is exactly
+// what EnsureArenas' overlap check on g_blk/g_ops exists to catch, and a new allocation
+// slipped in without one. conflict/firstTime answer the question without allocating anything.
+void JitCauses(uint64_t* conflict, uint64_t* firstTime) {
+    if (conflict)   *conflict   = g_nConflict;
+    if (firstTime)  *firstTime  = g_nFirstTime;
+}
+
 void JitStats(uint64_t* blocks, uint64_t* entries, uint64_t* insns, uint64_t* sideExits) {
     if (blocks)    *blocks = g_nCompiled;
     if (entries)   *entries = g_nEntries;
@@ -717,16 +790,32 @@ int JitStep(CpuState& s, uint32_t fsBase, uint64_t stepsUsed, uint64_t maxSteps,
     // No window test here: a block only EXISTS for an EIP that was inside both the exec
     // range and the SMC-tracked span at compile time (Compile enforces both), so a hit
     // implies them. A miss lands in Compile, which tests them.
-    // Direct-mapped, like the form cache: a colliding entry is simply overwritten and
-    // the evicted block recompiled the next time it is reached. Compiling is a few
-    // hundred instructions, so eviction costs throughput, never correctness — and the
-    // slot's tag (entry) plus the generation list make a WRONG block unreachable.
+    // TWO-WAY SET ASSOCIATIVE. Way 0 is checked first and is the common hit; way 1 exists
+    // so a colliding PAIR of hot blocks can coexist instead of recompiling each other
+    // forever (see kBlkWays for the measurement that forced this). A tag miss in both ways
+    // -- or a stale hit -- compiles into the NMRU way, so the block just used survives.
+    // Eviction still costs only throughput: the tag plus the generation list keep a wrong
+    // block unreachable, exactly as when this was direct-mapped.
     if (__builtin_expect(g_guardCheck, 0)) GuardVerify();      // M2 debug leg only
-    Block& b = g_blk[BlockHash(eip)];
-    if (__builtin_expect(b.entry != eip || BlockStale(b), 0)) {
-        if (b.entry == eip) ++g_nStale;     // §1.3.1 rejected it: the code bytes moved
-        if (!Compile(eip, b)) { ++g_nDeclines; g_jitLinkReq.site = nullptr; return 0; }
+    Block* ways = BlockWays(BlockSet(eip));
+    Block* pb = &ways[0];
+    if (__builtin_expect(pb->entry != eip, 0) && g_ways > 1 && ways[1].entry == eip) pb = &ways[1];
+    if (__builtin_expect(pb->entry != eip || BlockStale(*pb), 0)) {
+        if (pb->entry == eip) ++g_nStale;   // §1.3.1 rejected it: the code bytes moved
+        // Victim: the way this set did NOT last hit -- pad holds the way we last USED, so
+        // the victim is its complement. (Getting this inversion wrong is not a small loss:
+        // evicting the most-recently-used way measured 42,932 conflicts per 400 frames
+        // against 21,536 for plain direct-mapped, i.e. worse than no associativity at all.) A STALE hit rebuilds in its own way -- that block is being
+        // refreshed, not displaced, so evicting the other way would lose a live block for
+        // nothing. Compile writes pad=0 on the record it fills; the NMRU store below runs
+        // after it, so the order is deliberate.
+        Block* victim = (pb->entry == eip) ? pb
+                                          : &ways[g_ways > 1 ? ((ways[0].pad & 1u) ^ 1u) : 0u];
+        if (!Compile(eip, *victim)) { ++g_nDeclines; g_jitLinkReq.site = nullptr; return 0; }
+        pb = victim;
     }
+    ways[0].pad = (uint8_t)(pb == &ways[1]);   // NMRU: remember the way just used
+    Block& b = *pb;
     // MaxSteps for the FIRST block stays EXACT (better than the plan's block-granular
     // +-64): a block that would overrun the budget is declined and the caller single-steps
     // into it. Inside a CHAIN the budget is enforced at block granularity by the prologue
@@ -789,6 +878,10 @@ int JitStep(CpuState& s, uint32_t fsBase, uint64_t stepsUsed, uint64_t maxSteps,
 void EngineJitStats(uint64_t* blocksCompiled, uint64_t* blockEntries,
                     uint64_t* insnsInBlocks, uint64_t* sideExits) {
     jit::JitStats(blocksCompiled, blockEntries, insnsInBlocks, sideExits);
+}
+void EngineJitHealth(uint64_t* compiled, uint64_t* flushes, uint64_t* stale,
+                     uint64_t* declines) {
+    jit::JitHealth(compiled, flushes, stale, declines);
 }
 bool EngineJitArmed() { return jit::JitArmed(); }
 void EngineSetJit(bool on) { jit::JitSetEnabled(on); }
