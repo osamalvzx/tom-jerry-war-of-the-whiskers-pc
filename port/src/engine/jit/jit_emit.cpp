@@ -343,8 +343,31 @@ bool EnsureThunk() {
 }
 
 // ------------------------------------------------------------------ the block emitter
+// WHERE THE EMITTED WORDS ACTUALLY GO. The emitter's own comment says the EFLAGS-in-memory
+// choice should be revisited "with a measurement, not with a preference", and every estimate
+// of the emitted-code split so far has been a static derivation. These counters are the
+// measurement: compile-time only (no runtime cost whatsoever), attributing every word Put()
+// into the block image to the thing that asked for it. Printed by TJ_ENG_JIT_STATS.
+enum EmitCat { EC_FLAGS = 0, EC_EA, EC_MEM, EC_WORK, EC_FRAME, EC_X87, EC_OTHER,
+               EC_PROLOG, EC_TAIL, EC_N };
+static const char* const kEmitCatName[EC_N] = { "flags", "ea", "mem", "work", "frame",
+                                                "x87", "other", "prolog", "tail" };
+uint64_t g_emitWords[EC_N] = { 0 };
+
 struct BlockEmit {
     Asm A;
+    // Current attribution bucket; Cat scopes it and bills the words emitted while it is set.
+    int cat = EC_OTHER;
+    // Watermark billing: the flag helpers call each other, so a naive "words since entry"
+    // would charge the inner words twice. Every word is billed exactly once, to the
+    // innermost scope that was open when it was emitted.
+    uint32_t billed = 0;
+    struct Cat {
+        BlockEmit& e; int prev; 
+        Cat(BlockEmit& b, int c) : e(b), prev(b.cat) { b.Bill(); b.cat = c; }
+        ~Cat() { e.Bill(); e.cat = prev; }
+    };
+    void Bill() { if (A.n > billed) { g_emitWords[cat] += A.n - billed; billed = A.n; } }
     const JitOp* ops = nullptr;
     uint32_t nOps = 0, entry = 0;
     uint32_t lExit = 0;              // the single `b <epilogue>`, patched after placement
@@ -375,6 +398,7 @@ struct BlockEmit {
     // wraps identically to the interpreter's uint32 arithmetic, and the W-form result
     // zero-extends — which IS the host address. No translation, no bounds check. (P1)
     uint32_t EmitEA(const JitOp& o) {
+        Cat _c(*this, EC_EA);
         const bool hasB = o.base >= 0, hasI = o.idx >= 0;
         const bool fs = (o.flags & HF_SEGFS) != 0;
         if (hasB && !hasI && !fs && o.disp == 0) return GReg(o.base);  // the register IS the EA
@@ -400,6 +424,7 @@ struct BlockEmit {
     // push (whose successor's own prologue check covers the target).
     void EmitStore(uint32_t eaReg, uint32_t valReg, uint32_t size, uint32_t insnIdx,
                    bool sideExit) {
+        Cat _c(*this, EC_MEM);
         EnsureGuard();
         const uint32_t lSlow = A.NewLabel(), lBack = A.NewLabel();
         A.Put(LSRi(W_F0, eaReg, 12));
@@ -425,12 +450,14 @@ struct BlockEmit {
     // hooks, for pushfd and for the interpreter at EVERY instruction boundary: a block
     // exit needs no flag epilogue and a helper call needs no flag sync.
     void EmitParity(uint32_t res) {
+        Cat _c(*this, EC_FLAGS);
         A.LdLitX(X_P0, (uint64_t)(uintptr_t)g_parity);
         A.Put(UXTB(W_F1, res));
         A.Put(LDRBreg(W_F1, X_P0, W_F1));
         A.Put(ORR(W_F0, W_F0, W_F1, 2));
     }
     void EmitMerge(uint32_t clearMask) {
+        Cat _c(*this, EC_FLAGS);
         A.Put(LDRw(W_F1, X_CPU, OFF_EFL));
         A.Put(MOVN(W_F2, clearMask));                 // ~clearMask in a single word
         A.Put(AND(W_F1, W_F1, W_F2));
@@ -438,6 +465,7 @@ struct BlockEmit {
         A.Put(STRw(W_F1, X_CPU, OFF_EFL));
     }
     void FlagsFromNZCV(uint32_t res, bool subLike, bool keepCF) {
+        Cat _c(*this, EC_FLAGS);
         A.Put(CSET(W_F1, C_EQ)); A.Put(ORR(W_F0, WZR, W_F1, 6));      // ZF
         A.Put(CSET(W_F1, C_MI)); A.Put(ORR(W_F0, W_F0, W_F1, 7));     // SF
         A.Put(CSET(W_F1, C_VS)); A.Put(ORR(W_F0, W_F0, W_F1, 11));    // OF
@@ -454,6 +482,7 @@ struct BlockEmit {
     // FlagsLogic: CF=OF=AF=0, ZF/SF/PF from the result. `nzSet` when the producing op was
     // ANDS and already left N/Z correct for the value.
     void FlagsLogical(uint32_t res, bool nzSet) {
+        Cat _c(*this, EC_FLAGS);
         if (!nzSet) A.Put(CMPi(res, 0));
         A.Put(CSET(W_F1, C_EQ)); A.Put(ORR(W_F0, WZR, W_F1, 6));
         A.Put(CSET(W_F1, C_MI)); A.Put(ORR(W_F0, W_F0, W_F1, 7));
@@ -728,6 +757,7 @@ struct BlockEmit {
     }
 
     void EmitTails() {
+        Cat _c(*this, EC_TAIL);
         for (uint32_t t = 0; t < nTail; ++t) {
             const Tail& T = tail[t];
             A.Bind(T.lIn);
@@ -905,6 +935,7 @@ bool EmitBlockCode(const Block& b, const JitOp* ops, void** outCode, void** outB
     E.A.Reset();
     E.ops = ops; E.nOps = b.nOps; E.entry = b.entry;
     E.nTail = 0; E.guardLive = false;
+    E.billed = 0; E.cat = EC_FRAME;      // prologue/epilogue words bill to the frame bucket
     E.lExit = E.A.NewLabel();
 
     // The block's OWN generation list, inside its OWN image: an evicted block whose code
@@ -915,6 +946,7 @@ bool EmitBlockCode(const Block& b, const JitOp* ops, void** outCode, void** outB
     const uint32_t lStale = E.A.NewLabel(), lSlice = E.A.NewLabel();
 
     // ---- prologue (§1.3.1): LINKED entries land here and revalidate the gen list.
+    E.Bill(); E.cat = EC_PROLOG;
     for (uint32_t i = 0; i < b.nPages; ++i) {
         E.A.LdLitX(X_P0, (uint64_t)(uintptr_t)&g_pageGen[b.page[i]]);
         E.A.Put(LDRw(W_F0, X_P0, 0));
@@ -938,8 +970,11 @@ bool EmitBlockCode(const Block& b, const JitOp* ops, void** outCode, void** outB
     E.A.Put(ADDSXi(X_ACC, X_ACC, b.nOps));
     E.A.Bc(C_PL, lSlice);
 
-    for (uint32_t i = 0; i < b.nOps; ++i)
+    E.Bill(); E.cat = EC_FRAME;
+    for (uint32_t i = 0; i < b.nOps; ++i) {
+        BlockEmit::Cat _work(E, EC_WORK);   // the op's own work; its helpers rebill their part
         if (!E.EmitOp(i)) { ++g_nEmitFail; return false; }
+    }
     if (!IsTerminator(ops[b.nOps - 1].form)) {          // ran off the end (decliner/cap/edge)
         E.EmitSetEip(ops[b.nOps].eip, W_F0);
         E.EmitExit(EX_OK);
@@ -957,6 +992,7 @@ bool EmitBlockCode(const Block& b, const JitOp* ops, void** outCode, void** outB
     E.exitWord = E.A.Here();
     E.A.Put(B(0));                                      // patched to the shared epilogue
 
+    E.Bill();                       // tails + epilogue land in the frame bucket
     if (!E.A.Finish()) { ++g_nEmitFail; return false; }
     uint32_t* img = CodePlace(E.A.w, E.A.n);
     if (!img) return false;                             // cache full: the caller flushes

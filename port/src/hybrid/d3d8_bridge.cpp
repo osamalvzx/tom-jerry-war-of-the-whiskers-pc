@@ -1869,6 +1869,29 @@ extern "C" void BridgeCapture(const char* path) {
     strncpy_s(g_pendingCap, path, _TRUNCATE);
 }
 
+// Drop every cache entry keyed by a GAME RESOURCE ADDRESS. Called when the frontend mode
+// changes, i.e. when a level (and its resources) has been torn down: the game reuses those
+// same addresses for different textures afterwards, and an entry that outlives its resource
+// silently becomes a per-frame re-decode of the wrong key. Handles are RELEASED rather than
+// destroyed, so the pool serves the re-creates and the GLES textures stay alive app-side
+// until an explicit destroy — the release is ordered in the same command ring as the draws
+// that still reference them, so nothing in flight can see a freed texture.
+static void DropResourceTextureCaches() {
+    int n = 0;
+    for (int i = 0; i < g_texCacheN; ++i) {
+        if (g_texCache[i].h >= 0) { g_dev.ReleaseTexture(g_texCache[i].h); ++n; }
+        g_texCache[i] = TexCacheEnt{};
+        g_texCache[i].h = tj::gfx::kNoTexture;
+    }
+    g_texCacheN = 0;
+    g_texIndex.clear();
+    // The pushbuffer cache is CONTENT-keyed, so its textures stay valid across a teardown —
+    // but g_pbAlias maps a pushbuffer OFFSET to a content key, and offsets are reused by the
+    // next level with different content. It is documented as a pure optimization, so drop it.
+    g_pbAlias.clear();
+    if (n) printf("[d3d8] level teardown: dropped %d resource-keyed textures\n", n);
+}
+
 // engine_mode.cpp: guest instructions retired + gate calls, for the frame log's workload
 // column. C linkage so this file needs no engine header (it must build the same either way).
 extern "C" void BridgeEngineStats(unsigned long long* insn, unsigned long long* gate);
@@ -1977,7 +2000,22 @@ static void __stdcall Br_Swap(uint32_t flags) {
     // Diagnostic: trace the frontend mode byte so we can see the legal->title->menu flow.
     static uint8_t lastMode = 0xFF;
     uint8_t mode = *(volatile uint8_t*)(uintptr_t)0x184661;
-    if (mode != lastMode) { printf("[d3d8] frame %d: frontend mode %u -> %u\n", g_frame, lastMode, mode); lastMode = mode; }
+    if (mode != lastMode) {
+        printf("[d3d8] frame %d: frontend mode %u -> %u\n", g_frame, lastMode, mode);
+        lastMode = mode;
+        // A MODE CHANGE MEANS THE LEVEL'S RESOURCES DIED. The texture cache is keyed by the
+        // game's RESOURCE ADDRESS, and the game reuses those addresses for entirely
+        // different textures after a teardown -- so a surviving entry becomes "same key,
+        // different bytes" and re-decodes and re-uploads that texture EVERY FRAME, forever.
+        // Measured on Beach: the FIRST play of an arena does zero per-frame texture updates
+        // (acq=121/0 then 0/0); the second and every later play does 20-68 per frame
+        // (acq=0/8184 .. 0/27012) at an IDENTICAL cache size -- nothing evicted, nothing
+        // leaked, purely stale keys. That regime is the entire texture cost this project has
+        // been optimising, and on a display-bound device it is also ~59 uploads and ~15 mip
+        // regenerations per frame in the compositor. Dropping the entries costs a few dozen
+        // one-time re-creates after each transition: exactly what a first play already pays.
+        DropResourceTextureCaches();
+    }
     // WHICH ARENA IS SELECTED. The map carousel index-to-arena mapping has now been wrong
     // three times (ring size, then direction, then press count), and each time it silently
     // tested the WRONG map for a whole leg. The game knows the answer -- FE+0x501 is the id
@@ -2128,7 +2166,26 @@ static void __stdcall Br_Swap(uint32_t flags) {
                 lastScreen = screen;
             }
             cur ^= 1;
-            if (ping[cur] >= 0) g_dev.CopyBackbufferTo(ping[cur]);
+            // ONLY WHILE THE FRONTEND IS UP. This snapshot exists so the NEXT frontend
+            // screen can sample the previous one's last image; in a match nothing samples
+            // it at all -- ResolveTexture returns TransparentTex() for the capture header
+            // whenever mode == 7 (see the tempTex branch there). Capturing anyway cost a
+            // full-screen blit on every in-match frame, which on a weaker GPU is not a
+            // rounding error: the compositor PACES the sim (one present per frame, vsync
+            // on, no frame dropping), so display work over budget becomes literal slow
+            // motion rather than a dropped frame.
+            // ...but not at full rate in a match. IN THE FRONTEND every frame is captured,
+            // because the next screen samples the previous frame's image and a transition can
+            // happen on any frame. IN A MATCH nothing samples it -- ResolveTexture returns
+            // TransparentTex() for the capture header whenever mode == 7 -- so the only thing
+            // the capture is still for is the FIRST frontend screen after the match ends,
+            // which wants the match's last picture. One in eight frames keeps that image at
+            // most 130 ms old (invisible on a background) and removes 87% of the cost: a
+            // full-screen blit per frame is not a rounding error on a weak GPU, and this
+            // thread paces the simulation, so display work over budget becomes slow motion.
+            const bool inMatch = *(volatile uint8_t*)(uintptr_t)0x184661 == 7;
+            if (ping[cur] >= 0 && (!inMatch || (g_frame & 7) == 0))
+                g_dev.CopyBackbufferTo(ping[cur]);
         }
     }
     { PhaseTimer _pt(&g_tSwap); g_dev.EndScene(); g_dev.Present(); }

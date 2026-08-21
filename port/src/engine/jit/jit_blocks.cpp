@@ -162,6 +162,14 @@ uint64_t g_nStale = 0;            // prologue revalidations that REJECTED a matc
                                   // one of its code pages) — §1.3.1 actually firing
 // WHY a compile happened -- the three causes are indistinguishable in g_nCompiled, and they
 // call for opposite fixes. A steady in-match window should be ~0 of all three.
+// WHICH INSTRUCTIONS THE JIT REFUSES, by first opcode byte (0F-prefixed forms counted in a
+// second table). 11.1% of executed instructions are declined, and a declined instruction is
+// several times more expensive than an emitted one -- it costs a dispatcher round trip AND a
+// full interpreter decode, because the interpreter's hot-form cache holds F_NONE for exactly
+// these sites. Ranking them is what turns "widen the form table" from a guess into a work
+// list. Diagnostic only: TJ_ENG_JIT_STATS prints the top entries.
+uint64_t g_declByOp[256] = { 0 };
+uint64_t g_declBy0F[256] = { 0 };
 uint32_t g_ways = kBlkWays;       // TJ_ENG_JIT_WAYS=1 pins way 0 => the old direct-mapped
                                   // behaviour, in the SAME binary, for the device A/B.
 uint64_t g_nConflict = 0;         // the slot held a DIFFERENT live entry: direct-mapped
@@ -258,6 +266,40 @@ void StatsLine(const char* why) {
            g_nEntries ? 100.0 * (double)g_nFellThrough / (double)g_nEntries : 0.0,
            (unsigned long long)g_nStale, (unsigned long long)g_nSideExits,
            (unsigned long long)g_nFlushes, g_opUsed, kOpArenaCap);
+    {   // WHERE THE EMITTED WORDS GO -- compile-time accounting, no runtime cost. This is
+        // the measurement the emitter's own EFLAGS comment asks for before anyone trades
+        // the memory-resident design for a pinned register.
+        extern uint64_t g_emitWords[]; extern const char* const kEmitCatName[];
+        uint64_t tot = 0; for (int i = 0; i < 9; ++i) tot += g_emitWords[i];
+        if (tot) {
+            printf("[jit] %s: emitted words by category (total %llu):", why,
+                   (unsigned long long)tot);
+            for (int i = 0; i < 9; ++i)
+                printf(" %s=%.1f%%", kEmitCatName[i], 100.0 * (double)g_emitWords[i] / (double)tot);
+            printf("\n");
+        }
+    }
+    {   // the refusal census, ranked -- the form-coverage work list
+        struct E { uint64_t n; uint32_t op; bool tf; };
+        E top[12]; int nt = 0;
+        auto push = [&](uint64_t n, uint32_t op, bool tf) {
+            if (!n) return;
+            if (nt < 12) { top[nt++] = { n, op, tf }; }
+            else { int m = 0; for (int i = 1; i < 12; ++i) if (top[i].n < top[m].n) m = i;
+                   if (top[m].n < n) top[m] = { n, op, tf }; }
+        };
+        for (int i = 0; i < 256; ++i) { push(g_declByOp[i], (uint32_t)i, false);
+                                        push(g_declBy0F[i], (uint32_t)i, true); }
+        for (int i = 0; i < nt; ++i)               // simple selection sort, 12 entries
+            for (int j = i + 1; j < nt; ++j) if (top[j].n > top[i].n) { E t = top[i]; top[i] = top[j]; top[j] = t; }
+        if (nt) {
+            printf("[jit] %s: declines by opcode:", why);
+            for (int i = 0; i < nt; ++i)
+                printf(" %s%02X=%.1f%%", top[i].tf ? "0F" : "", top[i].op,
+                       g_nDeclines ? 100.0 * (double)top[i].n / (double)g_nDeclines : 0.0);
+            printf("\n");
+        }
+    }
     printf("[jit] %s: compile causes: conflict=%llu (direct-mapped slot held another block) "
            "firstTime=%llu\n", why,
            (unsigned long long)g_nConflict, (unsigned long long)g_nFirstTime);
@@ -811,7 +853,14 @@ int JitStep(CpuState& s, uint32_t fsBase, uint64_t stepsUsed, uint64_t maxSteps,
         // after it, so the order is deliberate.
         Block* victim = (pb->entry == eip) ? pb
                                           : &ways[g_ways > 1 ? ((ways[0].pad & 1u) ^ 1u) : 0u];
-        if (!Compile(eip, *victim)) { ++g_nDeclines; g_jitLinkReq.site = nullptr; return 0; }
+        if (!Compile(eip, *victim)) {
+            ++g_nDeclines;
+            if (eip >= g_execLo && eip + 1 < g_execHi) {          // census the refusal
+                const uint8_t* p8 = (const uint8_t*)(uintptr_t)eip;
+                if (p8[0] == 0x0F) ++g_declBy0F[p8[1]]; else ++g_declByOp[p8[0]];
+            }
+            g_jitLinkReq.site = nullptr; return 0;
+        }
         pb = victim;
     }
     ways[0].pad = (uint8_t)(pb == &ways[1]);   // NMRU: remember the way just used

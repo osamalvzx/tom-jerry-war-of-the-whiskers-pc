@@ -727,9 +727,14 @@ TextureHandle Device::CreateCaptureTexture() {
     GLuint id = 0; glGenTextures(1, &id);
     glBindTexture(GL_TEXTURE_2D, id);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cw, ch, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    // NO MIP CHAIN. A capture is only ever drawn back as a full-screen background at 1:1,
+    // so no sampler reads a level below 0 -- but the chain was REGENERATED on every
+    // presented frame in CopyBackbufferTo: at 2240x1260 that is ~2.8 Mpx of blit plus an
+    // 11-level filtered chain, ~30 MB of GPU traffic and ~12 render-pass setups PER FRAME,
+    // on levels nothing samples. MAX_LEVEL=0 makes the texture complete with level 0 alone.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     // A color-only FBO wrapping the texture, so CopyBackbufferTo can blit Y-inverted
     // (D3D top-origin content) instead of glCopyTexSubImage2D's bottom-up copy.
     GLuint fbo = 0; glGenFramebuffers(1, &fbo);
@@ -762,8 +767,7 @@ void Device::CopyBackbufferTo(TextureHandle t) {
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, sx, sy,
                             sw < tex.w ? sw : tex.w, sh < tex.h ? sh : tex.h);
     }
-    glBindTexture(GL_TEXTURE_2D, tex.id);
-    glGenerateMipmap(GL_TEXTURE_2D);
+    // (No glGenerateMipmap here: see CreateCaptureTexture -- level 0 is all anything reads.)
 }
 
 bool Device::ResizeBackbuffer(int width, int height) {

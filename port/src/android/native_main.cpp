@@ -575,6 +575,11 @@ std::atomic<bool> g_surfaceDown{true};                  // render -> glue: relea
 tj::gfx::Device g_dev;
 int g_texMap[4096];
 bool     g_compProf = false;                  // TJ_COMP_PROF=1 in the flags file
+// Catch-up frame dropping (TJ_COMP_DROP=0 disables). ON by default because the alternative
+// is worse on exactly the hardware that needs help: this thread paces the simulation, so a
+// compositor that misses the budget slows the GAME down instead of dropping a picture.
+bool     g_compDrop = true;
+uint64_t g_dropped = 0;                       // superseded frames whose draws were skipped
 // TJ_GAME_SCALE=<f> (0.35..1.0): render the game at a fraction of the 16:9 rect, scaled up
 // on present. Two purposes: it is the decisive CPU-vs-GPU experiment for the replay cost
 // (fill rate scales with it, driver call count does not), and if the display leg is
@@ -671,7 +676,18 @@ bool StageFrame(uint64_t tail, uint64_t head) {
 // Pass 2 (and, with slices == nullptr, the whole legacy streaming path). Executes commands
 // until one OP_PRESENT has been consumed or the ring runs dry; the caller swaps.
 // Returns the number of OP_PRESENTs consumed (-1 = stream desync).
-int ReplayRange(const DrawSlice* slices) {
+//
+// skipDraws: consume a frame WITHOUT issuing its draw calls. Used only for a frame that a
+// newer complete frame has already superseded, and it is the difference between a slow GPU
+// dropping frames and a slow GPU slowing the GAME DOWN: the sim is throttled by this thread
+// (the producer blocks at two unconsumed frames, ipc_gfx.cpp Present), and the game advances
+// a FIXED TIMESTEP per frame, so a compositor that cannot hold 16.67 ms drags the simulation
+// into literal slow motion rather than dropping a picture. Skipping only the draws -- every
+// resource, state, render-target and present command still executes in order -- means the
+// dropped frame changes nothing a later frame can observe. It is not the session-30 "frame
+// drop" that flickered: that one presented a PARTIALLY drained frame, whereas this consumes
+// only frames that are already complete and always presents the newest one in full.
+int ReplayRange(const DrawSlice* slices, bool skipDraws = false) {
     using namespace tj::ipc;
     const uint32_t N = g_hdr->ringBytes;
     uint64_t tail = g_hdr->tail.load(std::memory_order_relaxed);
@@ -700,12 +716,14 @@ int ReplayRange(const DrawSlice* slices) {
             } break;
             case OP_DRAW_PC: {
                 uint32_t vc; memcpy(&vc, pl, 4);
-                if (slices) tj::gfx::GlesDrawPCAt(slices[di++].vbOfs, (int)vc);
-                else        g_dev.DrawTriangleList((const tj::gfx::VertexPC*)(pl + 4), (int)vc);
+                if (skipDraws)   { }
+                else if (slices) tj::gfx::GlesDrawPCAt(slices[di++].vbOfs, (int)vc);
+                else             g_dev.DrawTriangleList((const tj::gfx::VertexPC*)(pl + 4), (int)vc);
             } break;
             case OP_DRAW_PTC: {
                 uint32_t hd[2]; memcpy(hd, pl, 8);
-                if (slices) {
+                if (skipDraws) {
+                } else if (slices) {
                     const DrawSlice& sl = slices[di++];
                     tj::gfx::GlesDrawPTCAt(sl.vbOfs, (int)hd[0], sl.ibOfs, (int)hd[1]);
                 } else {
@@ -716,7 +734,8 @@ int ReplayRange(const DrawSlice* slices) {
             } break;
             case OP_DRAW_SHINY: {
                 int32_t hd[6]; memcpy(hd, pl, 24);
-                if (slices) {
+                if (skipDraws) {
+                } else if (slices) {
                     const DrawSlice& sl = slices[di++];
                     tj::gfx::GlesDrawShinyAt(sl.vbOfs, hd[0], sl.ibOfs, hd[1],
                                              mapTex(hd[2]), mapTex(hd[3]), mapTex(hd[4]), mapTex(hd[5]));
@@ -814,6 +833,10 @@ int ReplayRange(const DrawSlice* slices) {
 }
 
 // Returns the number of OP_PRESENTs consumed (-1 = stream desync).
+// Consume one ALREADY-COMPLETE frame without drawing it (see ReplayRange's skipDraws).
+// Deliberately does not stage geometry: nothing will be drawn from it.
+int ReplaySkipFrame() { return ReplayRange(nullptr, true); }
+
 int ReplayRing() {
     if (g_batch) {
         uint64_t tail = g_hdr->tail.load(std::memory_order_relaxed);
@@ -892,7 +915,24 @@ void* RenderThread(void* pv) {
         // time it BLOCKS in Present, which conflates the 60 Hz limiter with waiting for
         // this thread — so the replay+swap split has to be measured on this side to know
         // whether the display leg or the sim is the frame's real bound.
+        // CATCH UP BY DROPPING, NOT BY SLOWING THE GAME DOWN. framesProduced - framesConsumed
+        // is the number of complete frames waiting; anything but the last of them is already
+        // superseded, so its draws are wasted work whose only effect is to hold the producer
+        // at its two-frame cap and stall the simulation. On hardware that comfortably makes
+        // the budget this never fires (the producer is never more than one frame ahead), so
+        // it costs the phone nothing; on a weak GPU it converts slow motion into dropped
+        // frames, which is what a fixed-timestep game needs. TJ_COMP_DROP=0 restores the
+        // strict one-present-per-frame behaviour.
         uint64_t t0 = NowNs(), c0 = NowCpuNs();
+        if (g_compDrop) {
+            for (int guard = 0; guard < 8; ++guard) {
+                uint32_t prod = g_hdr->framesProduced.load(std::memory_order_acquire);
+                uint32_t cons = g_hdr->framesConsumed.load(std::memory_order_acquire);
+                if ((uint32_t)(prod - cons) <= 1) break;   // this is the newest: draw it
+                if (ReplaySkipFrame() <= 0) break;         // ring dry or desync
+                ++g_dropped;
+            }
+        }
         int frames = ReplayRing();
         uint64_t t1 = NowNs(), c1 = NowCpuNs();
         if (frames > 0) {
@@ -902,11 +942,12 @@ void* RenderThread(void* pv) {
             rCpuReplay += c1 - c0; rCpuSwap += c2 - c1;
             if (((++rN) % 400) == 0) {
                 LOGI("comp: replay %.2f ms (cpu %.2f) swap %.2f ms (cpu %.2f) "
-                     "partial %.2f ms (cpu %.2f, n=%.1f) batch %.2f frames/drain (per present)",
+                     "partial %.2f ms (cpu %.2f, n=%.1f) batch %.2f frames/drain (per present) "
+                     "dropped=%llu",
                      rReplay / 400.0 / 1e6, rCpuReplay / 400.0 / 1e6,
                      rSwap / 400.0 / 1e6, rCpuSwap / 400.0 / 1e6,
                      rPart / 400.0 / 1e6, rPartCpu / 400.0 / 1e6, rPartN / 400.0,
-                     rBatch / 400.0);
+                     rBatch / 400.0, (unsigned long long)g_dropped);
                 if (g_compProf) {
                     static const char* kCls[4] = { "draw", "tex", "rt", "state" };
                     for (int i = 0; i < 4; ++i) {
@@ -1028,6 +1069,7 @@ void android_main(android_app* app) {
             char line[256];
             while (fgets(line, sizeof line, f)) {
                 if (strstr(line, "TJ_COMP_PROF=1")) g_compProf = true;
+                if (strstr(line, "TJ_COMP_DROP=0")) g_compDrop = false;
                 if (const char* dg = strstr(line, "TJ_COMP_DIAG="))
                     g_compDiag = (uint32_t)strtoul(dg + 13, nullptr, 0);
                 if (strstr(line, "TJ_COMP_BATCH=0")) g_batch = false;
