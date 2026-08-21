@@ -455,6 +455,8 @@ int ExecBlock(CpuState* sp, const Block* bp, uint32_t fsBase,
         g_lbl[F_TEST8_AL_IMM]= &&L_TEST8_AL_IMM; g_lbl[F_SSE]         = &&L_SSE;
         g_lbl[F_MOV_R8_IMM]  = &&L_MOV_R8_IMM;   g_lbl[F_MOVSX16]     = &&L_MOVSX16;
         g_lbl[F_TEST_RM32_IMM] = &&L_TEST_RM32_IMM;
+        g_lbl[F_ALU8_RM8_R]  = &&L_ALU8_RM8_R;   g_lbl[F_ALU8_R_RM8]  = &&L_ALU8_R_RM8;
+        g_lbl[F_ALU8_AL_IMM] = &&L_ALU8_AL_IMM;  g_lbl[F_ALU8_RM8_IMM]= &&L_ALU8_RM8_IMM;
         g_lbl[kFormEnd]      = &&L_END;
         g_lblReady = true;
     }
@@ -605,6 +607,39 @@ L_DEC_R: {
     uint32_t cf = s.eflags & F_CF;
     s.r[o->a] = FlagsSub(s, s.r[o->a], 1, 0, 32);
     s.eflags = (s.eflags & ~F_CF) | cf;
+    NEXT();
+}
+L_ALU8_R_RM8: {
+    uint8_t v = (o->flags & HF_ISREG) ? *Reg8(s, o->rm) : ld8(EA());
+    uint32_t res = AluOp(s, o->b, *Reg8(s, o->a), v, 8);
+    if (o->b != 7) *Reg8(s, o->a) = (uint8_t)res;
+    NEXT();
+}
+L_ALU8_RM8_R: {
+    if (o->flags & HF_ISREG) {
+        uint32_t res = AluOp(s, o->b, *Reg8(s, o->rm), *Reg8(s, o->a), 8);
+        if (o->b != 7) *Reg8(s, o->rm) = (uint8_t)res;
+        NEXT();
+    }
+    uint32_t ea = EA();
+    uint32_t res = AluOp(s, o->b, ld8(ea), *Reg8(s, o->a), 8);
+    if (o->b != 7) { st8(ea, (uint8_t)res); STORE_CHK(); }
+    NEXT();
+}
+L_ALU8_RM8_IMM: {
+    if (o->flags & HF_ISREG) {
+        uint32_t res = AluOp(s, o->b, *Reg8(s, o->rm), o->aux & 0xFF, 8);
+        if (o->b != 7) *Reg8(s, o->rm) = (uint8_t)res;
+        NEXT();
+    }
+    uint32_t ea = EA();
+    uint32_t res = AluOp(s, o->b, ld8(ea), o->aux & 0xFF, 8);
+    if (o->b != 7) { st8(ea, (uint8_t)res); STORE_CHK(); }
+    NEXT();
+}
+L_ALU8_AL_IMM: {
+    uint32_t res = AluOp(s, o->b, s.r[EAX] & 0xFF, o->aux & 0xFF, 8);
+    if (o->b != 7) s.r[EAX] = (s.r[EAX] & 0xFFFFFF00u) | (res & 0xFF);
     NEXT();
 }
 L_MOV_R8_IMM:

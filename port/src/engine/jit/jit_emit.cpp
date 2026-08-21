@@ -69,6 +69,11 @@ constexpr uint32_t W_AB    = 12;   // a^b — the AF input, live across the ALU 
 constexpr uint32_t W_F0    = 13;   // flag accumulator / barrier temp / eip temp
 constexpr uint32_t W_F1    = 15;   // flag temp / barrier temp
 constexpr uint32_t W_F2    = 8;    // flag temp (the merge mask)
+// Two more caller-saved temps, used only inside a single stencil with no call in between.
+// Deliberately NOT w0/w1: EmitStore's slow-path tail marshals its arguments there, and its
+// own comment records that the ea/val registers must stay clear of them.
+constexpr uint32_t W_T0    = 2;    // byte ALU: the 32-bit wide sum/difference
+constexpr uint32_t W_T1    = 3;    // byte ALU: the left operand, live to the end for OF/AF
 
 inline uint32_t GReg(int i) { return 19u + (uint32_t)(i & 7); }
 
@@ -503,6 +508,61 @@ struct BlockEmit {
         EmitMerge(0x8D5);
     }
 
+    // ---- byte ALU. Not a width parameter on the 32-bit path: at eight bits every flag
+    // comes from a different place (CF is bit 8 of a 32-bit sum, SF is bit 7, OF is a
+    // sign-agreement test on bit 7), and adc/sbb rule out the usual trick of shifting the
+    // operands into the top byte, because the carry-in would land at bit 0 instead of bit 24.
+    // So this mirrors the interpreter's OWN formulas -- FlagsAdd/FlagsSub with bits=8 --
+    // term for term, which is also what makes the self-test's comparison meaningful.
+    //   a8, b8: zero-extended byte operands.  Result byte is left in W_RES.
+    void EmitAlu8(int op, uint32_t a8, uint32_t b8) {
+        if (op == 1 || op == 4 || op == 6) {                 // or / and / xor
+            A.Put(op == 1 ? ORR(W_RES, a8, b8)
+                : op == 4 ? AND(W_RES, a8, b8) : EOR(W_RES, a8, b8));
+            FlagsLogical8(W_RES);
+            return;
+        }
+        Cat _c(*this, EC_WORK);
+        const bool sub = (op == 5 || op == 3 || op == 7);     // sub / sbb / cmp
+        // carry-in: 0 for add/sub/cmp, x86 CF for adc/sbb
+        uint32_t cin = WZR;
+        if (op == 2 || op == 3) {
+            A.Put(LDRw(W_F2, X_CPU, OFF_EFL));
+            A.Put(UBFX(W_F2, W_F2, 0, 1));
+            cin = W_F2;
+        }
+        // wide = a +/- b -/+ cin, kept in 32 bits: for BOTH directions bit 8 is exactly the
+        // x86 carry/borrow (a-b-c goes negative iff a < b+c, and then bits 8.. are all set).
+        if (sub) { A.Put(SUB(W_T0, a8, b8)); if (cin != WZR) A.Put(SUB(W_T0, W_T0, cin)); }
+        else     { A.Put(ADD(W_T0, a8, b8)); if (cin != WZR) A.Put(ADD(W_T0, W_T0, cin)); }
+        A.Put(UXTB(W_RES, W_T0));                             // res = wide & 0xFF
+        {
+            Cat _cf(*this, EC_FLAGS);
+            A.Put(UBFX(W_F1, W_T0, 8, 1));                    // CF = bit 8 of the wide value
+            A.Put(ORR(W_F0, WZR, W_F1));
+            A.Put(EOR(W_F1, a8, b8));                         // AF = (a^b^res) bit 4
+            A.Put(EOR(W_F1, W_F1, W_RES));
+            A.Put(UBFX(W_F1, W_F1, 4, 1));
+            A.Put(ORR(W_F0, W_F0, W_F1, 4));
+            if (sub) {                                        // OF = (a^b) & (a^res) bit 7
+                A.Put(EOR(W_F1, a8, b8));
+                A.Put(EOR(W_F2, a8, W_RES));
+            } else {                                          // OF = (a^res) & (b^res) bit 7
+                A.Put(EOR(W_F1, a8, W_RES));
+                A.Put(EOR(W_F2, b8, W_RES));
+            }
+            A.Put(AND(W_F1, W_F1, W_F2));
+            A.Put(UBFX(W_F1, W_F1, 7, 1));
+            A.Put(ORR(W_F0, W_F0, W_F1, 11));
+            A.Put(CMPi(W_RES, 0));                            // ZF
+            A.Put(CSET(W_F1, C_EQ)); A.Put(ORR(W_F0, W_F0, W_F1, 6));
+            A.Put(UBFX(W_F1, W_RES, 7, 1));                   // SF = bit 7
+            A.Put(ORR(W_F0, W_F0, W_F1, 7));
+            EmitParity(W_RES);
+            EmitMerge(0x8D5);
+        }
+    }
+
     // ---- the grouped ALU (AluOp's eight indices), operands already in registers.
     // `dst` is the writeback register, or W_RES for cmp (index 7), which has none.
     void EmitAlu(int op, uint32_t dst, uint32_t a, uint32_t b) {
@@ -710,6 +770,42 @@ struct BlockEmit {
         // stencil buys is that the BLOCK NO LONGER ENDS at these instructions -- the census
         // put movaps/mulps/shufps/addps at ~30% of every remaining refusal, and a refusal
         // costs a dispatcher round trip plus a full interpreter decode.
+        // ---- the 8-bit ALU grid. Writeback is a bitfield insert into the guest register
+        // (or a byte store), and `cmp` (index 7) writes nothing at all -- same rule as 32-bit.
+        case F_ALU8_R_RM8: {
+            uint32_t v;
+            if (isReg) { Reg8Read(W_MEM, o.rm); v = W_MEM; }
+            else { uint32_t ea = EmitEA(o); A.Put(LDRB(W_MEM, ea, 0)); v = W_MEM; }
+            Reg8Read(W_T1, o.a);
+            EmitAlu8(o.b, W_T1, v);
+            if (o.b != 7) Reg8Write(o.a, W_RES);
+            return true;
+        }
+        case F_ALU8_RM8_R:
+        case F_ALU8_RM8_IMM: {
+            const bool imm = (o.form == F_ALU8_RM8_IMM);
+            if (isReg) {
+                Reg8Read(W_T1, o.rm);
+                if (imm) A.MovImm32(W_MEM, o.aux & 0xFF); else Reg8Read(W_MEM, o.a);
+                EmitAlu8(o.b, W_T1, W_MEM);
+                if (o.b != 7) Reg8Write(o.rm, W_RES);
+                return true;
+            }
+            uint32_t ea = EmitEA(o);
+            if (ea != W_EA) { A.Put(MOV(W_EA, ea)); ea = W_EA; }   // EmitStore wants w9
+            A.Put(LDRB(W_T1, ea, 0));
+            if (imm) A.MovImm32(W_MEM, o.aux & 0xFF); else Reg8Read(W_MEM, o.a);
+            EmitAlu8(o.b, W_T1, W_MEM);                            // never touches w9
+            if (o.b != 7) EmitStore(ea, W_RES, 1, i, true);
+            return true;
+        }
+        case F_ALU8_AL_IMM: {
+            A.Put(UXTB(W_T1, GReg(EAX)));
+            A.MovImm32(W_MEM, o.aux & 0xFF);
+            EmitAlu8(o.b, W_T1, W_MEM);
+            if (o.b != 7) A.Put(BFI(GReg(EAX), W_RES, 0, 8));
+            return true;
+        }
         case F_MOV_R8_IMM: {
             A.MovImm32(W_MEM, o.aux & 0xFF);
             Reg8Write(o.a, W_MEM);
@@ -970,6 +1066,48 @@ bool JitSelfTest() {
             if (g.r[EAX] != w.r[EAX] || g.eflags != w.eflags)
                 Report("test", -1, kVals[i], kVals[j], kBg[0], g, w);
         }
+    // ---- the 8-bit ALU grid, every operation including adc/sbb, against AluOp(...,8).
+    // This is the corpus that matters most in this file: byte flags are derived by hand
+    // (CF from bit 8 of a 32-bit sum, SF from bit 7, OF from a sign-agreement test) rather
+    // than read out of NZCV, so an off-by-one bit position would be invisible everywhere
+    // except here and in a det log days later.
+    {
+        for (int alu = 0; alu < 8; ++alu) {
+            ops[0].form = F_ALU8_R_RM8; ops[0].b = (uint8_t)alu;
+            ops[0].a = 1 /*CL*/; ops[0].rm = 4 /*AH*/; ops[0].flags = HF_ISREG; ops[0].aux = 0;
+            for (uint32_t i = 0; i < kN; ++i)
+                for (uint32_t j = 0; j < kN; ++j)
+                    for (uint32_t cf = 0; cf < 2; ++cf) {
+                        CpuState g{}, w{};
+                        g.r[EAX] = w.r[EAX] = kVals[i];
+                        g.r[ECX] = w.r[ECX] = kVals[j];
+                        g.r[ESP] = w.r[ESP] = 0x40000000u;
+                        g.eflags = w.eflags = kBg[cf] | (cf ? F_CF : 0);
+                        if (SelfTestRun(ops, 1, g) < 0) return false;
+                        uint32_t res = AluOp(w, alu, *Reg8(w, 1), *Reg8(w, 4), 8);
+                        if (alu != 7) *Reg8(w, 1) = (uint8_t)res;
+                        ++cases;
+                        if (g.r[EAX] != w.r[EAX] || g.r[ECX] != w.r[ECX] || g.eflags != w.eflags)
+                            Report("alu8 r,rm", alu, kVals[i], kVals[j], w.eflags, g, w);
+                    }
+            // and the al,imm8 encoding, which writes back through a different path
+            ops[0].form = F_ALU8_AL_IMM; ops[0].flags = 0;
+            for (uint32_t i = 0; i < kN; ++i)
+                for (uint32_t j = 0; j < kN; ++j) {
+                    ops[0].aux = kVals[j] & 0xFF;
+                    CpuState g{}, w{};
+                    g.r[EAX] = w.r[EAX] = kVals[i];
+                    g.r[ESP] = w.r[ESP] = 0x40000000u;
+                    g.eflags = w.eflags = kBg[j & 1] | ((j & 1) ? F_CF : 0);
+                    if (SelfTestRun(ops, 1, g) < 0) return false;
+                    uint32_t res = AluOp(w, alu, w.r[EAX] & 0xFF, ops[0].aux, 8);
+                    if (alu != 7) w.r[EAX] = (w.r[EAX] & 0xFFFFFF00u) | (res & 0xFF);
+                    ++cases;
+                    if (g.r[EAX] != w.r[EAX] || g.eflags != w.eflags)
+                        Report("alu8 al,imm", alu, kVals[i], ops[0].aux, w.eflags, g, w);
+                }
+        }
+    }
     // ---- byte TEST: 84 (reg,reg), F6 /0 (reg,imm8) and A8 (al,imm8), against the
     // interpreter's own FlagsLogic(res, 8). The byte forms have their own flag writer
     // (ZF/PF from the low byte, SF from bit 7, CF/OF/AF cleared), so they need their own

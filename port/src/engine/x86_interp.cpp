@@ -84,6 +84,9 @@ enum : uint8_t {
     // an absolute address is just base=-1, idx=-1, disp=addr, which both EA paths already
     // compute -- so they are classified straight onto the existing mov forms.
     F_MOV_R8_IMM, F_MOVSX16, F_TEST_RM32_IMM,
+    // The 8-bit ALU grid (00/02/04 .. 38/3A/3C and the 80 group). AluOp already takes a
+    // width, so the interpreter side is the 32-bit case with bits=8 and byte accessors.
+    F_ALU8_RM8_R, F_ALU8_R_RM8, F_ALU8_AL_IMM, F_ALU8_RM8_IMM,
 };
 constexpr uint8_t HF_ISREG = 1;      // modrm mod==3: operand is register e.rm
 constexpr uint8_t HF_SEGFS = 2;      // EA adds the fs base
@@ -601,7 +604,10 @@ static void TryCacheSite(uint32_t eipVal) {
         if (fm == 1) { WithModRM(F_ALU_RM32_R); b = alu; }
         else if (fm == 3) { WithModRM(F_ALU_R_RM32); b = alu; }
         else if (fm == 5) { memcpy(&aux, p, 4); p += 4; form = F_ALU_EAX_IMM; b = alu; }
-        else return;                                     // 8-bit grid forms: slow path
+        else if (!g_form8) return;                       // 8-bit grid: the A/B switch
+        else if (fm == 0) { WithModRM(F_ALU8_RM8_R); b = alu; }
+        else if (fm == 2) { WithModRM(F_ALU8_R_RM8); b = alu; }
+        else { aux = *p++; form = F_ALU8_AL_IMM; b = alu; }   // fm == 4: ALU al, imm8
     }
     else if (op >= 0x40 && op <= 0x47) { form = F_INC_R; a = op - 0x40; }
     else if (op >= 0x48 && op <= 0x4F) { form = F_DEC_R; a = op - 0x48; }
@@ -618,6 +624,8 @@ static void TryCacheSite(uint32_t eipVal) {
                            memcpy(&aux, p, 4); p += 4; }
     else if (op == 0x83) { WithModRM(F_ALU_RM32_IMM); b = r.reg;
                            aux = (uint32_t)(int32_t)(int8_t)*p++; }
+    else if (op == 0x80) { if (!g_form8) return;      // ALU r/m8, imm8
+                           WithModRM(F_ALU8_RM8_IMM); b = r.reg; aux = *p++; }
     else if (op == 0x84) { if (!g_form8) return; WithModRM(F_TEST_RM8_R); }
     else if (op == 0xA1 || op == 0xA3) {            // mov eax,[moffs32] / [moffs32],eax
         if (!g_form8) return;
@@ -989,6 +997,39 @@ RunResult Run(CpuState& s, uint32_t stopEip, uint64_t maxSteps) {
                         case F_MOVSX8: {
                             uint32_t v = (e.flags & HF_ISREG) ? *Reg8(s, e.rm) : ld8(HotEa());
                             s.r[e.a] = (uint32_t)(int32_t)(int8_t)v;
+                            s.eip = e.next; continue;
+                        }
+                        case F_ALU8_R_RM8: {
+                            uint8_t v = (e.flags & HF_ISREG) ? *Reg8(s, e.rm) : ld8(HotEa());
+                            uint32_t res = AluOp(s, e.b, *Reg8(s, e.a), v, 8);
+                            if (e.b != 7) *Reg8(s, e.a) = (uint8_t)res;
+                            s.eip = e.next; continue;
+                        }
+                        case F_ALU8_RM8_R: {
+                            if (e.flags & HF_ISREG) {
+                                uint32_t res = AluOp(s, e.b, *Reg8(s, e.rm), *Reg8(s, e.a), 8);
+                                if (e.b != 7) *Reg8(s, e.rm) = (uint8_t)res;
+                            } else {
+                                uint32_t ea = HotEa();
+                                uint32_t res = AluOp(s, e.b, ld8(ea), *Reg8(s, e.a), 8);
+                                if (e.b != 7) st8(ea, (uint8_t)res);
+                            }
+                            s.eip = e.next; continue;
+                        }
+                        case F_ALU8_RM8_IMM: {
+                            if (e.flags & HF_ISREG) {
+                                uint32_t res = AluOp(s, e.b, *Reg8(s, e.rm), e.aux & 0xFF, 8);
+                                if (e.b != 7) *Reg8(s, e.rm) = (uint8_t)res;
+                            } else {
+                                uint32_t ea = HotEa();
+                                uint32_t res = AluOp(s, e.b, ld8(ea), e.aux & 0xFF, 8);
+                                if (e.b != 7) st8(ea, (uint8_t)res);
+                            }
+                            s.eip = e.next; continue;
+                        }
+                        case F_ALU8_AL_IMM: {
+                            uint32_t res = AluOp(s, e.b, s.r[EAX] & 0xFF, e.aux & 0xFF, 8);
+                            if (e.b != 7) s.r[EAX] = (s.r[EAX] & 0xFFFFFF00u) | (res & 0xFF);
                             s.eip = e.next; continue;
                         }
                         case F_MOV_R8_IMM:
