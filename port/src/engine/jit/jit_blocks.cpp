@@ -174,6 +174,9 @@ uint64_t g_nStale = 0;            // prologue revalidations that REJECTED a matc
 // list. Diagnostic only: TJ_ENG_JIT_STATS prints the top entries.
 uint64_t g_declByOp[256] = { 0 };
 uint64_t g_declBy0F[256] = { 0 };
+// x87 run batching (TJ_ENG_X87BATCH=0 disables, for the same-binary A/B).
+bool     g_x87Batch = true;
+uint64_t g_x87Batched = 0, g_x87Runs = 0;   // instructions folded into runs, and run count
 uint32_t g_ways = kBlkWays;       // TJ_ENG_JIT_WAYS=1 pins way 0 => the old direct-mapped
                                   // behaviour, in the SAME binary, for the device A/B.
 uint64_t g_nConflict = 0;         // the slot held a DIFFERENT live entry: direct-mapped
@@ -304,6 +307,10 @@ void StatsLine(const char* why) {
             printf("\n");
         }
     }
+    if (g_x87Runs)
+        printf("[jit] %s: x87 runs: %llu instructions in %llu calls (%.2f per call)\n", why,
+               (unsigned long long)g_x87Batched, (unsigned long long)g_x87Runs,
+               (double)g_x87Batched / (double)g_x87Runs);
     printf("[jit] %s: compile causes: conflict=%llu (direct-mapped slot held another block) "
            "firstTime=%llu\n", why,
            (unsigned long long)g_nConflict, (unsigned long long)g_nFirstTime);
@@ -798,6 +805,7 @@ void JitInit() {
     }
     if (const char* d = getenv("TJ_ENG_JIT_DUMP"))
         g_dumpVa = (uint32_t)strtoul(d, nullptr, 16);
+    if (const char* xb = getenv("TJ_ENG_X87BATCH")) g_x87Batch = (*xb != '0');
     if (const char* w = getenv("TJ_ENG_JIT_WAYS")) {
         g_ways = (uint32_t)strtoul(w, nullptr, 0);
         if (g_ways < 1) g_ways = 1;

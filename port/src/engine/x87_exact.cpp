@@ -146,6 +146,16 @@ void X87Prof2Print() {
     }
 }
 
+int X87RunN(CpuState& s, const X87Desc* d, int n, const uint32_t* eas, uint32_t* failEip) {
+    for (int i = 0; i < n; ++i) {
+        if (!X87Exec(s, d[i].op, d[i].modrm, d[i].hasMem ? eas[i] : 0u)) {
+            if (failEip) *failEip = d[i].eip;
+            return i;                        // i instructions completed; d[i] refused
+        }
+    }
+    return n;
+}
+
 bool X87Exec(CpuState& s, uint8_t op, uint8_t modrm, uint32_t ea) {
 #ifdef _M_IX86
     if (g_fpuMode == FpuMode::Native) return X87NativeExec(s, op, modrm, ea);

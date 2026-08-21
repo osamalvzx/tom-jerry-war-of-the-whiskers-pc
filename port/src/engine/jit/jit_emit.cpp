@@ -878,7 +878,7 @@ struct BlockEmit {
             AddTail(TK_SSE, false, lFail, 0, o.eip, i, 0, 0);
             return true;
         }
-        case F_X87: {
+        case F_X87: {   // single op; a RUN of them is emitted by EmitX87Batch instead
             uint32_t ea = 0;
             const bool mem = !isReg;
             if (mem) ea = EmitEA(o);
@@ -961,6 +961,64 @@ struct BlockEmit {
         default:
             return false;                   // no stencil: the caller declines the block
         }
+    }
+
+    // ---- a RUN of consecutive x87 instructions in ONE call (see X87RunN).
+    // The descriptors are compile-time constants and live in the block's own DATA area, so
+    // the only runtime work before the call is computing the memory operands' addresses.
+    // On a refusal the call reports how many completed, and the exit is the SAME EX_X87 the
+    // single-op path takes -- with the eip and the retire-back computed from that count,
+    // because both are dynamic here. Getting the retire wrong would desync maxSteps and the
+    // [eng-mode] STOPPED line, so it is done explicitly rather than approximated.
+    bool EmitX87Batch(uint32_t first, uint32_t n) {
+        const uint32_t descOff = A.PutData(ops[first].eip) * 4;
+        A.PutData((uint32_t)ops[first].b | ((uint32_t)ops[first].rm << 8) |
+                  (((ops[first].flags & HF_ISREG) ? 0u : 1u) << 16));
+        for (uint32_t j = 1; j < n; ++j) {
+            A.PutData(ops[first + j].eip);
+            A.PutData((uint32_t)ops[first + j].b | ((uint32_t)ops[first + j].rm << 8) |
+                      (((ops[first + j].flags & HF_ISREG) ? 0u : 1u) << 16));
+        }
+        // ⚠ EAX. The single-op stencil's comment says it: the ONLY guest GPR the unit touches
+        // is EAX, and only for `fnstsw ax` (modrm E0) -- which is ~19% of the x87 stream, so
+        // a batch containing one is the common case, not the corner. The unit writes EAX in
+        // CpuState while the pinned w19 still holds the stale value; without this sync the
+        // det log diverges within a couple of thousand frames (it did).
+        bool touchesEax = false;
+        for (uint32_t j = 0; j < n; ++j) if (ops[first + j].rm == 0xE0) touchesEax = true;
+        const uint32_t frame = ((4 * n + 4) + 15) & ~15u;
+        A.Put(SUBXi(SP_REG, SP_REG, frame));
+        if (touchesEax) A.Put(STRw(GReg(EAX), X_CPU, OFF_R));
+        for (uint32_t j = 0; j < n; ++j) {
+            const JitOp& oj = ops[first + j];
+            if (oj.flags & HF_ISREG) continue;          // no memory operand: slot unused
+            uint32_t ea = EmitEA(oj);
+            A.Put(STRw(ea, SP_REG, 4 * j));
+        }
+        A.Put(MOVX(0, X_CPU));
+        A.LdLitX(1, descOff, /*self=*/true);
+        A.Put(MOVZ(2, n));
+        A.Put(ADDXi(3, SP_REG, 0));                     // &eas[0]
+        A.Put(ADDXi(4, SP_REG, 4 * n));                 // &failEip
+        A.LdLitX(X_P1, (uint64_t)(uintptr_t)(void*)&X87RunN);
+        A.Put(BLR(X_P1));
+        guardLive = false;                              // the call clobbered x14
+        // Reload BEFORE the branch: the failure path exits, and the exit thunk writes the
+        // pinned registers back to CpuState -- a stale w19 there would undo the unit's write.
+        if (touchesEax) A.Put(LDRw(GReg(EAX), X_CPU, OFF_R));
+        const uint32_t lOk = A.NewLabel();
+        A.Put(CMPi(0, n));
+        A.Bc(C_EQ, lOk);                                // all n completed
+        A.Put(LDRw(W_F0, SP_REG, 4 * n));               // the refusing instruction's eip
+        A.MovImm32(W_F1, nOps - first);                 // ops from here to the block end...
+        A.Put(SUB(W_F1, W_F1, 0));                      // ...minus the completed count (w0)
+        A.Put(ADDXi(SP_REG, SP_REG, frame));
+        A.Put(STRw(W_F0, X_CPU, OFF_EIP));
+        A.Put(SUBXr(X_ACC, X_ACC, W_F1));
+        EmitExit(EX_X87);
+        A.Bind(lOk);
+        A.Put(ADDXi(SP_REG, SP_REG, frame));
+        return true;
     }
 
     void EmitTails() {
@@ -1284,6 +1342,16 @@ bool EmitBlockCode(const Block& b, const JitOp* ops, void** outCode, void** outB
     E.Bill(); E.cat = EC_FRAME;
     for (uint32_t i = 0; i < b.nOps; ++i) {
         BlockEmit::Cat _work(E, EC_WORK);   // the op's own work; its helpers rebill their part
+        if (g_x87Batch && ops[i].form == F_X87) {
+            uint32_t n = 1;
+            while (i + n < b.nOps && ops[i + n].form == F_X87) ++n;
+            if (n > 1) {                     // a run: one call instead of n
+                if (!E.EmitX87Batch(i, n)) { ++g_nEmitFail; return false; }
+                g_x87Batched += n; ++g_x87Runs;
+                i += n - 1;
+                continue;
+            }
+        }
         if (!E.EmitOp(i)) { ++g_nEmitFail; return false; }
     }
     if (!IsTerminator(ops[b.nOps - 1].form)) {          // ran off the end (decliner/cap/edge)

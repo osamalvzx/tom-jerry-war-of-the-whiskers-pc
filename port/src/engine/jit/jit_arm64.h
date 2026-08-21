@@ -81,6 +81,10 @@ inline uint32_t ADDS(uint32_t rd, uint32_t rn, uint32_t rm, uint32_t lsl = 0) { 
 inline uint32_t SUB (uint32_t rd, uint32_t rn, uint32_t rm, uint32_t lsl = 0) { return AddSubReg(true,  false, false, rd, rn, rm, 0, lsl); }
 inline uint32_t SUBS(uint32_t rd, uint32_t rn, uint32_t rm, uint32_t lsl = 0) { return AddSubReg(true,  true,  false, rd, rn, rm, 0, lsl); }
 inline uint32_t CMPr(uint32_t rn, uint32_t rm)                                { return AddSubReg(true,  true,  false, WZR, rn, rm, 0, 0); }
+// 64-bit SUB reg. Used to retire back a DYNAMIC count (an x87 run that stopped early):
+// the rm operand is written through a w-move first, so its upper half is already zero.
+inline uint32_t SUBXr(uint32_t rd, uint32_t rn, uint32_t rm) { return AddSubReg(true, false, true, rd, rn, rm, 0, 0); }
+
 
 // ---------------------------------------------------------------- adc/sbc (with carry)
 // sf | op | S | 11010000 | Rm | 000000 | Rn | Rd
