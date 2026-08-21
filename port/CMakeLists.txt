@@ -111,6 +111,7 @@ target_compile_options(tj_game PRIVATE /arch:IA32 /fp:precise)
 # tj_hybrid.dll: based HIGH (above the XBE image). Maps default.xbe at real VAs,
 # wires the kernel thunks + XDK bridges, and drives the game's startup.
 add_library(tj_hybrid SHARED
+    src/android/perf_hint.cpp
     src/hybrid/xbe_image.cpp
     src/hybrid/kernel.cpp
     src/hybrid/symbolize.cpp
@@ -257,6 +258,10 @@ target_link_libraries(xmf_test PRIVATE tj_setup_core)
 target_compile_definitions(xmf_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_property(TARGET xmf_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(xmf_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(tex_test tests/tex_test.cpp src/runtime/assets/xmf_texture.cpp)
+target_include_directories(tex_test PRIVATE src)
+target_compile_features(tex_test PRIVATE cxx_std_17)
 
 add_executable(diff_test tests/diff_test.cpp)
 target_link_libraries(diff_test PRIVATE tj_game)

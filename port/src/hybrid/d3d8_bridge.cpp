@@ -14,6 +14,7 @@
 #include "hybrid/lan_ui.h"
 #include "runtime/gfx/d3d8.h"
 #include "runtime/assets/xmf_texture.h"
+#include "android/perf_hint.h"
 #include "runtime/input/xinput_pad.h"
 #include "hybrid/host_compat.h"
 #ifdef _WIN32
@@ -295,6 +296,14 @@ static uint32_t g_frmTexCreate = 0, g_frmTexUpdate = 0;   // per-frame texture c
 // (ResolveTexture is called from inside them); "rest" = total - pb - draw - swap =
 // the game's own x86 simulation + everything the bridge doesn't time.
 static int64_t g_tPb = 0, g_tDraw = 0, g_tTex = 0, g_tSwap = 0;
+// The tex phase splits into two very different jobs and only one of them is ours to
+// make cheaper: DECODE (Xbox format -> RGBA, on this CPU) and UPLOAD (handing the
+// result to the backend). Beach spends 3-5 ms/f here; without the split, optimising it
+// would be guesswork about which half.
+static int64_t g_tTexDec = 0, g_tTexUpl = 0;
+static uint64_t g_texDecPix = 0;        // pixels decoded per window (the work, not the calls)
+static double g_frmMax = 0.0;               // worst single frame in the 400-frame window
+static uint32_t g_frmOver17 = 0, g_frmOver20 = 0, g_frmOver33 = 0;
 struct PhaseTimer {
     int64_t* acc; LARGE_INTEGER t0;
     explicit PhaseTimer(int64_t* a) : acc(a) { QueryPerformanceCounter(&t0); }
@@ -560,6 +569,44 @@ static tj::gfx::TextureHandle TransparentTex() {
     return g_transparentTex;
 }
 
+// Decode into a REUSED buffer, not a fresh vector: in a busy arena this runs 44-72 times per
+// frame, and the vector API charged each call a heap allocation, a prefill of every texel that
+// the decode then overwrote, and an alpha scan for a flag only the native mesh demo reads.
+// Same pixels -- tex_test proves bit-identity over 22 formats x 10 sizes (220/220) and
+// measures 3.0x overall, 3-13x on the swizzled formats the game actually ships. The buffer is
+// shared by both texture paths: they run on the game thread, one decode at a time, and the
+// result is consumed (uploaded) before the next call.
+static bool DecodeScratch(int fmt, const uint8_t* pix, size_t avail, const uint32_t* pal,
+                          int w, int h, uint32_t** out) {
+    static uint32_t* buf = nullptr; static size_t cap = 0;
+    size_t need = (size_t)w * (size_t)h;
+    if (need > cap) {
+        if (buf) VirtualFree(buf, 0, MEM_RELEASE);
+        size_t want = (need + 0xFFFF) & ~(size_t)0xFFFF;
+        buf = (uint32_t*)VirtualAlloc(nullptr, want * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        cap = buf ? want : 0;
+    }
+    *out = buf;
+    if (!buf) return false;
+    // TJ_TEXFAST=0 reverts to the allocating vector decoder IN THE SAME BINARY, so the device
+    // A/B is one build measured two ways -- the rule this project has used for every
+    // mechanism swap (dispatch, GCALL, raw hooks, the JIT tiers).
+    static int fast = -1;
+    if (fast < 0) { char* e = nullptr; size_t n = 0; _dupenv_s(&e, &n, "TJ_TEXFAST");
+                    fast = (e && *e == '0') ? 0 : 1; free(e); }
+    PhaseTimer _pd(&g_tTexDec);
+    bool ok;
+    if (fast) {
+        ok = tj::assets::DecodeXboxTextureInto(fmt, pix, avail, pal, w, h, buf);
+    } else {
+        tj::assets::DecodedTexture d = tj::assets::DecodeXboxTexture(fmt, pix, avail, pal, w, h);
+        ok = d.ok && !d.rgba.empty();
+        if (ok) memcpy(buf, d.rgba.data(), (size_t)w * h * 4);
+    }
+    if (ok) g_texDecPix += (uint64_t)w * (uint64_t)h;
+    return ok;
+}
+
 // Resolve (decode + upload, cached) the bound resource to a D3D11 texture handle.
 static tj::gfx::TextureHandle ResolveTexture(void* res) {
     PhaseTimer _pt(&g_tTex);
@@ -663,8 +710,14 @@ static tj::gfx::TextureHandle ResolveTexture(void* res) {
             pix = repack;
         }
     }
-    auto dec = tj::assets::DecodeXboxTexture(fmt, pix, (size_t)w*h*4, pal, w, h);
-    bool decoded = dec.ok && !dec.rgba.empty();
+    // Decode into a REUSED buffer, not a fresh vector: in a busy arena this path runs 44-72
+    // times per frame, and the vector API charged each one a heap allocation, a prefill of
+    // every texel that the decode then overwrote, and an alpha scan for a flag only the
+    // native mesh demo reads. Same pixels -- tex_test proves bit-identity over 22 formats x
+    // 10 sizes (220/220) and measures 3.0x overall, 3-13x on the swizzled formats the game
+    // actually ships.
+    uint32_t* decBuf = nullptr;
+    bool decoded = DecodeScratch(fmt, pix, (size_t)w * h * 4, pal, w, h, &decBuf);
     if (!decoded) {
         // Decode FAILED (format the decoder doesn't handle, or P8 with no palette) -->
         // this surface draws white. Log once per resource so missing textures are
@@ -687,7 +740,9 @@ static tj::gfx::TextureHandle ResolveTexture(void* res) {
         // invisible for water/fire), an occasional update still gets fresh mips.
         bool rapid = en.lastUpd && (uint32_t)g_frame - en.lastUpd <= 30;
         bool mips = !rapid || ((en.updN + 1) & 3) == 0;
-        if (g_dev.UpdateTexture(en.h, dec.rgba.data(), w, h, mips)) {
+        bool updOk; { PhaseTimer _pu(&g_tTexUpl);
+                      updOk = g_dev.UpdateTexture(en.h, decBuf, w, h, mips); }
+        if (updOk) {
             en.data = data; en.srcHash = srcHash; ++en.updN; en.lastUpd = (uint32_t)g_frame;
             ++g_frmTexUpdate;
             return en.h;
@@ -697,8 +752,9 @@ static tj::gfx::TextureHandle ResolveTexture(void* res) {
     // UpdateSubresource, or falls through to CreateTexture on a pool miss. The old
     // handle is Released AFTER the Acquire below, so Acquire can never hand back the
     // texture this cache entry still references.
-    tj::gfx::TextureHandle handle = decoded ? (++g_frmTexCreate, g_dev.AcquireTexture(dec.rgba.data(), w, h))
-                                            : tj::gfx::kNoTexture;
+    tj::gfx::TextureHandle handle = tj::gfx::kNoTexture;
+    if (decoded) { ++g_frmTexCreate; PhaseTimer _pa(&g_tTexUpl);
+                   handle = g_dev.AcquireTexture(decBuf, w, h); }
     int slot;
     if (existSlot >= 0) {                        // reuse the entry (dims changed / had no tex)
         slot = existSlot;
@@ -1338,9 +1394,12 @@ static tj::gfx::TextureHandle ResolvePbTexture(uint32_t texOff, uint32_t texFmt,
           }
       } }
     tj::gfx::TextureHandle handle = tj::gfx::kNoTexture;
-    auto dec = tj::assets::DecodeXboxTexture(fmt, pix, (size_t)w * h * 4, pal, w, h);
-    if (dec.ok && !dec.rgba.empty()) { ++g_frmTexCreate; handle = g_dev.AcquireTexture(dec.rgba.data(), w, h); }
-    else {
+    uint32_t* pbBuf = nullptr;
+    if (DecodeScratch(fmt, pix, (size_t)w * h * 4, pal, w, h, &pbBuf)) {
+        ++g_frmTexCreate;
+        PhaseTimer _pu(&g_tTexUpl);
+        handle = g_dev.AcquireTexture(pbBuf, w, h);
+    } else {
         static uint32_t warned[128]; static int warnedN = 0;
         bool seen = false;
         for (int i = 0; i < warnedN; ++i) if (warned[i] == texOff) { seen = true; break; }
@@ -1803,6 +1862,10 @@ extern "C" void BridgeCapture(const char* path) {
     strncpy_s(g_pendingCap, path, _TRUNCATE);
 }
 
+// engine_mode.cpp: guest instructions retired + gate calls, for the frame log's workload
+// column. C linkage so this file needs no engine header (it must build the same either way).
+extern "C" void BridgeEngineStats(unsigned long long* insn, unsigned long long* gate);
+
 // D3DDevice_Swap(Flags) ret 4 -- the frame flip. Present + pump the window.
 static void __stdcall Br_Swap(uint32_t flags) {
     (void)flags;
@@ -1810,6 +1873,63 @@ static void __stdcall Br_Swap(uint32_t flags) {
     if (!g_devReady) return;
     // Diagnostic: dump a frame to a BMP when TJ_CAPTURE is set (frame number).
     ++g_frame;
+    // STABILITY, not average speed. The 400-frame line below reports the MEAN, and a mean of
+    // 16.7 ms is exactly what a leg that stutters twice a second also reports. A player feels
+    // the OUTLIERS, so every frame is timed here and the window keeps that shape: how many
+    // frames missed the 16.67 ms vsync budget, how many missed it badly, and the worst one.
+    {
+        static LARGE_INTEGER fqpf = {}, fprev = {};
+        if (!fqpf.QuadPart) { QueryPerformanceFrequency(&fqpf); QueryPerformanceCounter(&fprev); }
+        LARGE_INTEGER fnow; QueryPerformanceCounter(&fnow);
+        double ms = (double)(fnow.QuadPart - fprev.QuadPart) * 1000.0 / (double)fqpf.QuadPart;
+        fprev = fnow;
+        if (ms > g_frmMax) g_frmMax = ms;
+        if (ms > 17.5) ++g_frmOver17;      // missed the vsync budget at all
+        if (ms > 20.0) ++g_frmOver20;      // a visible hitch
+        if (ms > 33.0) ++g_frmOver33;      // a dropped frame anyone would see
+        // ...and WHY. A count of hitches names no cause, so each spike prints its own phase
+        // split, taken as deltas of the same cumulative counters the 400-frame line averages.
+        // The window is swap-point to swap-point, so it covers the tail of the previous
+        // Br_Swap (its Present, hence `swap`) plus all of this frame's work -- one whole frame
+        // period, phase-shifted by the flip. `rest` is the sim, which is the interesting one:
+        // a spike that is all `rest` is the guest, a spike with `tex` is asset streaming, and
+        // a spike that is only `swap` is the compositor or the pacer, not us.
+        static int spikeMs = -1;
+        if (spikeMs < 0) { char* se = nullptr; size_t sn = 0; _dupenv_s(&se, &sn, "TJ_SPIKE");
+                           spikeMs = se ? atoi(se) : 25; free(se); }
+        static int64_t pPb = 0, pDraw = 0, pTex = 0, pSwap = 0;
+        static uint32_t pCre = 0, pUpd = 0;
+        // The 400-frame census below ZEROES these cumulative counters, and it runs later in
+        // this same function -- so the frame after it would diff against a stale high water
+        // and report negative phases. Any counter going backwards means that happened.
+        if (g_tPb < pPb || g_tDraw < pDraw || g_tTex < pTex || g_tSwap < pSwap ||
+            g_frmTexCreate < pCre || g_frmTexUpdate < pUpd) {
+            pPb = pDraw = pTex = pSwap = 0; pCre = pUpd = 0;
+        }
+        if (spikeMs > 0 && ms > (double)spikeMs) {
+            double k = 1000.0 / (double)fqpf.QuadPart;
+            printf("[spike] frame %d: %.1fms [pb %.2f draw %.2f tex %.2f swap %.2f rest %.2f] "
+                   "3d=%u ui=%u texcre=%u texupd=%u\n", g_frame, ms,
+                   (double)(g_tPb - pPb) * k, (double)(g_tDraw - pDraw) * k,
+                   (double)(g_tTex - pTex) * k, (double)(g_tSwap - pSwap) * k,
+                   ms - (double)((g_tPb - pPb) + (g_tDraw - pDraw) + (g_tSwap - pSwap)) * k,
+                   g_dbg3dDraws, g_dbgUiDraws,
+                   g_frmTexCreate - pCre, g_frmTexUpdate - pUpd);
+        }
+        // ADPF: tell the scheduler what this frame COST IN WORK, so it can hold clocks where
+        // the deadline is being met instead of inferring demand from utilisation. The pacer
+        // wait is subtracted deliberately -- reporting idle time as work teaches it the
+        // opposite of the truth. Off unless TJ_ADPF=1; a device without the hint HAL no-ops.
+        {
+            double swapMs = (double)(g_tSwap - pSwap) * 1000.0 / (double)fqpf.QuadPart;
+            static bool hintInit = false;
+            if (!hintInit) { hintInit = true; tj::android::PerfHintInit(16666667ll); }
+            double workMs = ms - swapMs;
+            if (workMs > 0.0) tj::android::PerfHintReport((int64_t)(workMs * 1e6));
+        }
+        pPb = g_tPb; pDraw = g_tDraw; pTex = g_tTex; pSwap = g_tSwap;
+        pCre = g_frmTexCreate; pUpd = g_frmTexUpdate;
+    }
     // TJ_CAPTURE=N: dump capture.bmp at frame N. TJ_CAPTURE=N+ : dump capture_<frame>.bmp
     // every N frames (film strip of the whole flow in one run).
     static int capAt = -2; static bool capEvery = false;
@@ -1858,6 +1978,18 @@ static void __stdcall Br_Swap(uint32_t flags) {
 #else
         struct { size_t WorkingSetSize; } pmc = {};
 #endif
+        // THE NUMBER THAT SEPARATES "the phone slowed down" FROM "the game got heavier".
+        // ms/f alone cannot tell a clock cap from a busier scene, and this device moves its
+        // own clock ceiling by 3-4x mid-match, so a frame-time trend on its own is unreadable.
+        // Guest instructions retired per frame is workload in the guest's OWN units: flat
+        // insn/f with rising ms/f is the DEVICE, rising insn/f is the GAME. Zero when engine
+        // mode is off (the native x86 path retires nothing through Run).
+        static unsigned long long prevInsn = 0, prevGate = 0;
+        unsigned long long insnNow = 0, gateNow = 0;
+        BridgeEngineStats(&insnNow, &gateNow);
+        double insnPerF = (insnNow >= prevInsn) ? (double)(insnNow - prevInsn) / 400.0 : 0.0;
+        double gatePerF = (gateNow >= prevGate) ? (double)(gateNow - prevGate) / 400.0 : 0.0;
+        prevInsn = insnNow; prevGate = gateNow;
         extern uint32_t LowArenaHighMB();        // kernel.cpp (arena exhaustion canary)
         extern uint32_t ContigPoolLiveMB();      // kernel.cpp (contiguous-pool recycler canaries)
         extern uint32_t ContigPoolHighMB();      //   live must plateau; high < 128 forever
@@ -1873,7 +2005,9 @@ static void __stdcall Br_Swap(uint32_t flags) {
         tj::hybrid::NetStatus(netbuf, sizeof netbuf);          // LAN session telemetry
         printf("[d3d8] frame %d: %.2fms/f [pb %.2f draw %.2f tex %.2f swap %.2f rest %.2f] "
                "draws ui=%u 3d=%u tex=%d pool=%d cache=%d/%d acq=%u/%u skip=%u dedup=%u "
-               "nullbind=%u arena=%uMB cpool=%u/%uMB ws=%zuMB%s\n",
+               "nullbind=%u arena=%uMB cpool=%u/%uMB ws=%zuMB insn=%.0fk/f gate=%.0f/f%s "
+               "texdec %.2f/texupl %.2f (%.0fkpx/f) "
+               "stut %u/%u/%u max=%.1f\n",
                g_frame, msPer,
                g_tPb * kms, g_tDraw * kms, g_tTex * kms, g_tSwap * kms,
                msPer - (g_tPb + g_tDraw + g_tSwap) * kms,
@@ -1882,9 +2016,13 @@ static void __stdcall Br_Swap(uint32_t flags) {
                g_frmTexCreate, g_frmTexUpdate, g_frmTexSkip, g_frmPbDedup,
                Device_NullSrvBinds(), LowArenaHighMB(),
                ContigPoolLiveMB(), ContigPoolHighMB(),
-               (size_t)(pmc.WorkingSetSize >> 20), netbuf);
+               (size_t)(pmc.WorkingSetSize >> 20), insnPerF / 1000.0, gatePerF, netbuf,
+               g_tTexDec * kms, g_tTexUpl * kms, (double)g_texDecPix / 400.0 / 1000.0,
+               g_frmOver17, g_frmOver20, g_frmOver33, g_frmMax);
         g_frmTexCreate = g_frmTexUpdate = g_frmTexSkip = g_frmPbDedup = 0;
         g_tPb = g_tDraw = g_tTex = g_tSwap = 0;
+        g_tTexDec = g_tTexUpl = 0; g_texDecPix = 0;
+        g_frmMax = 0.0; g_frmOver17 = g_frmOver20 = g_frmOver33 = 0;
         // TJ_ENG_PROF2 (session-30 temporary instrumentation): cumulative engine
         // counters + dispatch totals every 400 frames; diff consecutive snaps offline
         // to isolate the in-match interval.

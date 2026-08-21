@@ -46,4 +46,14 @@ DecodedTexture DecodeXboxTexture(int fmtCode, const uint8_t* pixels, size_t avai
 // Fill in DecodedTexture::hasAlpha by scanning the decoded pixels.
 void ComputeAlphaFlag(DecodedTexture& t);
 
+// Same decode, straight into a caller-owned W*H buffer. For the in-game path, where a
+// handful of animated textures (water, fire, flipbooks) re-decode EVERY frame and the
+// vector-returning API charges each one an allocation, a prefill of the whole buffer that
+// the decode then overwrites, and a full alpha scan for a flag the game path never reads.
+// Every supported format writes all W*H pixels, so no prefill is needed; a false return
+// means the buffer was NOT written at all (unknown format or short source).
+// Output is bit-identical to DecodeXboxTexture().rgba -- tex_test proves it per format.
+bool DecodeXboxTextureInto(int fmtCode, const uint8_t* pixels, size_t avail,
+                           const uint32_t* palette, int W, int H, uint32_t* dst);
+
 } // namespace tj::assets

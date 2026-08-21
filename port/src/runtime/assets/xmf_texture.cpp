@@ -174,6 +174,138 @@ void ComputeAlphaFlag(DecodedTexture& t) {
         if ((p >> 24) < 250) { t.hasAlpha = true; break; }
 }
 
+// ---- in-game fast path: decode into a caller buffer -------------------------------------
+//
+// Same pixels, three costs removed. (1) No allocation and no prefill: every branch below
+// writes all W*H pixels, and a `false` return writes none. (2) No alpha scan -- that flag
+// only feeds the native mesh demo. (3) THE SWIZZLE IS A TABLE, not a per-pixel bit loop:
+// the Morton pattern sends x-bits and y-bits to DISJOINT bit positions, so the index is
+// exactly xtab[x] | ytab[y] and the ~16-iteration inner loop per pixel disappears.
+namespace {
+struct SwizzleTab {
+    uint32_t xt[2048], yt[2048];
+    SwizzleTab(int W, int H) {
+        int wbits = 0, hbits = 0;
+        while ((1 << wbits) < W) ++wbits;
+        while ((1 << hbits) < H) ++hbits;
+        char pattern[24];
+        int xb = 0, yb = 0;
+        for (int i = 0; i < wbits + hbits; ++i) {
+            if (xb < wbits && (yb >= hbits || (i % 2 == 0))) { pattern[i] = 'x'; ++xb; }
+            else { pattern[i] = 'y'; ++yb; }
+        }
+        for (int x = 0; x < W; ++x) {
+            uint32_t v = 0; int xi = 0;
+            for (int bi = 0; bi < wbits + hbits; ++bi)
+                if (pattern[bi] == 'x') { v |= (uint32_t)((x >> xi) & 1) << bi; ++xi; }
+            xt[x] = v;
+        }
+        for (int y = 0; y < H; ++y) {
+            uint32_t v = 0; int yi = 0;
+            for (int bi = 0; bi < wbits + hbits; ++bi)
+                if (pattern[bi] == 'y') { v |= (uint32_t)((y >> yi) & 1) << bi; ++yi; }
+            yt[y] = v;
+        }
+    }
+};
+} // namespace
+
+bool DecodeXboxTextureInto(int fmt, const uint8_t* pixels, size_t avail,
+                           const uint32_t* palette, int W, int H, uint32_t* dst) {
+    if (!pixels || !dst || W < 1 || H < 1 || W > 2048 || H > 2048) return false;
+    if (fmt == 0x0c || fmt == 0x0e || fmt == 0x0f) {
+        int blockBytes = (fmt == 0x0c) ? 8 : 16;
+        size_t need = (size_t)((W + 3) / 4) * ((H + 3) / 4) * blockBytes;
+        if (avail < need) return false;
+        const uint8_t* p = pixels;
+        for (int by = 0; by < H; by += 4) {
+            for (int bx = 0; bx < W; bx += 4) {
+                uint8_t alpha[16];
+                if (fmt == 0x0f) {
+                    uint8_t a0 = p[0], a1 = p[1];
+                    int at[8] = { a0, a1 };
+                    if (a0 > a1) { for (int i = 2; i < 8; ++i) at[i] = ((8-i)*a0 + (i-1)*a1)/7; }
+                    else { for (int i = 2; i < 6; ++i) at[i] = ((6-i)*a0 + (i-1)*a1)/5; at[6]=0; at[7]=255; }
+                    uint64_t abits = 0; for (int i = 0; i < 6; ++i) abits |= (uint64_t)p[2+i] << (8*i);
+                    for (int i = 0; i < 16; ++i) alpha[i] = (uint8_t)at[(abits >> (3*i)) & 7];
+                    DecodeColorBlock(p + 8, dst, bx, by, W, H, alpha);
+                    p += 16;
+                } else if (fmt == 0x0e) {
+                    for (int i = 0; i < 16; ++i) { uint8_t a = (p[i/2] >> ((i&1)*4)) & 0xf; alpha[i] = a*17; }
+                    DecodeColorBlock(p + 8, dst, bx, by, W, H, alpha);
+                    p += 16;
+                } else {
+                    DecodeColorBlock(p, dst, bx, by, W, H, nullptr);
+                    p += 8;
+                }
+            }
+        }
+        return true;
+    }
+    if (fmt == 0x0b) {                                   // P8, swizzled, palettised
+        if (avail < (size_t)W * H) return false;
+        SwizzleTab sz(W, H);
+        for (int y = 0; y < H; ++y) {
+            uint32_t yb = sz.yt[y];
+            uint32_t* row = dst + (size_t)y * W;
+            for (int x = 0; x < W; ++x) {
+                uint8_t v = pixels[yb | sz.xt[x]];
+                row[x] = palette ? palette[v]
+                                 : (0xff000000u | ((uint32_t)v << 16) | ((uint32_t)v << 8) | v);
+            }
+        }
+        return true;
+    }
+    int bpp = 0; bool sw = false;
+    uint32_t (*conv16)(uint16_t) = nullptr;
+    enum Kind { K16, K32, KL8, KA8, KAL8 } kind = K16;
+    switch (fmt) {
+    case 0x00: bpp = 1; sw = true;  kind = KL8;  break;
+    case 0x01: bpp = 1; sw = true;  kind = KAL8; break;
+    case 0x09: bpp = 1; sw = true;  kind = KA8;  break;
+    case 0x13: bpp = 1; sw = false; kind = KL8;  break;
+    case 0x27: bpp = 1; sw = false; kind = KA8;  break;
+    case 0x28: bpp = 1; sw = false; kind = KAL8; break;
+    case 0x02: bpp = 2; sw = true;  kind = K16; conv16 = Conv1555;  break;
+    case 0x03: bpp = 2; sw = true;  kind = K16; conv16 = ConvX1555; break;
+    case 0x04: bpp = 2; sw = true;  kind = K16; conv16 = Conv4444;  break;
+    case 0x05: bpp = 2; sw = true;  kind = K16; conv16 = Conv565;   break;
+    case 0x10: bpp = 2; sw = false; kind = K16; conv16 = Conv565;   break;
+    case 0x11: bpp = 2; sw = false; kind = K16; conv16 = Conv1555;  break;
+    case 0x1a: bpp = 2; sw = false; kind = K16; conv16 = Conv4444;  break;
+    case 0x1c: bpp = 2; sw = false; kind = K16; conv16 = ConvX1555; break;
+    case 0x06: bpp = 4; sw = true;  kind = K32; break;
+    case 0x07: bpp = 4; sw = true;  kind = K32; break;
+    case 0x12: bpp = 4; sw = false; kind = K32; break;
+    case 0x1e: bpp = 4; sw = false; kind = K32; break;
+    default: return false;
+    }
+    if (avail < (size_t)W * H * bpp) return false;
+    SwizzleTab sz(W, H);
+    for (int y = 0; y < H; ++y) {
+        uint32_t yb = sw ? sz.yt[y] : (uint32_t)(y * W);
+        uint32_t* row = dst + (size_t)y * W;
+        for (int x = 0; x < W; ++x) {
+            uint32_t idx = sw ? (yb | sz.xt[x]) : (yb + (uint32_t)x);
+            uint32_t c = 0;
+            if (kind == K16) {
+                uint16_t v; memcpy(&v, pixels + (size_t)idx * 2, 2);
+                c = conv16(v);
+            } else if (kind == K32) {
+                memcpy(&c, pixels + (size_t)idx * 4, 4);
+                if (fmt == 0x07 || fmt == 0x1e) c |= 0xff000000u;
+            } else {
+                uint8_t v = pixels[idx];
+                if (kind == KL8) c = 0xff000000u | (v << 16) | (v << 8) | v;
+                else if (kind == KA8) c = ((uint32_t)v << 24) | 0x00ffffffu;
+                else c = ((uint32_t)v << 24) | (v << 16) | (v << 8) | v;
+            }
+            row[x] = c;
+        }
+    }
+    return true;
+}
+
 DecodedTexture DecodeXboxTexture(int fmt, const uint8_t* pixels, size_t avail,
                                  const uint32_t* palette, int W, int H) {
     DecodedTexture out;

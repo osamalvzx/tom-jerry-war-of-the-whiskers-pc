@@ -470,3 +470,14 @@ bool RunGameMainEngine(uint32_t vaGameMain) {
 }
 
 } // namespace tj::hybrid
+
+// The frame log's workload column (d3d8_bridge). Kept here because this file already owns the
+// engine's headers, and C linkage keeps the bridge free of any engine include -- the bridge
+// must build identically whether or not engine mode is even reachable. Zero on the native
+// path: nothing retires through Run there.
+extern "C" void BridgeEngineStats(unsigned long long* insn, unsigned long long* gate) {
+    uint64_t i = 0, g = 0;
+    tj::engine::EngineStats(&i, &g);
+    if (insn) *insn = (unsigned long long)i;
+    if (gate) *gate = (unsigned long long)g;
+}

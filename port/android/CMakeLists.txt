@@ -163,6 +163,7 @@ target_link_libraries(tj_gles PRIVATE GLESv3 EGL android)
 # GLES/EGL — gfx is the ipc ring producer.
 add_executable(tjgame
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/android/game_main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/android/perf_hint.cpp
     ${RT}/gfx/ipc_gfx.cpp
     ${RT}/snd/mix_snd.cpp
     ${HYB}/net_lan.cpp
