@@ -806,6 +806,43 @@ struct BlockEmit {
             if (o.b != 7) A.Put(BFI(GReg(EAX), W_RES, 0, 8));
             return true;
         }
+        // ---- shifts and rotates: ShiftOp does the work (see the form comment). The count
+        // is masked by ShiftOp itself, and `wrote` tells us whether a count of zero made the
+        // whole thing a no-op -- x86 leaves both the operand AND the flags untouched there,
+        // which is the rule most hand-written shift emitters get wrong.
+        case F_SHIFT32_IMM:
+        case F_SHIFT32_CL: {
+            uint32_t ea = 0;
+            const bool mem = !isReg;
+            if (mem) { ea = EmitEA(o); if (ea != W_EA) { A.Put(MOV(W_EA, ea)); ea = W_EA; } }
+            // 16 bytes of scratch for ShiftOp's `bool* wrote` (16, not 1: SP must stay
+            // 16-byte aligned). x5 must be SP as a VALUE -- `mov x5, sp` is not encodable
+            // (ORR reads register 31 as XZR), so it is `add x5, sp, #0`.
+            A.Put(SUBXi(SP_REG, SP_REG, 16));
+            // ⚠ w9 (the EA) is CALLER-SAVED: ShiftOp is free to clobber it, and when it did,
+            // the writeback stored through garbage and faulted. Park it in the same scratch.
+            if (mem) A.Put(STRw(ea, SP_REG, 8));
+            A.Put(MOVX(0, X_CPU));
+            A.Put(MOVZ(1, o.b));
+            if (mem) A.Put(LDRw(2, ea, 0)); else A.Put(MOV(2, GReg(o.rm)));
+            if (o.form == F_SHIFT32_CL) A.Put(UXTB(3, GReg(ECX)));
+            else                        A.MovImm32(3, o.aux);
+            A.Put(MOVZ(4, 32));
+            A.Put(ADDXi(5, SP_REG, 0));
+            A.LdLitX(X_P1, (uint64_t)(uintptr_t)(void*)&ShiftOp);
+            A.Put(BLR(X_P1));
+            guardLive = false;                           // the call clobbered x14
+            A.Put(MOV(W_MEM, 0));                        // w0 = the shifted result
+            A.Put(LDRB(W_F1, SP_REG, 0));                // ...and the `wrote` byte
+            if (mem) A.Put(LDRw(W_EA, SP_REG, 8));       // ...and the EA the call may have eaten
+            A.Put(ADDXi(SP_REG, SP_REG, 16));
+            const uint32_t lSkip = A.NewLabel();
+            A.Cbz(W_F1, lSkip);
+            if (mem) EmitStore(W_EA, W_MEM, 4, i, true);
+            else     A.Put(MOV(GReg(o.rm), W_MEM));
+            A.Bind(lSkip);
+            return true;
+        }
         case F_MOV_R8_IMM: {
             A.MovImm32(W_MEM, o.aux & 0xFF);
             Reg8Write(o.a, W_MEM);

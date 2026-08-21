@@ -87,6 +87,11 @@ enum : uint8_t {
     // The 8-bit ALU grid (00/02/04 .. 38/3A/3C and the 80 group). AluOp already takes a
     // width, so the interpreter side is the 32-bit case with bits=8 and byte accessors.
     F_ALU8_RM8_R, F_ALU8_R_RM8, F_ALU8_AL_IMM, F_ALU8_RM8_IMM,
+    // 32-bit shifts and rotates (C1, D1, D3). The work is ShiftOp's -- rcl/rcr are loops and
+    // every one of the eight has its own count==0 and OF rule -- so all three execution
+    // paths call it, exactly like SSE and x87. What the JIT gains is that the block no
+    // longer ends at a shift, which is the cost that showed up in the census.
+    F_SHIFT32_IMM, F_SHIFT32_CL,
 };
 constexpr uint8_t HF_ISREG = 1;      // modrm mod==3: operand is register e.rm
 constexpr uint8_t HF_SEGFS = 2;      // EA adds the fs base
@@ -624,6 +629,12 @@ static void TryCacheSite(uint32_t eipVal) {
                            memcpy(&aux, p, 4); p += 4; }
     else if (op == 0x83) { WithModRM(F_ALU_RM32_IMM); b = r.reg;
                            aux = (uint32_t)(int32_t)(int8_t)*p++; }
+    else if (op == 0xC1) { if (!g_form8) return;      // shift/rotate r/m32, imm8
+                           WithModRM(F_SHIFT32_IMM); b = r.reg; aux = *p++; }
+    else if (op == 0xD1) { if (!g_form8) return;      // shift/rotate r/m32, 1
+                           WithModRM(F_SHIFT32_IMM); b = r.reg; aux = 1; }
+    else if (op == 0xD3) { if (!g_form8) return;      // shift/rotate r/m32, cl
+                           WithModRM(F_SHIFT32_CL); b = r.reg; }
     else if (op == 0x80) { if (!g_form8) return;      // ALU r/m8, imm8
                            WithModRM(F_ALU8_RM8_IMM); b = r.reg; aux = *p++; }
     else if (op == 0x84) { if (!g_form8) return; WithModRM(F_TEST_RM8_R); }
@@ -997,6 +1008,21 @@ RunResult Run(CpuState& s, uint32_t stopEip, uint64_t maxSteps) {
                         case F_MOVSX8: {
                             uint32_t v = (e.flags & HF_ISREG) ? *Reg8(s, e.rm) : ld8(HotEa());
                             s.r[e.a] = (uint32_t)(int32_t)(int8_t)v;
+                            s.eip = e.next; continue;
+                        }
+                        case F_SHIFT32_IMM:
+                        case F_SHIFT32_CL: {
+                            const uint32_t cnt = (e.form == F_SHIFT32_CL)
+                                               ? (s.r[ECX] & 0xFF) : e.aux;
+                            bool wrote = false;
+                            if (e.flags & HF_ISREG) {
+                                uint32_t r2 = ShiftOp(s, e.b, s.r[e.rm], cnt, 32, &wrote);
+                                if (wrote) s.r[e.rm] = r2;
+                            } else {
+                                uint32_t ea = HotEa();
+                                uint32_t r2 = ShiftOp(s, e.b, ld32(ea), cnt, 32, &wrote);
+                                if (wrote) st32(ea, r2);
+                            }
                             s.eip = e.next; continue;
                         }
                         case F_ALU8_R_RM8: {

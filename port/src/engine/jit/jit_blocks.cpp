@@ -457,6 +457,7 @@ int ExecBlock(CpuState* sp, const Block* bp, uint32_t fsBase,
         g_lbl[F_TEST_RM32_IMM] = &&L_TEST_RM32_IMM;
         g_lbl[F_ALU8_RM8_R]  = &&L_ALU8_RM8_R;   g_lbl[F_ALU8_R_RM8]  = &&L_ALU8_R_RM8;
         g_lbl[F_ALU8_AL_IMM] = &&L_ALU8_AL_IMM;  g_lbl[F_ALU8_RM8_IMM]= &&L_ALU8_RM8_IMM;
+        g_lbl[F_SHIFT32_IMM] = &&L_SHIFT32;      g_lbl[F_SHIFT32_CL]  = &&L_SHIFT32;
         g_lbl[kFormEnd]      = &&L_END;
         g_lblReady = true;
     }
@@ -607,6 +608,19 @@ L_DEC_R: {
     uint32_t cf = s.eflags & F_CF;
     s.r[o->a] = FlagsSub(s, s.r[o->a], 1, 0, 32);
     s.eflags = (s.eflags & ~F_CF) | cf;
+    NEXT();
+}
+L_SHIFT32: {
+    const uint32_t cnt = (o->form == F_SHIFT32_CL) ? (s.r[ECX] & 0xFF) : o->aux;
+    bool wrote = false;
+    if (o->flags & HF_ISREG) {
+        uint32_t r2 = ShiftOp(s, o->b, s.r[o->rm], cnt, 32, &wrote);
+        if (wrote) s.r[o->rm] = r2;
+        NEXT();
+    }
+    uint32_t ea = EA();
+    uint32_t r2 = ShiftOp(s, o->b, ld32(ea), cnt, 32, &wrote);
+    if (wrote) { st32(ea, r2); STORE_CHK(); }
     NEXT();
 }
 L_ALU8_R_RM8: {
