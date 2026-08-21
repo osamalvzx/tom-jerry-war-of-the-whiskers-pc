@@ -69,6 +69,11 @@ enum : uint8_t {
     F_TEST_RM32_R, F_JCC, F_JMP, F_CALL, F_CALL_RM, F_JMP_RM,
     F_RET, F_RETN, F_PUSH_R, F_POP_R, F_PUSH_IMM, F_LEA,
     F_INC_R, F_DEC_R, F_MOVZX8, F_MOVZX16, F_MOVSX8, F_X87,
+    // Byte TEST, added because the JIT's refusal census put these three among the most
+    // expensive instructions in the game: a form the classifier declines costs a dispatcher
+    // round trip AND a full slow decode (the hot table holds F_NONE for it), so 84/A8/F6-/0
+    // alone were ~15% of all declined instructions in an in-match leg.
+    F_TEST_RM8_R, F_TEST_RM8_IMM, F_TEST8_AL_IMM,
 };
 constexpr uint8_t HF_ISREG = 1;      // modrm mod==3: operand is register e.rm
 constexpr uint8_t HF_SEGFS = 2;      // EA adds the fs base
@@ -93,6 +98,12 @@ uint64_t g_hotHits = 0, g_hotMiss = 0;
 
 // SMC page tracking over the exec window (up to 256 MB = 65536 pages).
 uint32_t g_smcLo = 0, g_smcSpan = 0;
+// TJ_ENG_NOFORM8=1 makes the classifier refuse the byte-TEST forms again, i.e. the exact
+// behaviour before they were added. It exists because eng_sweep's tainted-trial class is
+// sensitive to code LAYOUT, so its result may only be judged by a same-binary A/B -- a
+// historical pass count cannot distinguish "this change broke something" from "the trial
+// class re-rolled". Read once, on the first classify.
+int g_form8 = -1;
 uint8_t  g_smcBits[65536 / 8];
 uint32_t g_pageGen[65536];
 
@@ -492,6 +503,10 @@ static const uint8_t* ParseHotModRM(const uint8_t* p, HotRec& r) {
 }
 
 static void TryCacheSite(uint32_t eipVal) {
+    if (g_form8 < 0) {                       // one getenv, on the first classify
+        const char* e8 = getenv("TJ_ENG_NOFORM8");
+        g_form8 = (e8 && *e8 == '1') ? 0 : 1;
+    }
     HotDec& e = g_hotTab[HotHash(eipVal)];
     uint32_t pg = (eipVal - g_smcLo) >> 12;
     // Default: a negative entry, so this site is not re-classified every visit.
@@ -548,7 +563,13 @@ static void TryCacheSite(uint32_t eipVal) {
                            memcpy(&aux, p, 4); p += 4; }
     else if (op == 0x83) { WithModRM(F_ALU_RM32_IMM); b = r.reg;
                            aux = (uint32_t)(int32_t)(int8_t)*p++; }
+    else if (op == 0x84) { if (!g_form8) return; WithModRM(F_TEST_RM8_R); }
     else if (op == 0x85) WithModRM(F_TEST_RM32_R);
+    else if (op == 0xA8) { if (!g_form8) return; aux = *p++; form = F_TEST8_AL_IMM; }
+    else if (op == 0xF6) { if (!g_form8) return;
+                           WithModRM(F_TEST_RM8_IMM);
+                           if (r.reg > 1) return;        // /0 and /1 are TEST imm8; the rest
+                           aux = *p++; }                 // (NOT/NEG/MUL/DIV) stay slow-path
     else if (op == 0x88) WithModRM(F_MOV_RM8_R8);
     else if (op == 0x89) WithModRM(F_MOV_RM32_R);
     else if (op == 0x8A) WithModRM(F_MOV_R8_RM8);
@@ -838,6 +859,19 @@ RunResult Run(CpuState& s, uint32_t stopEip, uint64_t maxSteps) {
                             if (e.b != 7) s.r[EAX] = res;
                             s.eip = e.next; continue;
                         }
+                        case F_TEST_RM8_R: {
+                            uint8_t v = (e.flags & HF_ISREG) ? *Reg8(s, e.rm) : ld8(HotEa());
+                            FlagsLogic(s, (uint32_t)(v & *Reg8(s, e.a)), 8);
+                            s.eip = e.next; continue;
+                        }
+                        case F_TEST_RM8_IMM: {
+                            uint8_t v = (e.flags & HF_ISREG) ? *Reg8(s, e.rm) : ld8(HotEa());
+                            FlagsLogic(s, (uint32_t)(v & (uint8_t)e.aux), 8);
+                            s.eip = e.next; continue;
+                        }
+                        case F_TEST8_AL_IMM:
+                            FlagsLogic(s, (s.r[EAX] & 0xFFu) & (e.aux & 0xFFu), 8);
+                            s.eip = e.next; continue;
                         case F_TEST_RM32_R: {
                             uint32_t v = (e.flags & HF_ISREG) ? s.r[e.rm] : ld32(HotEa());
                             FlagsLogic(s, v & s.r[e.a], 32);

@@ -479,6 +479,19 @@ struct BlockEmit {
         EmitParity(res);
         EmitMerge(keepCF ? 0x8D4 : 0x8D5);
     }
+    // Byte-width logical flags: CF=OF=AF=0, ZF/SF/PF from the BYTE result. Not a width
+    // parameter on FlagsLogical because none of the three bits can come from NZCV here --
+    // a 32-bit ANDS on a zero-extended byte always reports N=0, and Z would be right only by
+    // accident. res8 must already be zero-extended.
+    void FlagsLogical8(uint32_t res8) {
+        Cat _c(*this, EC_FLAGS);
+        A.Put(CMPi(res8, 0));
+        A.Put(CSET(W_F1, C_EQ)); A.Put(ORR(W_F0, WZR, W_F1, 6));      // ZF
+        A.Put(UBFX(W_F1, res8, 7, 1)); A.Put(ORR(W_F0, W_F0, W_F1, 7)); // SF = bit 7
+        EmitParity(res8);
+        EmitMerge(0x8D5);                                             // CF/OF/AF cleared too
+    }
+
     // FlagsLogic: CF=OF=AF=0, ZF/SF/PF from the result. `nzSet` when the producing op was
     // ANDS and already left N/Z correct for the value.
     void FlagsLogical(uint32_t res, bool nzSet) {
@@ -617,6 +630,27 @@ struct BlockEmit {
             A.MovImm32(W_MEM, o.aux);
             EmitAlu(o.b, o.b != 7 ? GReg(EAX) : W_RES, GReg(EAX), W_MEM);
             return true;
+        // ---- byte TEST (84 / F6 /0 / A8). Flags only, and the byte semantics are what make
+        // them their own stencils rather than a width parameter on the 32-bit path: ZF and PF
+        // come from the low BYTE of the result, and SF is bit 7, not bit 31. CF, OF and AF are
+        // cleared, exactly as the interpreter's FlagsLogic(res, 8) does.
+        case F_TEST_RM8_R:
+        case F_TEST_RM8_IMM: {
+            uint32_t v;
+            if (isReg) { Reg8Read(W_MEM, o.rm); v = W_MEM; }
+            else { uint32_t ea = EmitEA(o); A.Put(LDRB(W_MEM, ea, 0)); v = W_MEM; }
+            if (o.form == F_TEST_RM8_R) { Reg8Read(W_RES, o.a); A.Put(AND(W_RES, v, W_RES)); }
+            else { A.MovImm32(W_RES, o.aux & 0xFF); A.Put(AND(W_RES, v, W_RES)); }
+            FlagsLogical8(W_RES);
+            return true;
+        }
+        case F_TEST8_AL_IMM: {
+            A.Put(UXTB(W_RES, GReg(EAX)));
+            A.MovImm32(W_MEM, o.aux & 0xFF);
+            A.Put(AND(W_RES, W_RES, W_MEM));
+            FlagsLogical8(W_RES);
+            return true;
+        }
         case F_TEST_RM32_R: {
             uint32_t v;
             if (isReg) v = GReg(o.rm);
@@ -889,6 +923,61 @@ bool JitSelfTest() {
             if (g.r[EAX] != w.r[EAX] || g.eflags != w.eflags)
                 Report("test", -1, kVals[i], kVals[j], kBg[0], g, w);
         }
+    // ---- byte TEST: 84 (reg,reg), F6 /0 (reg,imm8) and A8 (al,imm8), against the
+    // interpreter's own FlagsLogic(res, 8). The byte forms have their own flag writer
+    // (ZF/PF from the low byte, SF from bit 7, CF/OF/AF cleared), so they need their own
+    // corpus rather than riding on the 32-bit one: a stencil that read SF from bit 31 or
+    // parity from the wrong byte would pass every 32-bit case and be wrong here.
+    {
+        // both halves of each byte-register pair, so AH/CH/DH/BH addressing is covered too
+        static const int kR8[] = { 0 /*AL*/, 1 /*CL*/, 4 /*AH*/, 5 /*CH*/ };
+        for (int ra = 0; ra < 4; ++ra)
+            for (int rb = 0; rb < 4; ++rb) {
+                ops[0].form = F_TEST_RM8_R; ops[0].a = (uint8_t)kR8[ra];
+                ops[0].rm = (uint8_t)kR8[rb]; ops[0].flags = HF_ISREG; ops[0].aux = 0;
+                for (uint32_t i = 0; i < kN; ++i)
+                    for (uint32_t cf = 0; cf < 2; ++cf) {
+                        CpuState g{}, w{};
+                        g.r[EAX] = w.r[EAX] = kVals[i];
+                        g.r[ECX] = w.r[ECX] = kVals[(i * 7 + 3) % kN];
+                        g.r[ESP] = w.r[ESP] = 0x40000000u;
+                        g.eflags = w.eflags = kBg[cf];
+                        if (SelfTestRun(ops, 1, g) < 0) return false;
+                        uint8_t va = *Reg8(w, kR8[ra]), vb = *Reg8(w, kR8[rb]);
+                        FlagsLogic(w, (uint32_t)(vb & va), 8);
+                        ++cases;
+                        if (g.r[EAX] != w.r[EAX] || g.r[ECX] != w.r[ECX] || g.eflags != w.eflags)
+                            Report("test8 r,r", -1, va, vb, kBg[cf], g, w);
+                    }
+            }
+        for (uint32_t i = 0; i < kN; ++i)
+            for (uint32_t j = 0; j < kN; ++j) {
+                uint8_t imm = (uint8_t)kVals[j];
+                // F6 /0 on CL
+                ops[0].form = F_TEST_RM8_IMM; ops[0].a = 0; ops[0].rm = 1 /*CL*/;
+                ops[0].flags = HF_ISREG; ops[0].aux = imm;
+                CpuState g{}, w{};
+                g.r[ECX] = w.r[ECX] = kVals[i];
+                g.r[ESP] = w.r[ESP] = 0x40000000u;
+                g.eflags = w.eflags = kBg[j & 1];
+                if (SelfTestRun(ops, 1, g) < 0) return false;
+                FlagsLogic(w, (uint32_t)((uint8_t)w.r[ECX] & imm), 8);
+                ++cases;
+                if (g.r[ECX] != w.r[ECX] || g.eflags != w.eflags)
+                    Report("test8 rm,imm", -1, kVals[i], imm, kBg[j & 1], g, w);
+                // A8 on AL
+                ops[0].form = F_TEST8_AL_IMM; ops[0].flags = 0; ops[0].aux = imm;
+                CpuState g2{}, w2{};
+                g2.r[EAX] = w2.r[EAX] = kVals[i];
+                g2.r[ESP] = w2.r[ESP] = 0x40000000u;
+                g2.eflags = w2.eflags = kBg[j & 1];
+                if (SelfTestRun(ops, 1, g2) < 0) return false;
+                FlagsLogic(w2, (w2.r[EAX] & 0xFFu) & imm, 8);
+                ++cases;
+                if (g2.r[EAX] != w2.r[EAX] || g2.eflags != w2.eflags)
+                    Report("test8 al,imm", -1, kVals[i], imm, kBg[j & 1], g2, w2);
+            }
+    }
     // ---- every jcc condition against Cond(), over a flag corpus that hits each bit pair
     {
         ops[0].form = F_JCC; ops[0].aux = 0x00001234u; ops[0].flags = 0;

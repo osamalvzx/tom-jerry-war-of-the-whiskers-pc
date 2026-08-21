@@ -85,11 +85,15 @@ static_assert(sizeof(JitOp) == 20, "JitOp must stay dense");
 // The block terminator: a synthetic op whose only field that matters is `eip` = the
 // address the block falls through to. It sits one past the last real op, so the ONE
 // expression `o[1].eip` gives every instruction its fall-through — including the last.
-constexpr uint8_t kFormEnd = 31;
-static_assert(kFormEnd < 32, "g_lbl[32] must hold every form plus the terminator");
-static_assert(F_X87 < kFormEnd, "a real form collided with the block terminator");
+// 63, not 31: the form set grows as the refusal census names the instructions worth
+// covering, and the terminator has to stay clear of every real form. (At 31 the first three
+// forms added -- the byte TESTs -- put F_TEST8_AL_IMM exactly ON the terminator, which the
+// static_assert below now catches at build time rather than as a mystery at run time.)
+constexpr uint8_t kFormEnd = 63;
+static_assert(kFormEnd < 64, "g_lbl[64] must hold every form plus the terminator");
+static_assert(F_TEST8_AL_IMM < kFormEnd, "a real form collided with the block terminator");
 
-const void* g_lbl[32];
+const void* g_lbl[64];
 const void* g_lblBug = nullptr;      // the "form has no executor" label, see FormOk()
 bool        g_lblReady = false;
 
@@ -427,7 +431,7 @@ int ExecBlock(CpuState* sp, const Block* bp, uint32_t fsBase,
               uint32_t* retired, uint32_t* faultEip) {
     if (__builtin_expect(!g_lblReady, 0)) {
         g_lblBug = &&L_BUG;
-        for (int i = 0; i < 32; ++i) g_lbl[i] = &&L_BUG;
+        for (int i = 0; i < 64; ++i) g_lbl[i] = &&L_BUG;
         g_lbl[F_MOV_R_RM32]  = &&L_MOV_R_RM32;   g_lbl[F_MOV_RM32_R]  = &&L_MOV_RM32_R;
         g_lbl[F_MOV_R8_RM8]  = &&L_MOV_R8_RM8;   g_lbl[F_MOV_RM8_R8]  = &&L_MOV_RM8_R8;
         g_lbl[F_MOV_R_IMM32] = &&L_MOV_R_IMM32;  g_lbl[F_MOV_RM32_IMM]= &&L_MOV_RM32_IMM;
@@ -442,6 +446,8 @@ int ExecBlock(CpuState* sp, const Block* bp, uint32_t fsBase,
         g_lbl[F_INC_R]       = &&L_INC_R;        g_lbl[F_DEC_R]       = &&L_DEC_R;
         g_lbl[F_MOVZX8]      = &&L_MOVZX8;       g_lbl[F_MOVZX16]     = &&L_MOVZX16;
         g_lbl[F_MOVSX8]      = &&L_MOVSX8;       g_lbl[F_X87]         = &&L_X87;
+        g_lbl[F_TEST_RM8_R]  = &&L_TEST_RM8_R;   g_lbl[F_TEST_RM8_IMM]= &&L_TEST_RM8_IMM;
+        g_lbl[F_TEST8_AL_IMM]= &&L_TEST8_AL_IMM;
         g_lbl[kFormEnd]      = &&L_END;
         g_lblReady = true;
     }
@@ -541,6 +547,19 @@ L_ALU_EAX_IMM: {
     if (o->b != 7) s.r[EAX] = res;
     NEXT();
 }
+L_TEST_RM8_R: {
+    uint8_t v = (o->flags & HF_ISREG) ? *Reg8(s, o->rm) : ld8(EA());
+    FlagsLogic(s, (uint32_t)(v & *Reg8(s, o->a)), 8);
+    NEXT();
+}
+L_TEST_RM8_IMM: {
+    uint8_t v = (o->flags & HF_ISREG) ? *Reg8(s, o->rm) : ld8(EA());
+    FlagsLogic(s, (uint32_t)(v & (uint8_t)o->aux), 8);
+    NEXT();
+}
+L_TEST8_AL_IMM:
+    FlagsLogic(s, (s.r[EAX] & 0xFFu) & (o->aux & 0xFFu), 8);
+    NEXT();
 L_TEST_RM32_R: {
     uint32_t v = (o->flags & HF_ISREG) ? s.r[o->rm] : ld32(EA());
     FlagsLogic(s, v & s.r[o->a], 32);
