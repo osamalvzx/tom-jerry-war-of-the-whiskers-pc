@@ -30,8 +30,15 @@ $strip = "$sdk\ndk\26.1.10909125\toolchains\llvm\prebuilt\windows-x86_64\bin\llv
 $appdir = "$root\port\android\app"
 $build  = "$root\port\build-apk"
 $stage  = "$build\stage"
+# ⚠ THIS WIPE DELETES THE INSTALLER'S TEMPLATE. A plain (non -Template) run removed
+# WOTW-template.apk, and the next installer build silently kept the last template it had
+# -- three commits stale, in the case that prompted this. Carry it across the wipe.
+$tplKeep = "$build\WOTW-template.apk"
+$tplSave = $null
+if (Test-Path $tplKeep) { $tplSave = "$env:TEMP\WOTW-template.keep.apk"; Copy-Item $tplKeep $tplSave -Force }
 Remove-Item $build -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force "$stage\lib\arm64-v8a" | Out-Null
+if ($tplSave) { Copy-Item $tplSave $tplKeep -Force }   # ...and put it back
 
 # 1) native binaries ------------------------------------------------------------------------
 # libtjapp.so  = the compositor shell (NativeActivity).

@@ -183,6 +183,10 @@ set(TJ_HYBRID_DLL  "${CMAKE_BINARY_DIR}/bin/Release/tj_hybrid.dll")
 # which needs the Android SDK/NDK — on THIS machine, once, not on any player's. When it is
 # absent the installer still builds and simply offers no Android option (TJ_HAVE_APK).
 set(TJ_APK_TEMPLATE "${CMAKE_CURRENT_SOURCE_DIR}/build-apk/WOTW-template.apk")
+# ⚠ Read at CONFIGURE time only. If the template is REBUILT after this runs, re-configure or
+# the installer keeps embedding the old one (build_apk.ps1 -Template then a fresh cmake -S/-B).
+# The resource dependency below makes MSBuild relink when the file's contents change, but only
+# once CMake has re-generated payload.rc from it.
 if(EXISTS "${TJ_APK_TEMPLATE}")
     set(TJ_APK_RC "IDR_APK_TEMPLATE       RCDATA  \"${TJ_APK_TEMPLATE}\"")
     set(TJ_HAVE_APK 1)
@@ -211,8 +215,16 @@ if(TJ_CRT_DIRS)
     # The .rc pulls these in by PATH, so CMake cannot see that the installer depends on their
     # CONTENT. Without this, rebuilding tj_hybrid.dll and not rebuilding tj_setup silently
     # ships the PREVIOUS DLL -- an installer that looks fine and installs a stale game.
+    # ⚠ THE ANDROID TEMPLATE BELONGS IN THIS LIST TOO, and it was missing: rebuilding the
+    # template and then tj_setup relinked NOTHING, so the installer kept embedding a template
+    # three commits old while every timestamp looked fresh. Same failure mode the comment
+    # above describes for the DLL, one file further along.
+    set(TJ_PAYLOAD_DEPS "${TJ_LOADER_EXE};${TJ_HYBRID_DLL};${TJ_SETUP_ICON};${TJ_README_TXT}")
+    if(TJ_HAVE_APK)
+        list(APPEND TJ_PAYLOAD_DEPS "${TJ_APK_TEMPLATE}")
+    endif()
     set_source_files_properties(${CMAKE_BINARY_DIR}/payload.rc PROPERTIES
-        OBJECT_DEPENDS "${TJ_LOADER_EXE};${TJ_HYBRID_DLL};${TJ_SETUP_ICON};${TJ_README_TXT}")
+        OBJECT_DEPENDS "${TJ_PAYLOAD_DEPS}")
 
     add_executable(tj_setup WIN32
         src/setup/setup_main.cpp
