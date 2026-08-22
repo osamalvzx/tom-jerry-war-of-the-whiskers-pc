@@ -383,6 +383,41 @@ bool WriteWholeFile(const std::wstring& path, const std::vector<uint8_t>& data) 
     return ok;
 }
 
+// Export the store as a PFX. The LEGACY format (the default) encrypts the certificate bag
+// with RC2 and the shrouded key bag with 3DES -- and RC2 is NOT a FIPS-approved algorithm, so
+// on a machine with "System cryptography: Use FIPS compliant algorithms" enabled this call
+// fails outright while every step before it succeeded. PBES2 (AES-256/SHA-256, Windows 8+) is
+// approved, so a machine that refuses the legacy format is asked again in the modern one.
+// Legacy is still TRIED FIRST on purpose: it is what every existing player's key was written
+// in, and this file is the only thing that reads them back, so nothing already working changes
+// format under it.
+bool ExportPfx(HCERTSTORE mem, bool pbes2, std::vector<uint8_t>& pfx, DWORD& lastErr) {
+    PKCS12_PBES2_EXPORT_PARAMS p2 = {};
+    void* para = nullptr;
+    DWORD flags = EXPORT_PRIVATE_KEYS;
+    if (pbes2) {
+        p2.dwSize = sizeof p2;
+        p2.hNcryptDescriptor = nullptr;
+        p2.pwszPbes2Alg = const_cast<LPWSTR>(PKCS12_PBES2_ALG_AES256_SHA256);
+        para = &p2;
+        flags |= PKCS12_EXPORT_PBES2_PARAMS;
+    }
+    CRYPT_DATA_BLOB out = {};
+    if (!PFXExportCertStoreEx(mem, &out, kPfxPassword, para, flags)) { lastErr = GetLastError(); return false; }
+    pfx.resize(out.cbData);
+    out.pbData = pfx.data();
+    if (!PFXExportCertStoreEx(mem, &out, kPfxPassword, para, flags)) {
+        lastErr = GetLastError(); pfx.clear(); return false;
+    }
+    pfx.resize(out.cbData);
+    return !pfx.empty();
+}
+
+// ⚠ NAME THE STEP AND THE ERROR CODE. This used to collapse five distinct API failures into
+// one message with no code, and the first field report of it ("A signing certificate could not
+// be created", PC install fine) was therefore impossible to act on: nothing said whether the
+// subject name, the certificate, the memory store or the PFX export was what refused, let
+// alone why. Every failure now carries the call that failed and its GetLastError.
 bool GenerateSigningKey(std::vector<uint8_t>& pfx, std::string& err) {
     // A named container is needed for CertCreateSelfSignCertificate to find the private key;
     // it is deleted again at the end, because the PFX bytes are the only copy we keep.
@@ -393,23 +428,30 @@ bool GenerateSigningKey(std::vector<uint8_t>& pfx, std::string& err) {
 
     HCRYPTPROV prov = 0;
     if (!CryptAcquireContextW(&prov, container, nullptr, PROV_RSA_AES, CRYPT_NEWKEYSET)) {
-        err = "A signing key could not be created."; return false;
+        err = "A signing key could not be created (CryptAcquireContext, error " +
+              std::to_string((unsigned)GetLastError()) + ")."; return false;
     }
     HCRYPTKEY key = 0;
     if (!CryptGenKey(prov, AT_SIGNATURE, (2048 << 16) | CRYPT_EXPORTABLE, &key)) {
+        DWORD e = GetLastError();
         CryptReleaseContext(prov, 0);
         CryptAcquireContextW(&prov, container, nullptr, PROV_RSA_AES, CRYPT_DELETEKEYSET);
-        err = "A signing key could not be generated."; return false;
+        err = "A signing key could not be generated (CryptGenKey, error " +
+              std::to_string((unsigned)e) + ")."; return false;
     }
     CryptDestroyKey(key);
 
     bool ok = false;
+    const char* step = "CertStrToName";      // the last call attempted, for the message below
+    DWORD lastErr = 0;
     BYTE nameBuf[512];
     DWORD nameLen = sizeof nameBuf;
     CERT_NAME_BLOB subject = { 0, nameBuf };
-    if (CertStrToNameW(X509_ASN_ENCODING,
-                       L"CN=Tom and Jerry War of the Whiskers, O=Native port",
-                       CERT_X500_NAME_STR, nullptr, nameBuf, &nameLen, nullptr)) {
+    if (!CertStrToNameW(X509_ASN_ENCODING,
+                        L"CN=Tom and Jerry War of the Whiskers, O=Native port",
+                        CERT_X500_NAME_STR, nullptr, nameBuf, &nameLen, nullptr)) {
+        lastErr = GetLastError();
+    } else {
         subject.cbData = nameLen;
         CRYPT_KEY_PROV_INFO kpi = {};
         kpi.pwszContainerName = container;
@@ -422,17 +464,26 @@ bool GenerateSigningKey(std::vector<uint8_t>& pfx, std::string& err) {
         GetSystemTime(&endSt);
         endSt.wYear = (WORD)(endSt.wYear + 30);
         if (endSt.wMonth == 2 && endSt.wDay == 29) endSt.wDay = 28;   // leap-day safety
+        step = "CertCreateSelfSignCertificate";
         PCCERT_CONTEXT cert = CertCreateSelfSignCertificate(prov, &subject, 0, &kpi, &alg,
                                                             nullptr, &endSt, nullptr);
-        if (cert) {
+        if (!cert) {
+            lastErr = GetLastError();
+        } else {
+            step = "CertOpenStore";
             HCERTSTORE mem = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, nullptr);
-            if (mem && CertAddCertificateContextToStore(mem, cert, CERT_STORE_ADD_ALWAYS, nullptr)) {
-                CRYPT_DATA_BLOB out = {};
-                if (PFXExportCertStoreEx(mem, &out, kPfxPassword, nullptr, EXPORT_PRIVATE_KEYS)) {
-                    pfx.resize(out.cbData);
-                    out.pbData = pfx.data();
-                    ok = PFXExportCertStoreEx(mem, &out, kPfxPassword, nullptr, EXPORT_PRIVATE_KEYS) != FALSE;
-                    pfx.resize(out.cbData);
+            if (!mem) {
+                lastErr = GetLastError();
+            } else if (!CertAddCertificateContextToStore(mem, cert, CERT_STORE_ADD_ALWAYS, nullptr)) {
+                step = "CertAddCertificateContextToStore"; lastErr = GetLastError();
+            } else {
+                step = "PFXExportCertStoreEx";
+                ok = ExportPfx(mem, false, pfx, lastErr);
+                if (!ok) {
+                    DWORD legacyErr = lastErr;
+                    ok = ExportPfx(mem, true, pfx, lastErr);       // FIPS-safe retry (AES-256)
+                    if (ok) step = "PFXExportCertStoreEx (PBES2 fallback used)";
+                    else    lastErr = legacyErr;                   // report the first refusal
                 }
             }
             if (mem) CertCloseStore(mem, 0);
@@ -441,7 +492,9 @@ bool GenerateSigningKey(std::vector<uint8_t>& pfx, std::string& err) {
     }
     CryptReleaseContext(prov, 0);
     CryptAcquireContextW(&prov, container, nullptr, PROV_RSA_AES, CRYPT_DELETEKEYSET);
-    if (!ok) err = "A signing certificate could not be created.";
+    if (!ok)
+        err = std::string("A signing certificate could not be created (") + step + ", error " +
+              std::to_string((unsigned)lastErr) + ").";
     return ok;
 }
 
