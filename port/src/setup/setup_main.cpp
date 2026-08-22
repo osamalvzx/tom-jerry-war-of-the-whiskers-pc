@@ -808,6 +808,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
             DWORD put = 0;                            // BOM: the log is UTF-8, so say so
             WriteFile(g_job.log, "\xEF\xBB\xBF", 3, &put, nullptr);
         }
+        // The /android flag has been silently lost twice -- once to a shell that rewrote it
+        // into a path, once to a build that compiled the feature out -- and BOTH times the
+        // install reported success and produced no apk, which is indistinguishable from the
+        // flag never being passed. Record what actually arrived, in the log itself.
+        g_job.Set(0, L"[args] <" + std::wstring(cmdline ? cmdline : L"") +
+                     L"> android=" + std::wstring(g_job.android ? L"yes" : L"no"));
         bool ok = RunInstall(&g_job);
         if (g_job.log != INVALID_HANDLE_VALUE) CloseHandle(g_job.log);
         CoUninitialize();

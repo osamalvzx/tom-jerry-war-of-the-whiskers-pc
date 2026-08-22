@@ -244,15 +244,21 @@ if(TJ_CRT_DIRS)
     # Same installer, WITHOUT the requireAdministrator manifest, so `/silent` can be driven by
     # a test script into a scratch folder rather than needing a human to click through UAC.
     # It is a test artifact only -- the shipped installer is tj_setup.exe above.
+    # ⚠ apk_build.cpp and TJ_HAVE_APK were MISSING here, so the probe -- whose entire reason
+    # to exist is that `/silent` can be driven by a script -- could not exercise the Android
+    # path at all. `/silent ... /android` ran, reported success, and quietly produced no apk,
+    # which is indistinguishable from "the flag did not arrive" unless you read this file.
     add_executable(tj_setup_probe WIN32
         src/setup/setup_main.cpp
         src/setup/payload.cpp
+        src/setup/apk_build.cpp
         ${CMAKE_BINARY_DIR}/payload.rc
     )
     add_dependencies(tj_setup_probe tj_loader tj_hybrid)
     target_link_libraries(tj_setup_probe PRIVATE tj_setup_core comctl32 shell32 ole32 shlwapi advapi32 uuid)
     target_include_directories(tj_setup_probe PRIVATE src)
-    target_compile_definitions(tj_setup_probe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_definitions(tj_setup_probe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
+                               TJ_HAVE_APK=${TJ_HAVE_APK})
     set_property(TARGET tj_setup_probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
     set_target_properties(tj_setup_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 else()
