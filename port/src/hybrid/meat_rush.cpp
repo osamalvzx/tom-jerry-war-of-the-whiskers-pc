@@ -581,10 +581,23 @@ static void DrawMeatScores(uint32_t hud) {
     if (!m || m < 0x04000000u || m >= 0x10000000u) return;
     if (!hud) return;
     // Everything the GUEST touches here — the rect out-param, the printed string, the
-    // colour triple whose address goes into hud+0x18 — must be guest-visible memory,
+    // colour whose address goes into hud+0x18 — must be guest-visible memory,
     // not host stack/statics (§2.1; the >4GB tripwire caught r[] first).
-    static uint32_t (&kWhite)[3] = *(uint32_t(*)[3])GuestObjAlloc(12, 8);
-    kWhite[0] = kWhite[1] = kWhite[2] = 0x7F;
+    // ⚠ THE COLOUR IS FOUR DWORDS, NOT THREE: {R, G, B, A}. FUN_00015EB0 copies
+    // param_6[0..3] into the quad colour it hands FUN_000796C0, and its own default when the
+    // pointer is null is {0x7F,0x7F,0x7F,0x7F} (the 0x07 0x31 colour escape at 0x1623D
+    // likewise sets {199,100,0,0x7F}), so index 3 is ALPHA. This allocated 12 bytes and
+    // wrote three,
+    // which left the guest reading alpha out of zeroed arena padding — A = 0. THAT is why the
+    // score drew nothing at any position and any scale while the clock rendered in the same
+    // frame through the same function: it WAS drawing, fully transparent.
+    // The alpha is the HUD's own, exactly as both retail clock paths pass it (0x5BC30 and
+    // 0x5E6E0 build {0x7F,0x7F,0x7F,*(hud+0x924)}). hud+0x924 is recomputed every frame as
+    // min(0x7F, per-fighter occlusion) — it fades the HUD text when a fighter is on top of
+    // it — so borrowing it makes the count fade with the clock instead of burning through.
+    static uint32_t (&col)[4] = *(uint32_t(*)[4])GuestObjAlloc(16, 8);
+    col[0] = col[1] = col[2] = 0x7F;
+    col[3] = *(uint32_t*)(uintptr_t)(hud + 0x924);
     static float (&r)[6] = *(float(*)[6])GuestObjAlloc(24, 8);
     static char (&buf)[16] = *(char(*)[16])GuestObjAlloc(16, 8);
     int n = *U8(m + kNumFighters);
@@ -608,27 +621,26 @@ static void DrawMeatScores(uint32_t hud) {
         else
             _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%u", *U8(f + kScoreOff));
         *(float*)(uintptr_t)(hud + 0x14) = 0.06f;                         // text scale
-        *(uint32_t*)(uintptr_t)(hud + 0x18) = (uint32_t)(uintptr_t)kWhite;
-        // ⚠ IN the bar row, not BELOW it. The row is empty in this mode (BlankHealthBars),
-        // which is the whole reason the count goes here -- but the anchor used to be
-        // r[3] + 0.075, i.e. below the row, and that is OFF THE BOTTOM OF THE SCREEN in every
-        // layout whose panels already sit at the bottom. Measured with TJ_MEATDBG on a
-        // four-player match: rect y = 0.830..0.870, anchor y = 0.945. It survived earlier
-        // testing only because a 1v1 layout puts the panels higher up. Centring in the row
-        // cannot go off-screen, because the row itself is drawn.
+        *(uint32_t*)(uintptr_t)(hud + 0x18) = (uint32_t)(uintptr_t)col;
+        // BELOW the bar with real daylight between them. r[2]/r[3] are the bar's top and
+        // bottom edges, so anchoring off r[3] keeps the gap correct at any resolution.
+        // ⚠ Session 33 moved this INTO the bar row on the theory that y 0.945 was off the
+        // bottom of the screen and that was why nothing drew. It was not: the anchor was
+        // always on-screen and the text was always drawing -- with alpha 0 (see the colour
+        // block above). The original placement is the intended one; screenshot-verified in a
+        // four-player match, where the panels sit lowest.
         GCALL(Cdecl, FnHudText, kHudText, hud + 0x10, (r[0] + r[1]) * 0.5f,
-              (r[2] + r[3]) * 0.5f, buf);
-        // TJ_MEATDBG=1: the score HUD has never been confirmed ON THE DEVICE (session 29
-        // verified it on Windows and qemu only, and the user reports it missing on Android).
-        // The two things that can make it draw nothing while everything reports success are
-        // an empty panel RECT (FnPanelRect not filling its out-param) and an off-screen
-        // anchor, so print both rather than guess between them.
+              r[3] + 0.075f, buf);
+        // TJ_MEATDBG=1: rect and anchor, per player. Both were RULED IN by this line during
+        // the alpha hunt -- a valid rect and an on-screen anchor is what narrowed the search
+        // to the one argument it does not print, the colour. Keep it: it is the cheapest way
+        // to tell "the panel geometry moved" apart from "the text is not being drawn".
         static uint32_t dbgTick = 0;
         if (i == 0) ++dbgTick;
         if (MeatDbgOn() && (dbgTick % 60) == 0)
             printf("[meatdbg] score p%u='%s' rect=%.3f,%.3f,%.3f,%.3f -> x=%.3f y=%.3f\n",
                    *U8(f + kPlayerNum), buf, r[0], r[1], r[2], r[3],
-                   (r[0] + r[1]) * 0.5f, (r[2] + r[3]) * 0.5f);
+                   (r[0] + r[1]) * 0.5f, r[3] + 0.075f);
     }
 }
 
