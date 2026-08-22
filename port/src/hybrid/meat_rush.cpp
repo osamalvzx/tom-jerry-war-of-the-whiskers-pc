@@ -146,6 +146,9 @@ static bool g_mode = false;             // MEAT RUSH selected for the next/curre
 static bool g_applied = false;          // are the byte patches currently in place?
 static bool g_installed = false;
 static uint8_t g_maxMeat = 5;           // target count; 0 = unlimited (time decides)
+// Hide the running score (see meat_rush.h). Host-side ON PURPOSE: presentational only, so it
+// stays out of the guest settings blob, the save signature and the LAN contract.
+static bool g_hideScores = false;
 static uint8_t g_barsBlanked = 0;       // health-bar draws currently stubbed out?
 static uint8_t g_barSave[4][3];         // their original first three bytes
 static void BlankHealthBars(bool on);   // defined with the rest of the HUD work below
@@ -169,6 +172,8 @@ static inline uint8_t*  U8(uint32_t va)  { return (uint8_t*)(uintptr_t)va; }
 static inline uint32_t* U32(uint32_t va) { return (uint32_t*)(uintptr_t)va; }
 
 bool MeatRushActive() { return g_mode; }
+bool MeatRushScoresHidden() { return g_hideScores; }
+void MeatRushSetScoresHidden(bool on) { g_hideScores = on; }
 void MeatRushSetMode(bool on) { g_mode = on; }
 void MeatRushSetTarget(uint8_t target) { g_maxMeat = target; }
 bool MeatRushArenaOk(int arenaId) { return arenaId >= 0 && arenaId < 13 && arenaId != kArenaBoxing; }
@@ -593,12 +598,26 @@ static void DrawMeatScores(uint32_t hud) {
         // the retail clock draws at 0.5 and lands in the middle of the screen.
         for (int k = 0; k < 6; ++k) r[k] = 0;
         GCALL(Cdecl, FnPanelRect, kPanelRect, r, 1, *U8(f + kPlayerNum));
-        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%u", *U8(f + kScoreOff));
+        // HIDDEN SCORES: a placeholder while the round is live, the real count once it is
+        // decided. The panel keeps its shape either way -- drawing nothing would leave a hole
+        // where players expect a number, and would be indistinguishable from the HUD bug this
+        // mode has had before. kRoundKo is set by our own win check; kRoundOver is retail's.
+        const bool decided = *U8(m + kRoundKo) || *U8(m + kRoundOver);
+        if (g_hideScores && !decided)
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "?");
+        else
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%u", *U8(f + kScoreOff));
         *(float*)(uintptr_t)(hud + 0x14) = 0.06f;                         // text scale
         *(uint32_t*)(uintptr_t)(hud + 0x18) = (uint32_t)(uintptr_t)kWhite;
-        // BELOW the bar with real daylight between them. r[2]/r[3] are the bar's top and
-        // bottom edges, so anchoring off r[3] keeps the gap correct at any resolution.
-        GCALL(Cdecl, FnHudText, kHudText, hud + 0x10, (r[0] + r[1]) * 0.5f, r[3] + 0.075f, buf);
+        // ⚠ IN the bar row, not BELOW it. The row is empty in this mode (BlankHealthBars),
+        // which is the whole reason the count goes here -- but the anchor used to be
+        // r[3] + 0.075, i.e. below the row, and that is OFF THE BOTTOM OF THE SCREEN in every
+        // layout whose panels already sit at the bottom. Measured with TJ_MEATDBG on a
+        // four-player match: rect y = 0.830..0.870, anchor y = 0.945. It survived earlier
+        // testing only because a 1v1 layout puts the panels higher up. Centring in the row
+        // cannot go off-screen, because the row itself is drawn.
+        GCALL(Cdecl, FnHudText, kHudText, hud + 0x10, (r[0] + r[1]) * 0.5f,
+              (r[2] + r[3]) * 0.5f, buf);
         // TJ_MEATDBG=1: the score HUD has never been confirmed ON THE DEVICE (session 29
         // verified it on Windows and qemu only, and the user reports it missing on Android).
         // The two things that can make it draw nothing while everything reports success are
@@ -609,7 +628,7 @@ static void DrawMeatScores(uint32_t hud) {
         if (MeatDbgOn() && (dbgTick % 60) == 0)
             printf("[meatdbg] score p%u='%s' rect=%.3f,%.3f,%.3f,%.3f -> x=%.3f y=%.3f\n",
                    *U8(f + kPlayerNum), buf, r[0], r[1], r[2], r[3],
-                   (r[0] + r[1]) * 0.5f, r[3] + 0.075f);
+                   (r[0] + r[1]) * 0.5f, (r[2] + r[3]) * 0.5f);
     }
 }
 

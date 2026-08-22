@@ -100,15 +100,30 @@ static char (&g_exitQ)[64] = *(char(*)[64])GuestObjAlloc(64, 8);  // filled at i
 // text is simply wrong. These override the localized entries in place. Two things must be
 // preserved exactly: 0xD6 is used as a printf FORMAT with the shortfall (keep one %d), and
 // \x08x / \x08o are the A/B button glyphs.
+// WHAT THIS MACHINE IS CALLED, in the player's own words. The retail strings said "Xbox";
+// this port replaced that with "PC", which is wrong on the Android build -- the user saw
+// "exists on this PC" on a phone. The hybrid layer builds for BOTH targets from these same
+// sources, so the word is chosen at COMPILE time and concatenated into the literals: one
+// table, no runtime cost, and no way for the two wordings to drift apart.
+// ⚠ Line width: these are drawn into the retail dialog box, which was sized for the
+// longer original wording ("the Xbox hard disk"), so the extra characters are safe.
+#ifdef __ANDROID__
+#define TJ_HOST_WORD    "phone"
+#define TJ_HOST_WORD_UC "PHONE"
+#else
+#define TJ_HOST_WORD    "PC"
+#define TJ_HOST_WORD_UC "PC"
+#endif
+
 static struct { uint16_t idx; const char* text; } kSaveText[] = {   // strings
     // relocated to the guest arena at install (the guest stores the pointers)
-    { 0xD0, "No TOM AND JERRY saved game\nexists on this PC.\nDo you wish to create a new save?" },
-    { 0xD1, "A TOM AND JERRY saved game\nexists on this PC.\nDo you wish to load the saved game?" },
-    { 0xD2, "Loading saved game. Please don't turn\noff your PC." },
-    { 0xD4, "Saving game. Please don't turn\noff your PC." },
+    { 0xD0, "No TOM AND JERRY saved game\nexists on this " TJ_HOST_WORD ".\nDo you wish to create a new save?" },
+    { 0xD1, "A TOM AND JERRY saved game\nexists on this " TJ_HOST_WORD ".\nDo you wish to load the saved game?" },
+    { 0xD2, "Loading saved game. Please don't turn\noff your " TJ_HOST_WORD "." },
+    { 0xD4, "Saving game. Please don't turn\noff your " TJ_HOST_WORD "." },
     { 0xD6, "There is not enough free disk space\nto save games.\nYou need to free %d more blocks.\n"
             "Press \x08x to continue without saving\nor \x08o to free more space." },
-    { 0xD7, "A TOM AND JERRY saved game already\nexists on this PC. Would you\nlike to replace it "
+    { 0xD7, "A TOM AND JERRY saved game already\nexists on this " TJ_HOST_WORD ". Would you\nlike to replace it "
             "with a new save?\nThe old save will be lost." },
 };
 static char* __cdecl Hk_GetText(uint32_t idxArg) {

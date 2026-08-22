@@ -33,6 +33,10 @@
 #include <cstdint>
 #include <cstring>
 
+// file_io.cpp owns where this port keeps its own files; the SCORES preference is remembered
+// there rather than in the game's signed save blob.
+namespace tj::hybrid { const char* UserDataDir(); }
+
 namespace tj::hybrid {
 
 // ---- game entry points -------------------------------------------------------
@@ -74,16 +78,23 @@ static const uint16_t kValBase  = 0xE6;        // value strings must fit in a u8
 // NO "OFF": the MULTIPLAYER menu (offline) and the lobby MODE row (LAN) decide whether MEAT
 // RUSH runs at all. This row is only its target, so "off" here meant nothing.
 enum { V_5 = 0, V_10, V_15, V_20, V_UNLIM, V_COUNT };
+// The SCORES row's own values. Same rules as the ones below: the colour escape is mandatory
+// or the row renders in a different colour from its neighbours, and no literal '%'.
+enum { H_SHOWN = 0, H_HIDDEN, H_COUNT };
 static const char* const kValText[V_COUNT] = {
     "\x07\x31" "5", "\x07\x31" "10", "\x07\x31" "15",
     "\x07\x31" "20", "\x07\x31" "UNLIMITED",
 };
 static const uint8_t kValTarget[V_COUNT] = { 5, 10, 15, 20, 0xFF };
+static const char* const kHideText[H_COUNT] = { "\x07\x31" "SHOWN", "\x07\x31" "HIDDEN" };
 
 const char* MeatCustomText(uint16_t idx) {
     if (idx == kTextBase) return "MAX MEAT:";     // retail labels carry their own colon
                                                 // ("TIME:", "ROUNDS:", "DIFFICULTY:")
+    if (idx == kTextBase + 1) return "SCORES:";
     if (idx >= kValBase && idx < kValBase + V_COUNT) return kValText[idx - kValBase];
+    if (idx >= kValBase + V_COUNT && idx < kValBase + V_COUNT + H_COUNT)
+        return kHideText[idx - kValBase - V_COUNT];
     return nullptr;
 }
 
@@ -91,7 +102,9 @@ const char* MeatCustomText(uint16_t idx) {
 static uint8_t (&g_row)[0x84] = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);                   // the item itself: screen 7 is FULL (0x520 B),
                                                // and its dtor never walks the item list, so a
                                                // DLL-side item is safe and is never freed.
+static uint8_t (&g_hideRow)[0x84] = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);   // SCORES row
 static int      g_sel = V_5;                 // what the row is showing right now
+static int      g_hideSel = H_SHOWN;
 static bool     g_installed = false;
 static uint8_t  g_entryVal = 5;         // the value on entry, restored if the player backs out
 static FnThis    Orig_Build = nullptr;
@@ -99,6 +112,7 @@ static FnThis    Orig_Enter = nullptr;
 static FnUpdate  Orig_Update = nullptr;
 
 static inline uint32_t Row() { return (uint32_t)(uintptr_t)g_row; }
+static inline uint32_t HideRow() { return (uint32_t)(uintptr_t)g_hideRow; }
 static inline uint8_t* U8(uint32_t va) { return (uint8_t*)(uintptr_t)va; }
 static inline uint32_t* U32(uint32_t va) { return (uint32_t*)(uintptr_t)va; }
 
@@ -116,6 +130,26 @@ static void ShowValue() {
     MeatRushApplySetting();                         // (guessing it was why the target stuck at 5)
 }
 
+// Read the remembered SCORES preference. Called at INSTALL as well as when the row is built:
+// the setting has to hold for a match started without ever visiting FIGHT SETTINGS, which is
+// exactly what a returning player does (and what the scripted captures do).
+static int LoadHidePref() {
+    char ini[512];
+    snprintf(ini, sizeof ini, "%s\\tomjerry.ini", tj::hybrid::UserDataDir());
+    return GetPrivateProfileIntA("MeatRush", "HideScores", 0, ini) ? H_HIDDEN : H_SHOWN;
+}
+
+// The SCORES row. Unlike MAX MEAT this value is NOT written into the guest settings blob: it
+// changes nothing the simulation reads, so it stays host-side (meat_rush.h says why) and is
+// remembered in the port's own ini instead of the game's signed save.
+static void ShowHide() {
+    SetValue(HideRow(), 0, (uint32_t)(kValBase + V_COUNT + g_hideSel));
+    MeatRushSetScoresHidden(g_hideSel == H_HIDDEN);
+    char ini[512];
+    snprintf(ini, sizeof ini, "%s\\tomjerry.ini", tj::hybrid::UserDataDir());
+    WritePrivateProfileStringA("MeatRush", "HideScores", g_hideSel == H_HIDDEN ? "1" : "0", ini);
+}
+
 // ---- the row -----------------------------------------------------------------
 static void BuildRow(uint32_t self) {
     uint32_t it = Row();
@@ -125,19 +159,41 @@ static void BuildRow(uint32_t self) {
     SetAlign(it, 0, 1);                                     // centre, like every other row
     SetScale(it, 0, 0x3D23D70A);                            // 0.04f -- the screen's row scale
     *(float*)(uintptr_t)(it + 0x40) = 0.5f;
-    *(float*)(uintptr_t)(it + 0x44) = 0.65f;                // between MARKERS 0.58, CONFIRM 0.72
+    // TWO rows now share the gap between MARKERS (0.58) and CONFIRM (0.72), at 0.622 and
+    // 0.666. Keeping them inside the SAME gap avoids re-spacing retail's rows, which is where
+    // the layout traps live. The spacing was set by LOOKING at it: the first attempt (0.632 /
+    // 0.686) put SCORES 0.034 from CONFIRM -- visibly crowding it, where every other row on
+    // this screen sits ~0.05 apart. Change these only with a fresh capture in hand
+    // (port/tools/meat_ui_shot.ps1).
+    *(float*)(uintptr_t)(it + 0x44) = 0.622f;
     *U8(it + 0x48) = 1;                                     // visible
     *U8(it + 0x49) = 1;                                     // selectable
     *U8(it + 0x4B) = 0;                                     // not greyed out
     ShowValue();
 
-    // Splice into the d-pad ring BETWEEN Markers and Confirm.  AppendItem would put it after
-    // CONFIRM, which reads as "past the OK button".  The screen's tail pointer still points at
-    // CONFIRM, so nothing else has to change.
-    *U32(it + 0x60) = self + kRowConfirm;                   // our next
-    *U32(it + 0x64) = self + kRowMarkers;                   // our prev
+    // The SCORES row, built the same way and sitting just below MAX MEAT.
+    uint32_t hr = HideRow();
+    memset(g_hideRow, 0, sizeof g_hideRow);
+    ItemCtor(hr, 0);
+    SetLabel(hr, 0, kTextBase + 1);
+    SetAlign(hr, 0, 1);
+    SetScale(hr, 0, 0x3D23D70A);                            // 0.04f, the screen's row scale
+    *(float*)(uintptr_t)(hr + 0x40) = 0.5f;
+    *(float*)(uintptr_t)(hr + 0x44) = 0.666f;
+    *U8(hr + 0x48) = 1;                                     // visible
+    *U8(hr + 0x49) = 1;                                     // selectable
+    *U8(hr + 0x4B) = 0;                                     // not greyed out
+    ShowHide();
+
+    // Splice BOTH into the d-pad ring between Markers and Confirm, in visual order.
+    // AppendItem would put them after CONFIRM, which reads as "past the OK button". The
+    // screen's tail pointer still points at CONFIRM, so nothing else has to change.
+    *U32(it + 0x60) = hr;                                   // MAX MEAT -> SCORES
+    *U32(it + 0x64) = self + kRowMarkers;
+    *U32(hr + 0x60) = self + kRowConfirm;                   // SCORES -> CONFIRM
+    *U32(hr + 0x64) = it;
     *U32(self + kRowMarkers + 0x60) = it;
-    *U32(self + kRowConfirm + 0x64) = it;
+    *U32(self + kRowConfirm + 0x64) = hr;
 }
 
 static void SeedRow() {
@@ -145,6 +201,11 @@ static void SeedRow() {
     g_entryVal = *U8(kSetting);
     if (g_sel == V_UNLIM && !TimeLimited()) g_sel = V_5;   // cannot end: no target, no clock
     ShowValue();
+    // The SCORES preference lives in the port's ini, not the game's save: read it once, then
+    // let the row own it. Reading it here rather than at install keeps it correct if the file
+    // is edited between visits to the screen.
+    g_hideSel = LoadHidePref();
+    ShowHide();
 }
 
 // ---- hooks -------------------------------------------------------------------
@@ -163,11 +224,21 @@ static void __fastcall Hk_Enter(uint32_t self, uint32_t edx) {
 }
 
 static uint32_t __fastcall Hk_Update(uint32_t self, uint32_t edx) {
-    bool mine = (*U32(self + 4) == Row());
+    const uint32_t selItem = *U32(self + 4);
+    bool mine     = (selItem == Row());
+    bool mineHide = (selItem == HideRow());
     uint32_t r = GVCALL(Fastcall, FnUpdate, Orig_Update, self, edx);
 
     uint32_t m = *(volatile uint32_t*)(uintptr_t)kMasterPtr;
     uint32_t in = m ? *U32(m + kInputMgr) : 0;
+    if (mineHide && in) {                                    // the SCORES row: two values
+        int d = 0;
+        for (uint32_t pad = 0; pad < 4 && !d; ++pad) {
+            if (InputTest(in, 0, 4, pad)) d = 1;             // RIGHT
+            else if (InputTest(in, 0, 3, pad)) d = -1;       // LEFT
+        }
+        if (d) { g_hideSel = (g_hideSel + d + H_COUNT) % H_COUNT; ShowHide(); }
+    }
     if (mine && in) {
         // Retail's Update only edits items it recognises by pointer, so it ignored ours --
         // the left/right delta has to be applied here.  Re-querying the input is safe: these
@@ -229,6 +300,8 @@ int InstallMeatUi() {
     *U32(kVTable + 0x14) = DispatchRegister(HOOK_FC(Hk_Enter),  "meat-ui:vt.enter");
     VirtualProtect((void*)(uintptr_t)kVTable, 0x2C, old, &old);
     MeatRushApplySetting();                      // honour whatever the save already holds
+    g_hideSel = LoadHidePref();                  // ...and whatever the player last chose here
+    MeatRushSetScoresHidden(g_hideSel == H_HIDDEN);
     printf("[meat] fight-settings row installed (vtable %s)\n", ok ? "as expected" : "UNEXPECTED");
     return ok ? 0 : 1;
 }

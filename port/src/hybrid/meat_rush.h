@@ -27,6 +27,15 @@ void MeatRushSetTarget(uint8_t target);
 // meat_ui.cpp -- the FIGHT SETTINGS row that turns the mode on, and its strings.
 int  InstallMeatUi();
 void MeatRushApplySetting();
+
+// HIDE THE SCORE UNTIL THE END. Purely presentational: the HUD draws "?" instead of each
+// fighter's count while a round is running, and the real numbers once it is decided. It is
+// NOT a simulation input -- nothing about scoring, item spawning or win conditions reads it --
+// so it is deliberately host-side state, outside the guest settings blob, outside the save
+// signature and outside the LAN contract. Two peers may therefore disagree about it, which is
+// the correct behaviour for a per-player display preference.
+bool MeatRushScoresHidden();
+void MeatRushSetScoresHidden(bool on);
 const char* MeatCustomText(uint16_t idx);
 
 // meat_menu.cpp -- the MULTIPLAYER main-menu row and the submenu on dead screen 14.

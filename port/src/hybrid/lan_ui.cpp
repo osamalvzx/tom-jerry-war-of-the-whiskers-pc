@@ -640,6 +640,16 @@ static void __fastcall Hk_BrowseBuild(uint32_t self, uint32_t) {
     ShowModalRows(false);
 }
 
+// Same compile-time host word as the save prompts (fe_menu.cpp): on Android this is a
+// phone, not a PC, and the LAN browser is one of the few places the player is told so.
+#ifndef TJ_HOST_WORD_UC
+#ifdef __ANDROID__
+#define TJ_HOST_WORD_UC "PHONE"
+#else
+#define TJ_HOST_WORD_UC "PC"
+#endif
+#endif
+
 static void RefreshBrowserText() {
     Txt(T_TITLE5, "LAN GAME");
     Txt(T_NAME_L, "YOUR NAME:  %s", LanGetName());
@@ -668,7 +678,7 @@ static void RefreshBrowserText() {
         RowShow((uint32_t)(uintptr_t)g_b_rowMode[i].mem, live, false);
         RowShow((uint32_t)(uintptr_t)g_b_rowTag[i].mem, live, false);
     }
-    Txt(T_EMPTY, "NO GAMES YET - IS THE OTHER PC ON THIS NETWORK?");
+    Txt(T_EMPTY, "NO GAMES YET - IS THE OTHER " TJ_HOST_WORD_UC " ON THIS NETWORK?");
     RowShow((uint32_t)(uintptr_t)g_b_empty.mem, n == 0, false);
     Txt(T_STATUS5, "%s", LanStatusLine());
     Txt(T_FOOT5, BTN_B " BACK    " BTN_A " SELECT");

@@ -21,10 +21,15 @@ if ($txt -match '(?m)^Width=')  { $txt = $txt -replace '(?m)^Width=.*',  "Width=
 if ($txt -match '(?m)^Height=') { $txt = $txt -replace '(?m)^Height=.*', "Height=$Height" }
 Set-Content -Path $ini -Value $txt -Encoding ascii
 
-# main menu is CHALLENGE / QUICK GAME / TOURNAMENT / LAN GAME / OPTIONS / EXIT, and OPTIONS is
-# four DOWNs from the QUICK GAME default; screen 6's first row is FIGHT SETTINGS (returns 7).
-# On screen 7 the rows are TIME, ROUNDS, DIFFICULTY, VIBRATION, MARKERS, [MEAT RUSH], CONFIRM.
-$nav = "@20:start,@1:start,@4:down,@4:down,@4:down,@4:down,@4:a,@6:a"
+# ⚠ THIS COMMENT WAS STALE AND THE SCRIPT WALKED INTO THE WRONG SCREEN. The main menu is no
+# longer CHALLENGE / QUICK GAME / TOURNAMENT / LAN GAME / OPTIONS / EXIT: meat_menu.cpp
+# splices a MULTIPLAYER row in and moves QUICK GAME and TOURNAMENT into it, so the menu is
+# CHALLENGE / MULTIPLAYER / LAN GAME / OPTIONS / EXIT with MULTIPLAYER as the default row
+# (a single A on screen 4 enters it -- proven by the device legs). OPTIONS is therefore TWO
+# DOWNs, not four; four landed on CHALLENGE (screen 10) and the capture never saw screen 7.
+# Screen 6's first row is FIGHT SETTINGS (returns 7). On screen 7 the rows are TIME, ROUNDS,
+# DIFFICULTY, VIBRATION, MARKERS, [MAX MEAT], [SCORES], CONFIRM.
+$nav = "@20:start,@1:start,@4:down,@4:down,@4:a,@6:a"
 $down = (1..5 | ForEach-Object { "@7:down" }) -join ","
 $right = if ($Rights -gt 0) { "," + ((1..$Rights | ForEach-Object { "@7:right" }) -join ",") } else { "" }
 $env:TJ_INPUT = "$nav,$down$right,@7:down,@7:a"
