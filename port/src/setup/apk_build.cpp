@@ -35,6 +35,41 @@ namespace {
 // file being usable by accident, and is not protecting anything from anyone.
 static const wchar_t* const kPfxPassword = L"tjwow";
 
+// WHAT A USABLE SIGNING IDENTITY IS. Preferred form is a PFX (key + certificate in one file,
+// portable, self-contained). But PFX export is the ONE step in this whole sequence that a
+// hostile environment can refuse while everything else succeeds -- an antivirus heuristic that
+// treats "export a private key" as credential theft, a policy that forbids it, a CSP that
+// cannot produce it. When that happens the key and certificate are still perfectly good; only
+// the packaging failed. So there is a second form: leave the private key in its CAPI container
+// (they persist in the user profile) and remember the container NAME plus the certificate's
+// DER bytes. Both forms sign identically, and both keep the SAME certificate across installs,
+// which is the only property Android actually cares about for updating an app in place.
+struct SigningKey {
+    std::vector<uint8_t> pfx;        // form 1: the whole identity in one blob
+    std::vector<uint8_t> cerDer;     // form 2: the certificate...
+    std::wstring         container;  // ...and the container its private key lives in
+    std::string          note;       // why form 2 was used, kept beside the key on disk
+    bool Empty() const { return pfx.empty() && (cerDer.empty() || container.empty()); }
+    bool UsesPfx() const { return !pfx.empty(); }
+};
+
+// The CSP is named EXPLICITLY everywhere, and that is not cosmetic. Passing nullptr means "the
+// default provider for PROV_RSA_AES", which is a registry setting a third-party CSP (antivirus,
+// smart-card middleware, an enterprise agent) is free to redirect. Create the key under one
+// provider and let PFXExportCertStoreEx look for it under another and the export fails to find
+// a key that plainly exists -- with nothing useful in GetLastError, because nothing errored.
+static const wchar_t* const kCsp = MS_ENH_RSA_AES_PROV_W;
+
+// TJ_APK_NO_PFX=1 forces the export to "fail" so the container-backed path can be exercised
+// on a machine where the normal one works. The fallback only ever runs where the ordinary
+// route already failed, which means it is exactly the code no developer's machine reaches --
+// so there has to be a way to reach it deliberately, or it ships untested.
+bool ForceExportFailure() {
+    char v[8] = {};
+    return GetEnvironmentVariableA("TJ_APK_NO_PFX", v, sizeof v) > 0 && v[0] && v[0] != '0';
+}
+
+
 // ---------------------------------------------------------------- little-endian writers
 void Put16(std::vector<uint8_t>& v, uint16_t x) { v.push_back((uint8_t)x); v.push_back((uint8_t)(x >> 8)); }
 void Put32(std::vector<uint8_t>& v, uint32_t x) { for (int i = 0; i < 4; ++i) v.push_back((uint8_t)(x >> (i * 8))); }
@@ -350,6 +385,59 @@ bool Pkcs7Sign(const void* pfx, size_t pfxBytes, const wchar_t* pw,
     return ok != FALSE;
 }
 
+// Sign from a certificate whose private key stays in its CAPI container -- the form used when
+// the PFX export was refused. Same CryptSignMessage, same detached PKCS#7, same certificate;
+// the only difference is where the key is found. The container is NOT deleted afterwards:
+// unlike the PFX path, it is the only copy of the key there is.
+bool Pkcs7SignContainer(const SigningKey& key, const std::vector<uint8_t>& data,
+                        std::vector<uint8_t>& out, std::string& err) {
+    PCCERT_CONTEXT cert = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                                       key.cerDer.data(), (DWORD)key.cerDer.size());
+    if (!cert) {
+        err = "The signing certificate could not be read (error " +
+              std::to_string((unsigned)GetLastError()) + ")."; return false;
+    }
+    CRYPT_KEY_PROV_INFO kpi = {};
+    kpi.pwszContainerName = const_cast<LPWSTR>(key.container.c_str());
+    kpi.pwszProvName = const_cast<LPWSTR>(kCsp);
+    kpi.dwProvType = PROV_RSA_AES;
+    kpi.dwKeySpec = AT_SIGNATURE;
+    if (!CertSetCertificateContextProperty(cert, CERT_KEY_PROV_INFO_PROP_ID, 0, &kpi)) {
+        DWORD e = GetLastError();
+        CertFreeCertificateContext(cert);
+        err = "The signing key could not be attached (error " + std::to_string((unsigned)e) + ").";
+        return false;
+    }
+    CRYPT_SIGN_MESSAGE_PARA para = {};
+    para.cbSize = sizeof para;
+    para.dwMsgEncodingType = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
+    para.pSigningCert = cert;
+    para.HashAlgorithm.pszObjId = const_cast<char*>(szOID_NIST_sha256);
+    para.cMsgCert = 1;
+    para.rgpMsgCert = &cert;
+
+    const BYTE* msg = data.data();
+    DWORD msgLen = (DWORD)data.size();
+    DWORD outLen = 0;
+    BOOL ok = CryptSignMessage(&para, TRUE /*detached*/, 1, &msg, &msgLen, nullptr, &outLen);
+    if (ok) {
+        out.resize(outLen);
+        ok = CryptSignMessage(&para, TRUE, 1, &msg, &msgLen, out.data(), &outLen);
+        out.resize(outLen);
+    }
+    if (!ok) err = "The Android package could not be signed (container, error " +
+                   std::to_string((unsigned)GetLastError()) + ").";
+    CertFreeCertificateContext(cert);
+    return ok != FALSE;
+}
+
+bool Pkcs7SignKey(const SigningKey& key, const std::vector<uint8_t>& data,
+                  std::vector<uint8_t>& out, std::string& err) {
+    if (key.UsesPfx())
+        return Pkcs7Sign(key.pfx.data(), key.pfx.size(), kPfxPassword, data, out, err);
+    return Pkcs7SignContainer(key, data, out, err);
+}
+
 
 // ---------------------------------------------------------------- the player's signing key
 //
@@ -403,14 +491,18 @@ bool ExportPfx(HCERTSTORE mem, bool pbes2, std::vector<uint8_t>& pfx, DWORD& las
         flags |= PKCS12_EXPORT_PBES2_PARAMS;
     }
     CRYPT_DATA_BLOB out = {};
-    if (!PFXExportCertStoreEx(mem, &out, kPfxPassword, para, flags)) { lastErr = GetLastError(); return false; }
+    SetLastError(0);
+    if (!PFXExportCertStoreEx(mem, &out, kPfxPassword, para, flags) || out.cbData == 0) {
+        lastErr = GetLastError(); return false;              // (0 here means it refused silently)
+    }
     pfx.resize(out.cbData);
     out.pbData = pfx.data();
-    if (!PFXExportCertStoreEx(mem, &out, kPfxPassword, para, flags)) {
+    SetLastError(0);
+    if (!PFXExportCertStoreEx(mem, &out, kPfxPassword, para, flags) || out.cbData == 0) {
         lastErr = GetLastError(); pfx.clear(); return false;
     }
     pfx.resize(out.cbData);
-    return !pfx.empty();
+    return true;
 }
 
 // ⚠ NAME THE STEP AND THE ERROR CODE. This used to collapse five distinct API failures into
@@ -418,7 +510,7 @@ bool ExportPfx(HCERTSTORE mem, bool pbes2, std::vector<uint8_t>& pfx, DWORD& las
 // be created", PC install fine) was therefore impossible to act on: nothing said whether the
 // subject name, the certificate, the memory store or the PFX export was what refused, let
 // alone why. Every failure now carries the call that failed and its GetLastError.
-bool GenerateSigningKey(std::vector<uint8_t>& pfx, std::string& err) {
+bool GenerateSigningKey(SigningKey& out, std::string& err) {
     // A named container is needed for CertCreateSelfSignCertificate to find the private key;
     // it is deleted again at the end, because the PFX bytes are the only copy we keep.
     wchar_t container[64];
@@ -427,7 +519,7 @@ bool GenerateSigningKey(std::vector<uint8_t>& pfx, std::string& err) {
     swprintf_s(container, L"tjwow-apk-%08lx%04hx%04hx", g.Data1, g.Data2, g.Data3);
 
     HCRYPTPROV prov = 0;
-    if (!CryptAcquireContextW(&prov, container, nullptr, PROV_RSA_AES, CRYPT_NEWKEYSET)) {
+    if (!CryptAcquireContextW(&prov, container, kCsp, PROV_RSA_AES, CRYPT_NEWKEYSET)) {
         err = "A signing key could not be created (CryptAcquireContext, error " +
               std::to_string((unsigned)GetLastError()) + ")."; return false;
     }
@@ -435,13 +527,14 @@ bool GenerateSigningKey(std::vector<uint8_t>& pfx, std::string& err) {
     if (!CryptGenKey(prov, AT_SIGNATURE, (2048 << 16) | CRYPT_EXPORTABLE, &key)) {
         DWORD e = GetLastError();
         CryptReleaseContext(prov, 0);
-        CryptAcquireContextW(&prov, container, nullptr, PROV_RSA_AES, CRYPT_DELETEKEYSET);
+        CryptAcquireContextW(&prov, container, kCsp, PROV_RSA_AES, CRYPT_DELETEKEYSET);
         err = "A signing key could not be generated (CryptGenKey, error " +
               std::to_string((unsigned)e) + ")."; return false;
     }
     CryptDestroyKey(key);
 
     bool ok = false;
+    bool keepContainer = false;              // set when the key must survive this call
     const char* step = "CertStrToName";      // the last call attempted, for the message below
     DWORD lastErr = 0;
     BYTE nameBuf[512];
@@ -455,6 +548,7 @@ bool GenerateSigningKey(std::vector<uint8_t>& pfx, std::string& err) {
         subject.cbData = nameLen;
         CRYPT_KEY_PROV_INFO kpi = {};
         kpi.pwszContainerName = container;
+        kpi.pwszProvName = const_cast<LPWSTR>(kCsp);      // never "whatever the default is"
         kpi.dwProvType = PROV_RSA_AES;
         kpi.dwKeySpec = AT_SIGNATURE;
         CRYPT_ALGORITHM_IDENTIFIER alg = {};
@@ -478,12 +572,28 @@ bool GenerateSigningKey(std::vector<uint8_t>& pfx, std::string& err) {
                 step = "CertAddCertificateContextToStore"; lastErr = GetLastError();
             } else {
                 step = "PFXExportCertStoreEx";
-                ok = ExportPfx(mem, false, pfx, lastErr);
+                DWORD pbErr = 0;
+                // ⚠ REPORT BOTH REFUSALS. The first version of this reported only the legacy
+                // code and threw the PBES2 one away, which is how a field report came back
+                // reading "error 0" and still could not be acted on. Two formats failing for
+                // two different reasons is a different diagnosis from two failing for one.
+                if (!ForceExportFailure()) {
+                    ok = ExportPfx(mem, false, out.pfx, lastErr);
+                    if (!ok) ok = ExportPfx(mem, true, out.pfx, pbErr);   // AES-256 (FIPS-safe)
+                }
                 if (!ok) {
-                    DWORD legacyErr = lastErr;
-                    ok = ExportPfx(mem, true, pfx, lastErr);       // FIPS-safe retry (AES-256)
-                    if (ok) step = "PFXExportCertStoreEx (PBES2 fallback used)";
-                    else    lastErr = legacyErr;                   // report the first refusal
+                    // The export is packaging, not identity. Keep the certificate and the
+                    // container the private key already lives in, and sign from those.
+                    out.note = "PFX export refused (legacy error " +
+                               std::to_string((unsigned)lastErr) + ", PBES2 error " +
+                               std::to_string((unsigned)pbErr) +
+                               "); the key stayed in its container instead.";
+                    out.pfx.clear();
+                    out.cerDer.assign(cert->pbCertEncoded, cert->pbCertEncoded + cert->cbCertEncoded);
+                    out.container = container;
+                    ok = !out.cerDer.empty();
+                    keepContainer = ok;              // the private key must OUTLIVE this call
+                    if (!ok) { step = "the certificate had no encoded bytes"; lastErr = 0; }
                 }
             }
             if (mem) CertCloseStore(mem, 0);
@@ -491,7 +601,8 @@ bool GenerateSigningKey(std::vector<uint8_t>& pfx, std::string& err) {
         }
     }
     CryptReleaseContext(prov, 0);
-    CryptAcquireContextW(&prov, container, nullptr, PROV_RSA_AES, CRYPT_DELETEKEYSET);
+    if (!keepContainer)
+        CryptAcquireContextW(&prov, container, kCsp, PROV_RSA_AES, CRYPT_DELETEKEYSET);
     if (!ok)
         err = std::string("A signing certificate could not be created (") + step + ", error " +
               std::to_string((unsigned)lastErr) + ").";
@@ -499,13 +610,45 @@ bool GenerateSigningKey(std::vector<uint8_t>& pfx, std::string& err) {
 }
 
 // Load the player's key, creating it the first time. `keyFile`'s directory must exist.
-bool EnsureSigningKey(const std::wstring& keyFile, std::vector<uint8_t>& pfx, std::string& err) {
-    if (ReadWholeFile(keyFile, pfx) && !pfx.empty()) return true;
-    if (!GenerateSigningKey(pfx, err)) return false;
-    if (!WriteWholeFile(keyFile, pfx)) {
-        // Not fatal: the apk can still be signed, it just will not update a previous one.
-        // Say nothing here — the caller's log carries the path, and failing the whole
-        // install over a cache file would be worse than the consequence.
+// ⚠ THE PFX PATH IS CHECKED FIRST AND IS UNCHANGED. Every player whose key already works keeps
+// working byte for byte; the container form below is only ever reached on a machine where the
+// export failed, so it cannot regress anyone.
+bool EnsureSigningKey(const std::wstring& keyFile, SigningKey& key, std::string& err) {
+    if (ReadWholeFile(keyFile, key.pfx) && !key.pfx.empty()) return true;
+    key.pfx.clear();
+
+    // The container form: the certificate beside the name of the container holding its key.
+    const std::wstring cerFile = keyFile + L".cer";
+    const std::wstring cspFile = keyFile + L".csp";
+    std::vector<uint8_t> cspRaw;
+    if (ReadWholeFile(cerFile, key.cerDer) && !key.cerDer.empty() &&
+        ReadWholeFile(cspFile, cspRaw) && !cspRaw.empty()) {
+        std::string nameA((const char*)cspRaw.data(), cspRaw.size());
+        while (!nameA.empty() && (nameA.back() == 10 || nameA.back() == 13 || nameA.back() == 0))
+            nameA.pop_back();
+        key.container.assign(nameA.begin(), nameA.end());     // the name is ASCII by construction
+        if (!key.container.empty()) return true;
+    }
+    key.cerDer.clear(); key.container.clear();
+
+    if (!GenerateSigningKey(key, err)) return false;
+    // Persisting is best-effort: an apk that cannot update a previous one still beats no apk.
+    if (key.UsesPfx()) {
+        WriteWholeFile(keyFile, key.pfx);
+    } else {
+        WriteWholeFile(cerFile, key.cerDer);
+        // The container name is ASCII by construction (GenerateSigningKey formats it from a
+        // GUID), so the narrowing is exact -- but spell it out rather than let a wide-to-narrow
+        // conversion happen implicitly.
+        std::vector<uint8_t> nameA;
+        for (wchar_t c : key.container) nameA.push_back((uint8_t)(c & 0x7F));
+        WriteWholeFile(cspFile, nameA);
+        // The reason lands on disk too. This path is silent by design -- the player gets a
+        // working apk and no scary message -- so without this nobody would ever learn WHY the
+        // export was refused on that machine, which is the one thing we still want to know.
+        if (!key.note.empty())
+            WriteWholeFile(keyFile + L".txt",
+                           std::vector<uint8_t>(key.note.begin(), key.note.end()));
     }
     return true;
 }
@@ -523,8 +666,8 @@ bool BuildAndroidApk(const void* templateApk, size_t templateBytes,
     if (!ReadTemplate((const uint8_t*)templateApk, templateBytes, tpl, err)) return false;
 
     // Do this BEFORE writing 223 MB: a key problem should fail in a second, not a minute.
-    std::vector<uint8_t> pfx;
-    if (!EnsureSigningKey(keyFile, pfx, err)) return false;
+    SigningKey signKey;
+    if (!EnsureSigningKey(keyFile, signKey, err)) return false;
 
     // What goes in the pack.
     std::vector<PakFile> files;
@@ -650,7 +793,7 @@ bool BuildAndroidApk(const void* templateApk, size_t templateBytes,
     }
     std::vector<uint8_t> sfBytes(sf.begin(), sf.end());
     std::vector<uint8_t> p7;
-    if (!Pkcs7Sign(pfx.data(), pfx.size(), kPfxPassword, sfBytes, p7, err)) return false;
+    if (!Pkcs7SignKey(signKey, sfBytes, p7, err)) return false;
 
     if (!AddEntry(out, dir, "META-INF/MANIFEST.MF", manifest.data(), manifest.size()) ||
         !AddEntry(out, dir, "META-INF/TJSIGN.SF", sf.data(), sf.size()) ||
