@@ -28,7 +28,8 @@
 namespace tj::ipc {
 
 constexpr uint32_t kMagic     = 0x544A4642;   // 'TJFB'
-constexpr uint32_t kVersion   = 2;            // v2: audio PCM ring appended
+constexpr uint32_t kVersion   = 3;            // v3: four pads (local multiplayer)
+constexpr uint32_t kMaxPads   = 4;            // Xbox seats; the app routes devices to these
 constexpr uint32_t kRingBytes = 64u << 20;    // >> largest single op (a 4 MB texture) + slack
 constexpr uint32_t kHeaderBytes = 4096;
 // Audio: the game-side software mixer (mix_snd.cpp) writes 48 kHz STEREO int16 frames into
@@ -55,7 +56,13 @@ struct Header {
     std::atomic<uint32_t> gameReady;          // game -> app: Device::Create ran
     // Pad seqlock: writer bumps to odd, writes, bumps to even; reader retries on odd/change.
     std::atomic<uint32_t> padSeq;
-    PadShm pad;
+    // ⚠ FOUR PADS, not one. This carried a single PadShm, so every controller plugged into
+    // the phone drove player 1 and seats 2-4 read a dead pad -- exactly the bug the PC had
+    // before v1.1.0. The app owns the device -> seat assignment (a controller claims a seat
+    // the first time somebody actually presses something on it); the game just reads them.
+    // One seqlock covers the whole array, so a reader never sees seat 1 from this frame and
+    // seat 2 from the last.
+    PadShm pad[kMaxPads];
     // SPSC ring cursors — MONOTONIC byte counts (offset = value % kRingBytes).
     std::atomic<uint64_t> head;               // producer (game) publish cursor
     std::atomic<uint64_t> tail;               // consumer (app) read cursor

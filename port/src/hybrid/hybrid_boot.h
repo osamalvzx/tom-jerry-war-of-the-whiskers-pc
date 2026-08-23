@@ -21,6 +21,7 @@ void SetPlatformWindow(void* w);
 
 } // namespace tj::hybrid
 
-// d3d8_bridge input seam: the Android app forwards gamepad/touch state to PORT 0.
-extern "C" void AndroidSetPad(unsigned short buttons, const unsigned char* analog8,
+// d3d8_bridge input seam: the Android app forwards each controller's state to ITS OWN PORT.
+// (It used to feed port 0 only, which is why a second controller on the phone did nothing.)
+extern "C" void AndroidSetPad(int port, unsigned short buttons, const unsigned char* analog8,
                               short lx, short ly, short rx, short ry);

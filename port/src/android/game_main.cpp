@@ -33,21 +33,24 @@ static tj::ipc::Header* g_hdr = nullptr;
 // Pad poll: read the app's seqlocked pad block and feed the game's PORT-0 seam
 // (AndroidSetPad -> d3d8_bridge MergeKeyboard — the same path proven in-process).
 static void* InputThread(void*) {
-    tj::ipc::PadShm last{};
+    tj::ipc::PadShm last[tj::ipc::kMaxPads]{};
     for (;;) {
         if (g_hdr->quit.load(std::memory_order_relaxed)) _exit(0);
         if (getppid() == 1) { printf("[game] app died — exiting\n"); _exit(0); }
-        tj::ipc::PadShm p;
+        tj::ipc::PadShm p[tj::ipc::kMaxPads];
         for (;;) {
             uint32_t s1 = g_hdr->padSeq.load(std::memory_order_acquire);
             if (s1 & 1) { sched_yield(); continue; }
-            p = g_hdr->pad;
+            for (int i = 0; i < tj::ipc::kMaxPads; ++i) p[i] = g_hdr->pad[i];
             std::atomic_thread_fence(std::memory_order_acquire);
             if (g_hdr->padSeq.load(std::memory_order_relaxed) == s1) break;
         }
-        if (memcmp(&p, &last, sizeof p) != 0) {
-            last = p;
-            AndroidSetPad(p.buttons, p.analog, p.lx, p.ly, p.rx, p.ry);
+        // Push each seat that changed. The whole array is read under one seqlock, so the four
+        // are a consistent snapshot even though they are forwarded one at a time.
+        for (int i = 0; i < tj::ipc::kMaxPads; ++i) {
+            if (memcmp(&p[i], &last[i], sizeof p[i]) == 0) continue;
+            last[i] = p[i];
+            AndroidSetPad(i, p[i].buttons, p[i].analog, p[i].lx, p[i].ly, p[i].rx, p[i].ry);
         }
         usleep(4000);                       // 250 Hz — well above the 60 Hz sim poll
     }

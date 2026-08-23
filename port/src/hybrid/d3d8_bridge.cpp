@@ -2346,46 +2346,53 @@ static void ParseInputScript() {
     free(e);
 }
 #ifndef _WIN32
-// Android input feeds PORT 0 ONLY (the touch-overlay rule: never let one input source drive
-// all four fighters). native_main translates gamepad/touch events into AndroidSetPad; the
-// game reads it here, merged exactly like the Windows keyboard path. On the qemu/headless leg
+// Android input feeds EVERY PORT, one per controller. It used to feed port 0 only -- the
+// touch-overlay rule, which was right while touch was the only input and wrong the moment
+// controllers worked: a second pad plugged into the phone drove player 1 alongside the first
+// and seats 2-4 read a dead pad. native_main now routes each DEVICE to its own seat and
+// forwards them here; touch stays player 1's alone, on the app side. On the qemu/headless leg
 // AndroidSetPad is never called, so g_androidActive stays false and this is a no-op (script
 // only), keeping the S5c determinism legs untouched.
 static CRITICAL_SECTION g_androidPadLock;
 static bool g_androidPadInit = false;
 static bool g_androidActive = false;
-static tj::input::XboxGamepad g_androidPad{};
+static tj::input::XboxGamepad g_androidPad[4]{};
 static void AndroidPadEnsureInit() {
     if (!g_androidPadInit) { InitializeCriticalSection(&g_androidPadLock); g_androidPadInit = true; }
 }
-extern "C" void AndroidSetPad(uint16_t buttons, const uint8_t* analog8,
+extern "C" void AndroidSetPad(int port, uint16_t buttons, const uint8_t* analog8,
                               int16_t lx, int16_t ly, int16_t rx, int16_t ry) {
+    if (port < 0 || port >= 4) return;
     AndroidPadEnsureInit();
     EnterCriticalSection(&g_androidPadLock);
     g_androidActive = true;
-    g_androidPad.wButtons = buttons;
-    if (analog8) memcpy(g_androidPad.bAnalogButtons, analog8, 8);
-    g_androidPad.sThumbLX = lx; g_androidPad.sThumbLY = ly;
-    g_androidPad.sThumbRX = rx; g_androidPad.sThumbRY = ry;
+    tj::input::XboxGamepad& a = g_androidPad[port];
+    a.wButtons = buttons;
+    if (analog8) memcpy(a.bAnalogButtons, analog8, 8);
+    a.sThumbLX = lx; a.sThumbLY = ly;
+    a.sThumbRX = rx; a.sThumbRY = ry;
     LeaveCriticalSection(&g_androidPadLock);
 }
-static void MergeKeyboard(tj::input::XboxGamepad& gp) {
+static void MergeKeyboard(tj::input::XboxGamepad& gp, int port) {
     if (!g_androidActive) return;               // qemu/headless: never activated -> script only
+    if (port < 0 || port >= 4) return;
     AndroidPadEnsureInit();
     EnterCriticalSection(&g_androidPadLock);
-    gp.wButtons |= g_androidPad.wButtons;
+    const tj::input::XboxGamepad& a = g_androidPad[port];
+    gp.wButtons |= a.wButtons;
     for (int i = 0; i < 8; ++i)
-        if (g_androidPad.bAnalogButtons[i] > gp.bAnalogButtons[i])
-            gp.bAnalogButtons[i] = g_androidPad.bAnalogButtons[i];
-    if (g_androidPad.sThumbLX) gp.sThumbLX = g_androidPad.sThumbLX;
-    if (g_androidPad.sThumbLY) gp.sThumbLY = g_androidPad.sThumbLY;
-    if (g_androidPad.sThumbRX) gp.sThumbRX = g_androidPad.sThumbRX;
-    if (g_androidPad.sThumbRY) gp.sThumbRY = g_androidPad.sThumbRY;
+        if (a.bAnalogButtons[i] > gp.bAnalogButtons[i])
+            gp.bAnalogButtons[i] = a.bAnalogButtons[i];
+    if (a.sThumbLX) gp.sThumbLX = a.sThumbLX;
+    if (a.sThumbLY) gp.sThumbLY = a.sThumbLY;
+    if (a.sThumbRX) gp.sThumbRX = a.sThumbRX;
+    if (a.sThumbRY) gp.sThumbRY = a.sThumbRY;
     LeaveCriticalSection(&g_androidPadLock);
 }
 #else
 static bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
-static void MergeKeyboard(tj::input::XboxGamepad& gp) {
+static void MergeKeyboard(tj::input::XboxGamepad& gp, int port) {
+    if (port != 0) return;      // the keyboard is one set of controls -- player 1's alone
     // While a LAN text modal is capturing, typing must not also drive the menu (pressing
     // 'A' would type A *and* move the cursor left).
     if (tj::hybrid::LanTextCaptureActive()) return;
@@ -2760,7 +2767,7 @@ extern "C" void GetLocalPadForNet(tj::hybrid::NetInput* out, int which) {
         EnterCriticalSection(&g_padLock);
         gp = g_padSnap[which];
         LeaveCriticalSection(&g_padLock);
-        if (which == 0) MergeKeyboard(gp);
+        MergeKeyboard(gp, which);
     }
     if (which == 0) MergeScript(gp);
     out->buttons = gp.wButtons;
@@ -2802,10 +2809,8 @@ static uint32_t __stdcall Br_XInputGetState(uint32_t h, void* state) {
         // The keyboard and the TJ_INPUT script are player 1's, and only player 1's: they are
         // a single set of controls, so feeding them to every port would make one keypress
         // move all four fighters at once.
-        if (port == 0) {
-            if (!noInput) MergeKeyboard(gp);
-            MergeScript(gp);
-        }
+        if (!noInput) MergeKeyboard(gp, port);
+        if (port == 0) MergeScript(gp);
     }
     static uint32_t packet[4];
     *(uint32_t*)state = ++packet[port];

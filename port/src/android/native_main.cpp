@@ -413,7 +413,14 @@ struct Pad {
     unsigned char  analog[8] = {0};
     short lx = 0, ly = 0, rx = 0, ry = 0;
 };
-Pad g_gamepad, g_touch;
+Pad g_gamepad[tj::ipc::kMaxPads], g_touch;
+// DEVICE -> SEAT. Android hands every input event a device id; without routing them, all of
+// them landed in one Pad and only player 1 ever existed. A device claims the lowest free seat
+// THE FIRST TIME SOMEBODY ACTUALLY PRESSES SOMETHING ON IT -- not merely by existing. That is
+// the rule the PC path already learned the hard way: idle virtual pads (vendor software,
+// wireless dongles) enumerate themselves and would otherwise silently take player 1's seat,
+// and on Android a resting controller emits centering motion events all on its own.
+int32_t g_padDev[tj::ipc::kMaxPads] = { -1, -1, -1, -1 };
 // THE TRIGGERS GET THEIR OWN SLOT, and it is not fussiness. Android pads report a trigger in
 // one of two ways: as an ANALOG AXIS on a motion event, or as a DIGITAL KEYCODE
 // (BUTTON_L2/R2). Both are written here, but they arrive on different event streams -- and a
@@ -421,21 +428,42 @@ Pad g_gamepad, g_touch;
 // g_gamepad.analog[], a pad that reports its triggers only as keycodes would have a held
 // block CLEARED by the player moving the stick, which is the whole time in a fighting game.
 // Keeping them apart and merging by max in PushPad means neither source can erase the other.
-uint8_t g_axisTrig[2];          // [0] = LT, [1] = RT, 0..255
+uint8_t g_axisTrig[tj::ipc::kMaxPads][2];   // per seat: [0] = LT, [1] = RT, 0..255
+
+// Resolve a device to its seat. `claim` is true only for events that represent a deliberate
+// press; a resting device never takes a seat. Returns -1 when the device has no seat yet.
+int SeatFor(int32_t dev, bool claim) {
+    for (int i = 0; i < tj::ipc::kMaxPads; ++i) if (g_padDev[i] == dev) return i;
+    if (!claim) return -1;
+    for (int i = 0; i < tj::ipc::kMaxPads; ++i) {
+        if (g_padDev[i] < 0) {
+            g_padDev[i] = dev;
+            LOGI("pad: device %d -> player %d", dev, i + 1);
+            return i;
+        }
+    }
+    return -1;                                  // five controllers, four seats
+}
 int g_surfW = 0, g_surfH = 0;         // ACTUAL current surface dims (touch-zone space)
 
 void PushPad() {
     if (!g_hdr) return;
-    tj::ipc::PadShm p{};
-    p.buttons = (uint16_t)(g_gamepad.buttons | g_touch.buttons);
-    for (int i = 0; i < 8; ++i)
-        p.analog[i] = g_gamepad.analog[i] > g_touch.analog[i] ? g_gamepad.analog[i] : g_touch.analog[i];
-    if (g_axisTrig[0] > p.analog[6]) p.analog[6] = g_axisTrig[0];
-    if (g_axisTrig[1] > p.analog[7]) p.analog[7] = g_axisTrig[1];
-    p.lx = g_touch.lx ? g_touch.lx : g_gamepad.lx;
-    p.ly = g_touch.ly ? g_touch.ly : g_gamepad.ly;
-    p.rx = g_touch.rx ? g_touch.rx : g_gamepad.rx;
-    p.ry = g_touch.ry ? g_touch.ry : g_gamepad.ry;
+    tj::ipc::PadShm p[tj::ipc::kMaxPads]{};
+    for (int s = 0; s < tj::ipc::kMaxPads; ++s) {
+        const Pad& g = g_gamepad[s];
+        // The TOUCH overlay is player 1's and only player 1's -- it is one set of controls on
+        // one screen, so merging it into every seat would make one tap move all four fighters.
+        const Pad& t = (s == 0) ? g_touch : Pad{};
+        p[s].buttons = (uint16_t)(g.buttons | t.buttons);
+        for (int i = 0; i < 8; ++i)
+            p[s].analog[i] = g.analog[i] > t.analog[i] ? g.analog[i] : t.analog[i];
+        if (g_axisTrig[s][0] > p[s].analog[6]) p[s].analog[6] = g_axisTrig[s][0];
+        if (g_axisTrig[s][1] > p[s].analog[7]) p[s].analog[7] = g_axisTrig[s][1];
+        p[s].lx = t.lx ? t.lx : g.lx;
+        p[s].ly = t.ly ? t.ly : g.ly;
+        p[s].rx = t.rx ? t.rx : g.rx;
+        p[s].ry = t.ry ? t.ry : g.ry;
+    }
     // Seqlock write (single writer — the glue thread). The RELEASE FENCE after the odd
     // bump is load-bearing: a release *increment* alone orders prior stores, not the pad
     // stores that FOLLOW it, so without the fence arm64 may publish new pad bytes while
@@ -443,7 +471,7 @@ void PushPad() {
     // write_seqcount_begin is exactly seq++; smp_wmb().)
     g_hdr->padSeq.fetch_add(1, std::memory_order_relaxed);      // -> odd: write in progress
     std::atomic_thread_fence(std::memory_order_release);
-    g_hdr->pad = p;
+    for (int s = 0; s < tj::ipc::kMaxPads; ++s) g_hdr->pad[s] = p[s];
     g_hdr->padSeq.fetch_add(1, std::memory_order_release);      // -> even: stable
 }
 
@@ -475,8 +503,13 @@ int32_t OnInput(android_app*, AInputEvent* e) {
         int32_t act = AKeyEvent_getAction(e);
         if (act != AKEY_EVENT_ACTION_DOWN && act != AKEY_EVENT_ACTION_UP) return 0;
         bool down = (act == AKEY_EVENT_ACTION_DOWN);
-        auto btn = [&](unsigned short b) { if (down) g_gamepad.buttons |= b; else g_gamepad.buttons &= (unsigned short)~b; };
-        auto ana = [&](int i) { g_gamepad.analog[i] = down ? 255 : 0; };
+        // A key DOWN is a deliberate press, so it may claim a seat; a key UP may not (a
+        // release from a device we never saw pressed is not a player arriving).
+        int seat = SeatFor(AInputEvent_getDeviceId(e), down);
+        if (seat < 0) return 0;
+        Pad& pad = g_gamepad[seat];
+        auto btn = [&](unsigned short b) { if (down) pad.buttons |= b; else pad.buttons &= (unsigned short)~b; };
+        auto ana = [&](int i) { pad.analog[i] = down ? 255 : 0; };
         switch (code) {
             case AKEYCODE_BUTTON_A: ana(0); break;                 // A jump / confirm
             case AKEYCODE_BUTTON_B: ana(1); break;                 // B grab / back
@@ -500,6 +533,14 @@ int32_t OnInput(android_app*, AInputEvent* e) {
     if (type == AINPUT_EVENT_TYPE_MOTION) {
         int32_t source = AInputEvent_getSource(e);
         if (source & AINPUT_SOURCE_JOYSTICK) {
+            // BEFORE any seat resolution: this one-shot exists to prove joystick events reach
+            // us at all, and a device that has not claimed a seat yet is exactly the case it
+            // has to be able to report. Behind the seat guard it could never fire.
+            static bool firstSeen = false;
+            if (!firstSeen) {
+                firstSeen = true;
+                LOGI("pad: joystick events arriving (device %d)", AInputEvent_getDeviceId(e));
+            }
             float ax = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_X, 0);
             float ay = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_Y, 0);
             float hx = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_X, 0);
@@ -521,8 +562,18 @@ int32_t OnInput(android_app*, AInputEvent* e) {
                 if (v >= 1.0f) return 255;
                 return (uint8_t)(v * 255.0f + 0.5f);
             };
-            g_axisTrig[0] = trig(AMOTION_EVENT_AXIS_LTRIGGER, AMOTION_EVENT_AXIS_BRAKE);
-            g_axisTrig[1] = trig(AMOTION_EVENT_AXIS_RTRIGGER, AMOTION_EVENT_AXIS_GAS);
+            // A stick or trigger genuinely deflected is a deliberate press and may claim a
+            // seat; a resting controller emitting centering events may not.
+            uint8_t lt = trig(AMOTION_EVENT_AXIS_LTRIGGER, AMOTION_EVENT_AXIS_BRAKE);
+            uint8_t rt = trig(AMOTION_EVENT_AXIS_RTRIGGER, AMOTION_EVENT_AXIS_GAS);
+            bool moved = (ax < -0.3f || ax > 0.3f || ay < -0.3f || ay > 0.3f ||
+                          hx < -0.5f || hx > 0.5f || hy < -0.5f || hy > 0.5f ||
+                          lt > 40 || rt > 40);
+            int seat = SeatFor(AInputEvent_getDeviceId(e), moved);
+            if (seat < 0) return 0;
+            Pad& pad = g_gamepad[seat];
+            g_axisTrig[seat][0] = lt;
+            g_axisTrig[seat][1] = rt;
             // ONE LINE, ONCE, NAMING WHAT THIS PAD ACTUALLY SENDS. The trigger bug above was
             // invisible from the outside -- every other control worked, so the report could
             // only ever be "block does not work" with nothing to act on. If a pad still fails
@@ -540,21 +591,21 @@ int32_t OnInput(android_app*, AInputEvent* e) {
                 float gas = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_GAS, 0);
                 float za  = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_Z, 0);
                 float rza = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_RZ, 0);
-                static bool firstSeen = false, pullSeen = false;
-                if (!firstSeen) { firstSeen = true; LOGI("pad: joystick events arriving"); }
+                static bool pullSeen = false;
                 if (!pullSeen && (lta > 0.1f || brk > 0.1f || rta > 0.1f || gas > 0.1f ||
                                   za > 0.1f || rza > 0.1f)) {
                     pullSeen = true;
-                    LOGI("pad trigger axes: LTRIG=%.2f BRAKE=%.2f RTRIG=%.2f GAS=%.2f "
-                         "Z=%.2f RZ=%.2f -> LT=%u RT=%u",
-                         lta, brk, rta, gas, za, rza, g_axisTrig[0], g_axisTrig[1]);
+                    LOGI("pad trigger axes (player %d): LTRIG=%.2f BRAKE=%.2f RTRIG=%.2f "
+                         "GAS=%.2f Z=%.2f RZ=%.2f -> LT=%u RT=%u",
+                         seat + 1, lta, brk, rta, gas, za, rza,
+                         g_axisTrig[seat][0], g_axisTrig[seat][1]);
                 }
             }
-            g_gamepad.lx = (short)(ax * 32000);
-            g_gamepad.ly = (short)(-ay * 32000);
-            g_gamepad.buttons &= (unsigned short)~0x0Fu;
-            if (hx < -0.5f) g_gamepad.buttons |= 0x04; else if (hx > 0.5f) g_gamepad.buttons |= 0x08;
-            if (hy < -0.5f) g_gamepad.buttons |= 0x01; else if (hy > 0.5f) g_gamepad.buttons |= 0x02;
+            pad.lx = (short)(ax * 32000);
+            pad.ly = (short)(-ay * 32000);
+            pad.buttons &= (unsigned short)~0x0Fu;
+            if (hx < -0.5f) pad.buttons |= 0x04; else if (hx > 0.5f) pad.buttons |= 0x08;
+            if (hy < -0.5f) pad.buttons |= 0x01; else if (hy > 0.5f) pad.buttons |= 0x02;
             PushPad();
             return 1;
         }
