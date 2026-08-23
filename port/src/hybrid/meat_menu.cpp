@@ -185,6 +185,18 @@ static void Unsplice(uint32_t self, uint32_t it) {
 }
 
 void MeatMenuBuild(uint32_t self) {
+    // ⚠ THE MODE IS A CHOICE, NOT A STICKY GLOBAL. It used to be set ONLY here-ish -- in the
+    // MULTIPLAYER submenu's A-press (Hk_MultiUpdate) -- and cleared NOWHERE. CHALLENGE is a
+    // main-menu row that never passes through that submenu, so a player who ran a MEAT RUSH
+    // match and then started CHALLENGE got a CHALLENGE whose every stage spawned meat: g_mode
+    // was still true from the previous selection. Reported from the field on BOTH platforms.
+    // The main menu is the one screen every mode is chosen from, and rebuilding it is exactly
+    // the moment the previous choice stops being in effect -- so the default is cleared here
+    // and only an explicit selection (this submenu, or the LAN lobby's MODE row) turns it on.
+    // Match series never come back through here, so nothing mid-tournament is disturbed.
+    if (MeatRushActive())
+        printf("[meat] main menu: MEAT RUSH cleared (a mode choice does not outlive the menu)\n");
+    MeatRushSetMode(false);
     uint32_t chal = self + 0x20, quick = self + 0xA4, tour = self + 0x128,
              lan = self + 0x230, opts = self + 0x338, exit_ = self + 0x1AC;
     Unsplice(self, quick);                       // QUICK GAME and TOURNAMENT move into the

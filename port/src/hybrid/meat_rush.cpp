@@ -254,6 +254,19 @@ static void ApplyPatches(bool on) {
     }
     FlushInstructionCache(GetCurrentProcess(), U8(kTypeSrc), 8);
     FlushInstructionCache(GetCurrentProcess(), U8(kCapImm), 4);
+    // ⚠ AND TELL THE ENGINE, or this patch does nothing on ARM. FlushInstructionCache is
+    // enough where the host CPU runs these bytes; in engine mode the x86 JIT has already
+    // COMPILED this site, and a compiled block holds the old instruction -- including the
+    // `cmp bl,1` immediate -- baked into emitted aarch64. Without invalidation the toggle
+    // silently does not take, in EITHER direction: MEAT RUSH runs with the item-type forcing
+    // absent (normal weapons spawn instead of meat), or a normal match keeps running with it
+    // applied. That is exactly the phone-only half of the report, and why it took several
+    // restarts to shake out -- it depends on what happened to be compiled.
+    // BlankHealthBars right below has always done this; ApplyPatches, the patch that actually
+    // decides what spawns, was the one that never did. EngineModeInvalidateCode is a no-op
+    // when engine mode is off, so Windows behaviour is unchanged byte for byte.
+    EngineModeInvalidateCode(kTypeSrc, 8);
+    EngineModeInvalidateCode(kCapImm, 4);
     g_applied = on;
 }
 
