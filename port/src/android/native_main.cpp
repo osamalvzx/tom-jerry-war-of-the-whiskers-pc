@@ -414,6 +414,14 @@ struct Pad {
     short lx = 0, ly = 0, rx = 0, ry = 0;
 };
 Pad g_gamepad, g_touch;
+// THE TRIGGERS GET THEIR OWN SLOT, and it is not fussiness. Android pads report a trigger in
+// one of two ways: as an ANALOG AXIS on a motion event, or as a DIGITAL KEYCODE
+// (BUTTON_L2/R2). Both are written here, but they arrive on different event streams -- and a
+// motion event fires for every stick nudge. If the axis path wrote straight into
+// g_gamepad.analog[], a pad that reports its triggers only as keycodes would have a held
+// block CLEARED by the player moving the stick, which is the whole time in a fighting game.
+// Keeping them apart and merging by max in PushPad means neither source can erase the other.
+uint8_t g_axisTrig[2];          // [0] = LT, [1] = RT, 0..255
 int g_surfW = 0, g_surfH = 0;         // ACTUAL current surface dims (touch-zone space)
 
 void PushPad() {
@@ -422,6 +430,8 @@ void PushPad() {
     p.buttons = (uint16_t)(g_gamepad.buttons | g_touch.buttons);
     for (int i = 0; i < 8; ++i)
         p.analog[i] = g_gamepad.analog[i] > g_touch.analog[i] ? g_gamepad.analog[i] : g_touch.analog[i];
+    if (g_axisTrig[0] > p.analog[6]) p.analog[6] = g_axisTrig[0];
+    if (g_axisTrig[1] > p.analog[7]) p.analog[7] = g_axisTrig[1];
     p.lx = g_touch.lx ? g_touch.lx : g_gamepad.lx;
     p.ly = g_touch.ly ? g_touch.ly : g_gamepad.ly;
     p.rx = g_touch.rx ? g_touch.rx : g_gamepad.rx;
@@ -474,6 +484,8 @@ int32_t OnInput(android_app*, AInputEvent* e) {
             case AKEYCODE_BUTTON_Y: ana(3); break;
             case AKEYCODE_BUTTON_L1: ana(5); break;                // White
             case AKEYCODE_BUTTON_R1: ana(4); break;                // Black
+            case AKEYCODE_BUTTON_L2: ana(6); break;                // LT
+            case AKEYCODE_BUTTON_R2: ana(7); break;                // RT -- BLOCK
             case AKEYCODE_BUTTON_START: case AKEYCODE_MENU: btn(0x10); break;
             case AKEYCODE_BUTTON_SELECT:                    btn(0x20); break;
             case AKEYCODE_DPAD_UP:    btn(0x01); break;
@@ -492,6 +504,52 @@ int32_t OnInput(android_app*, AInputEvent* e) {
             float ay = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_Y, 0);
             float hx = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_X, 0);
             float hy = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_Y, 0);
+            // ⚠ THE TRIGGERS WERE NEVER READ AT ALL, on either path. analog[6]/[7] (LT/RT)
+            // simply stayed 0 on Android for every pad, so BLOCK -- which is RT -- could not
+            // be pressed, while every other control worked. The Windows path fills all eight
+            // analog bytes from XInput; this one filled six.
+            // Pads disagree about WHICH axis carries a trigger: the documented Android
+            // mapping is LTRIGGER/RTRIGGER, but many pads (and Android's own automotive-
+            // derived naming) report the same physical pull on BRAKE/GAS, and some report
+            // both. Taking the larger of each pair covers every pad without a device table,
+            // and cannot misfire: an unreported axis reads 0.
+            auto trig = [&](int32_t a, int32_t b) -> uint8_t {
+                float v = AMotionEvent_getAxisValue(e, a, 0);
+                float w = AMotionEvent_getAxisValue(e, b, 0);
+                if (w > v) v = w;
+                if (v <= 0.0f) return 0;
+                if (v >= 1.0f) return 255;
+                return (uint8_t)(v * 255.0f + 0.5f);
+            };
+            g_axisTrig[0] = trig(AMOTION_EVENT_AXIS_LTRIGGER, AMOTION_EVENT_AXIS_BRAKE);
+            g_axisTrig[1] = trig(AMOTION_EVENT_AXIS_RTRIGGER, AMOTION_EVENT_AXIS_GAS);
+            // ONE LINE, ONCE, NAMING WHAT THIS PAD ACTUALLY SENDS. The trigger bug above was
+            // invisible from the outside -- every other control worked, so the report could
+            // only ever be "block does not work" with nothing to act on. If a pad still fails
+            // after this, `adb logcat -s wotw` says in one line which axes it moves, and
+            // whether the value arrives at all, instead of costing another round trip.
+            // TWO one-shots, because there are exactly two ways this can still fail and they
+            // need different answers: no joystick events reach us at all, or they do but the
+            // pad puts its triggers on an axis we are not reading. The second line fires the
+            // first time ANY trigger candidate leaves rest -- i.e. when the player actually
+            // pulls one -- which is the moment that names the axis.
+            {
+                float lta = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_LTRIGGER, 0);
+                float brk = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_BRAKE, 0);
+                float rta = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_RTRIGGER, 0);
+                float gas = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_GAS, 0);
+                float za  = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_Z, 0);
+                float rza = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_RZ, 0);
+                static bool firstSeen = false, pullSeen = false;
+                if (!firstSeen) { firstSeen = true; LOGI("pad: joystick events arriving"); }
+                if (!pullSeen && (lta > 0.1f || brk > 0.1f || rta > 0.1f || gas > 0.1f ||
+                                  za > 0.1f || rza > 0.1f)) {
+                    pullSeen = true;
+                    LOGI("pad trigger axes: LTRIG=%.2f BRAKE=%.2f RTRIG=%.2f GAS=%.2f "
+                         "Z=%.2f RZ=%.2f -> LT=%u RT=%u",
+                         lta, brk, rta, gas, za, rza, g_axisTrig[0], g_axisTrig[1]);
+                }
+            }
             g_gamepad.lx = (short)(ax * 32000);
             g_gamepad.ly = (short)(-ay * 32000);
             g_gamepad.buttons &= (unsigned short)~0x0Fu;
