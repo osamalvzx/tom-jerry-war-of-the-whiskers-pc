@@ -1092,7 +1092,8 @@ void __cdecl Hk_DrawText(uint32_t style, float x, float y, const char* fmt) {
         else if (strcmp(fmt, GuestInternStr(AR_SAVE_GAME)) == 0) { id = AR_STR_SAVE_GAME; spaceCount = 9; }
         else if (strcmp(fmt, GuestInternStr(AR_AUDIO)) == 0) { id = AR_STR_AUDIO; spaceCount = 5; }
         else if (strcmp(fmt, GuestInternStr(AR_CREDITS)) == 0) { id = AR_STR_CREDITS; spaceCount = 7; }
-        else if (strcmp(fmt, GuestInternStr(AR_CHEATS_MENU)) == 0) { id = AR_STR_CHEATS; spaceCount = 11; } // AR_STR_CHEATS
+        else if (strcmp(fmt, GuestInternStr(AR_CHEATS_MENU)) == 0) { id = AR_STR_CHEATS; spaceCount = 11; }
+          else if (strcmp(fmt, GuestInternStr(AR_MODS_CONFIG)) == 0) { id = AR_STR_MODS_CONFIG; spaceCount = 11; } // AR_STR_CHEATS
         else if (strcmp(fmt, GuestInternStr(AR_BACK)) == 0) { id = AR_STR_BACK; spaceCount = 4; }
         else if (strcmp(fmt, GuestInternStr(AR_EXIT)) == 0) { id = AR_STR_EXIT; spaceCount = 4; }
         else if (strcmp(fmt, GuestInternStr("أ¯آ»آ¤أ¯آ»آŒأ¯آ»آ§")) == 0) { id = AR_STR_YES; spaceCount = 3; }
@@ -1191,7 +1192,7 @@ void FeMenuDrawCustomOverlay(tj::gfx::Device& dev, int frame) {
             for (int i = 0; i < s_arabQueueN; ++i) {
                 
                     float scale = 0.040f;
-                    if (s_arabQueue[i].id == AR_STR_OPTIONS || s_arabQueue[i].id == AR_STR_FIGHT_SETTINGS || s_arabQueue[i].id == AR_STR_AUDIO || s_arabQueue[i].id == AR_STR_CREDITS || s_arabQueue[i].id == AR_STR_SAVE_GAME || s_arabQueue[i].id == AR_STR_CHEATS) scale = 0.038f;
+                    if (s_arabQueue[i].id == AR_STR_OPTIONS || s_arabQueue[i].id == AR_STR_FIGHT_SETTINGS || s_arabQueue[i].id == AR_STR_AUDIO || s_arabQueue[i].id == AR_STR_CREDITS || s_arabQueue[i].id == AR_STR_SAVE_GAME || s_arabQueue[i].id == AR_STR_CHEATS || s_arabQueue[i].id == AR_STR_MODS_CONFIG) scale = 0.038f;
                     if (s_arabQueue[i].id == AR_STR_YES || s_arabQueue[i].id == AR_STR_NO) scale = 0.024f;
                     
                     DrawArabicTextQuad(dev, s_arabicAtlasTex, s_arabQueue[i].id, s_arabQueue[i].x, s_arabQueue[i].y, scale);
