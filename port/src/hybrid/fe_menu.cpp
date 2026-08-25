@@ -1219,6 +1219,8 @@ void FeMenuDrawCustomOverlay(tj::gfx::Device& dev, int frame) {
                     float scale = 0.040f;
                     if (s_arabQueue[i].id == AR_STR_OPTIONS || s_arabQueue[i].id == AR_STR_FIGHT_SETTINGS || s_arabQueue[i].id == AR_STR_AUDIO || s_arabQueue[i].id == AR_STR_CREDITS || s_arabQueue[i].id == AR_STR_SAVE_GAME || s_arabQueue[i].id == AR_STR_CHEATS || s_arabQueue[i].id == AR_STR_MODS_CONFIG) scale = 0.038f;
                     if (s_arabQueue[i].id == AR_STR_YES || s_arabQueue[i].id == AR_STR_NO) scale = 0.024f;
+                      if (s_arabQueue[i].id == AR_STR_SAVE_PROMPT) scale = 0.120f;
+                      if (s_arabQueue[i].id == AR_STR_CANCEL || s_arabQueue[i].id == AR_STR_SELECT || s_arabQueue[i].id == AR_STR_B_BACK || s_arabQueue[i].id == AR_STR_A_SELECT || s_arabQueue[i].id == AR_STR_OR_TYPE) scale = 0.026f;
                       if (s_arabQueue[i].id == AR_STR_CANCEL || s_arabQueue[i].id == AR_STR_SELECT) scale = 0.026f;
                     
                     DrawArabicTextQuad(dev, s_arabicAtlasTex, s_arabQueue[i].id, s_arabQueue[i].x, s_arabQueue[i].y, scale);
