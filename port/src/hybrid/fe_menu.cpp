@@ -1189,15 +1189,14 @@ void FeMenuDrawCustomOverlay(tj::gfx::Device& dev, int frame) {
         
         if (s_arabicAtlasTex >= 0) {
             for (int i = 0; i < s_arabQueueN; ++i) {
-                if (s_arabQueue[i].frame == frame) {
+                
                     float scale = 0.040f;
                     if (s_arabQueue[i].id == AR_STR_OPTIONS || s_arabQueue[i].id == AR_STR_FIGHT_SETTINGS || s_arabQueue[i].id == AR_STR_AUDIO || s_arabQueue[i].id == AR_STR_CREDITS || s_arabQueue[i].id == AR_STR_SAVE_GAME || s_arabQueue[i].id == AR_STR_CHEATS) scale = 0.038f;
                     if (s_arabQueue[i].id == AR_STR_YES || s_arabQueue[i].id == AR_STR_NO) scale = 0.024f;
                     
                     DrawArabicTextQuad(dev, s_arabicAtlasTex, s_arabQueue[i].id, s_arabQueue[i].x, s_arabQueue[i].y, scale);
-                }
             }
-            if (s_arabQueueN > 0 && s_arabQueue[s_arabQueueN - 1].frame != frame) s_arabQueueN = 0;
+            
             s_arabQueueN = 0;
             
             if (g_exitModal) {
