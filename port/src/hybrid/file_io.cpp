@@ -14,6 +14,8 @@
 
 namespace tj::hybrid {
 
+bool CheckAssetOverride(const char* relPath, char* outPath, size_t cap); // mod_manager.cpp
+
 static const int32_t STATUS_SUCCESS = 0;
 static const int32_t STATUS_NO_SUCH_FILE = (int32_t)0xC000000F;
 static const int32_t STATUS_OBJECT_NAME_NOT_FOUND = (int32_t)0xC0000034;
@@ -215,8 +217,13 @@ static void MapPath(const char* nt, char* out, size_t cap) {
             if (_strnicmp(p, pre, (int)n) == 0) { p += n; break; }
         }
     }
-    if (save) _snprintf_s(out, cap, _TRUNCATE, "%s\\%s", SaveRoot(), p);
-    else      _snprintf_s(out, cap, _TRUNCATE, "%s\\%s", g_root, p);
+    if (save) {
+        _snprintf_s(out, cap, _TRUNCATE, "%s\\%s", SaveRoot(), p);
+    } else {
+        if (!CheckAssetOverride(p, out, cap)) {
+            _snprintf_s(out, cap, _TRUNCATE, "%s\\%s", g_root, p);
+        }
+    }
     for (char* c = out; *c; ++c) if (*c == '/') *c = '\\';
 }
 

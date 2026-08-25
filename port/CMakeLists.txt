@@ -132,6 +132,7 @@ add_library(tj_hybrid SHARED
     src/hybrid/meat_ui.cpp
     src/hybrid/meat_menu.cpp
     src/hybrid/file_io.cpp
+    src/hybrid/mod_manager.cpp
     src/hybrid/prof.cpp
     src/hybrid/engine_mode.cpp
     src/hybrid/startup.cpp
@@ -437,3 +438,12 @@ add_custom_command(TARGET diff_test POST_BUILD
         ${CMAKE_SOURCE_DIR}/src/game/generated/text_relocs.bin
         $<TARGET_FILE_DIR:diff_test>
 )
+
+# --- Standalone Mods Installer: setup.exe ---
+add_executable(setup WIN32
+    src/installer/setup.cpp
+    src/installer/setup.rc
+)
+target_include_directories(setup PRIVATE src)
+target_link_libraries(setup PRIVATE user32 shell32 ole32 comctl32 advapi32)
+set_target_properties(setup PROPERTIES RUNTIME_OUTPUT_DIRECTORY /bin)

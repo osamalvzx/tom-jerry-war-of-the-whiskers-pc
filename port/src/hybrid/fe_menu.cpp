@@ -17,15 +17,19 @@
 //   cdecl(idx) -> char*: base 0x114C20, 0xFF bytes/entry, 0xE3 entries/language --
 //   indices >= 0xE3 never occur in retail data, so they address our custom strings.
 #include "hybrid/xdk_patch.h"
+#include "hybrid/mod_manager.h"
 #include "hybrid/meat_rush.h"
 #include "hybrid/lan_ui.h"
 #include "hybrid/audio_ui.h"
 #include "hybrid/guest_call.h"
 #include "hybrid/host_compat.h"
+#include "hybrid/osama_sticker_rgba.h"
+#include "runtime/gfx/d3d8.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 
 namespace tj::hybrid {
 
@@ -38,15 +42,32 @@ using FnReady      = uint8_t  (__cdecl*)();                                    /
 using FnThis       = void     (__fastcall*)(uint32_t self, uint32_t);
 using FnThisU32    = void     (__fastcall*)(uint32_t self, uint32_t, uint32_t);
 using FnThisU32U32 = uint8_t  (__fastcall*)(uint32_t self, uint32_t, uint32_t, uint32_t);
+using FnUpdate     = uint32_t (__fastcall*)(uint32_t self, uint32_t);
+int GfxCurrentFrame();
+static int   s_lastMainAnimFrame = -100;
+static float s_liveSelY = 0.30f;
 // Host->guest seam (guest_call.h): resolved through GuestFnPtr at EVERY call -- engine
 // mode arms after all Install*() have run, so a static-init value would freeze the raw
 // native address. Native mode: the raw address, exactly as shipped.
 #define ItemCtor(...)   GCALL(Fastcall, FnThis,    0x1A340, __VA_ARGS__)  // MenuOptionItem ctor
 #define SetLabel(...)   GCALL(Fastcall, FnThisU32, 0x19E70, __VA_ARGS__)  // (u16 label idx)
 #define SetValue(...)   GCALL(Fastcall, FnThisU32, 0x19E80, __VA_ARGS__)  // (u8 value idx; 0x24 = none)
-#define SetAlign(...)   GCALL(Fastcall, FnThisU32, 0x19E90, __VA_ARGS__)
 #define SetScale(...)   GCALL(Fastcall, FnThisU32, 0x1A320, __VA_ARGS__)  // (float as raw bits)
 #define AppendItem(...) GCALL(Fastcall, FnThisU32, 0x1D030, __VA_ARGS__)  // Screen::AppendItem(item)
+
+inline void SetAlign(uint32_t it, uint32_t edx = 0, uint32_t align = 1) {
+    (void)edx;
+    if (!it || (uintptr_t)it < 0x10000 || (uintptr_t)it >= 0x7FFE0000) return;
+    *(uint16_t*)(uintptr_t)(it + 0x70) = (uint16_t)align;
+}
+
+inline void SetItemMetrics(uint32_t it, float x, float y, float scale, uint16_t align = 1) {
+    if (!it) return;
+    *(float*)(uintptr_t)(it + 0x40) = x;
+    if (y > 0.0f) *(float*)(uintptr_t)(it + 0x44) = y;
+    *(uint32_t*)(uintptr_t)(it + 0x68) = *(uint32_t*)&scale; // Target scale
+    *(uint16_t*)(uintptr_t)(it + 0x70) = align;
+}
 
 // ---- resolution mode table + current state ----
 struct Mode { int w, h; };
@@ -62,6 +83,7 @@ static char (&g_resLabel)[64] = *(char(*)[64])GuestObjAlloc(64, 8);
 static int  g_dispKind = 0;          // 0 windowed / 1 borderless / 2 fullscreen
 static char (&g_dispLabel)[64] = *(char(*)[64])GuestObjAlloc(64, 8);
 static const char* kDispNames[3] = { "WINDOWED", "BORDERLESS", "FULLSCREEN" };
+static bool g_exitModal = false;
 
 static void RefreshLabel() {
     _snprintf_s(g_resLabel, sizeof(g_resLabel), _TRUNCATE, "RESOLUTION: %dX%d",
@@ -126,6 +148,16 @@ static struct { uint16_t idx; const char* text; } kSaveText[] = {   // strings
     { 0xD7, "A TOM AND JERRY saved game already\nexists on this " TJ_HOST_WORD ". Would you\nlike to replace it "
             "with a new save?\nThe old save will be lost." },
 };
+// ---- MODS CONFIG STATE ----
+static uint8_t (&g_modsCfgItem)[0x84] = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
+static uint8_t (&g_modItems)[35][0x84] = *(uint8_t(*)[35][0x84])GuestObjAlloc(35 * 0x84, 8);
+static char (&g_modLabels)[35][64] = *(char(*)[35][64])GuestObjAlloc(35 * 64, 8);
+static bool g_modsMenuOpen = false;
+static bool g_osamaMod     = true; // Preserved for other code relying on this
+static bool g_animMod      = true; // Preserved for other code relying on this
+static int g_activeModCount = 0;
+
+
 static char* __cdecl Hk_GetText(uint32_t idxArg) {
     uint16_t idx = (uint16_t)idxArg;
     switch (idx) {                                            // custom (DLL-side) strings
@@ -142,6 +174,17 @@ static char* __cdecl Hk_GetText(uint32_t idxArg) {
     if (const char* a = AudioCustomText(idx)) return (char*)GuestInternStr(a);    // audio sliders (0x1C0+)
     if (const char* mt = MeatCustomText(idx)) return (char*)GuestInternStr(mt);  // MAX MEAT row (0x1A0, 0xE6+)
     if (const char* mm = MeatMenuText(idx)) return (char*)GuestInternStr(mm);    // MULTIPLAYER menu (0x1C8+)
+    static const uint16_t kStrLogo    = 0x1E0;
+    static const uint16_t kStrLogoSub = 0x1E1;
+    static const uint16_t kStrModsCfg = 0x1F0;
+    static const uint16_t kStrModBase = 0x200;
+    if (idx == kStrLogo)    return (char*)GuestInternStr("TOM & JERRY");
+    if (idx == kStrLogoSub) return (char*)GuestInternStr("WAR OF THE WHISKERS");
+    if (idx == kStrModsCfg) return (char*)GuestInternStr("MODS CONFIG");
+    if (idx >= kStrModBase && idx < kStrModBase + 35) {
+        return g_modLabels[idx - kStrModBase];
+    }
+
     if (idx > 0xE5) return g_resLabel;                        // unused custom slots
     if (!GCALL0(Cdecl, FnReady, 0x198e0)) return (char*)0x116FFC;    // "" until text ready
     uint32_t lang = *(uint8_t*)(uintptr_t)0x114C18;
@@ -152,24 +195,304 @@ static char* __cdecl Hk_GetText(uint32_t idxArg) {
 // bytes contain no relative branches) ----
 // (call-through trampolines now come from xdk_patch's guest-window pad — MakeGuestTramp)
 
-// ---- OPTIONS screen builder (FUN_00027590) post-hook: append the hidden VIDEO row ----
-static uint32_t Orig_OptionsBuild = 0;   // guest-window trampoline VAs (GCALL them)
+static void PlayUiSound(uint32_t id); // Forward declare
+#define TextItemCtor(...) GCALL(Fastcall, FnThis, 0x19E10, __VA_ARGS__)
+#define SetSelected(...) GCALL(Fastcall, FnSetSel, 0x1D230, __VA_ARGS__)
+using FnSetSel = void (__fastcall*)(uint32_t self, uint32_t, uint32_t, uint32_t);
+
+// ---- OPTIONS screen builder (FUN_00027590) & update (FUN_000278C0) ----
+static uint32_t Orig_OptionsBuild  = 0;
+static uint32_t Orig_OptionsUpdate = 0;
+
+// ---- Animation state for Options Menu ----
+static int      s_optAnimTick       = 0;
+static int      s_optTransitionTick = 0;
+static uint32_t s_optLastSel        = 0;
+static int      s_optSelTimer[7]    = { 0 };
+static int      s_modSelTimer[35]   = { 0 };
+static float    s_optCurX[7]        = { 0.28f, 0.28f, 0.28f, 0.28f, 0.28f, 0.28f, 0.28f };
+static float    s_modCurX[35]       = { 0.28f };
+static bool     s_lastModsMenuState = false;
+static int      s_lastOptFrame      = -100;
+
 static void __fastcall Hk_OptionsBuild(uint32_t self, uint32_t edx) {
     (void)edx;
     GCALL(Fastcall, FnThis, Orig_OptionsBuild, self, 0);
-    uint32_t vid = self + 0x1A8;                 // the fully-built, never-appended item
-    *(float*)(uintptr_t)(vid + 0x40) = 0.5f;
-    *(float*)(uintptr_t)(vid + 0x44) = 0.65f;    // the free row (CHEATS 0.58, EXIT 0.72)
-    // Splice into the child list right after CHEATS MENU (+0x22C) so d-pad order matches
-    // the on-screen order (AppendItem put it after EXIT: down from CHEATS skipped to
-    // EXIT and VIDEO only came after EXIT -- user-reported).
-    uint32_t cheats = self + 0x22C;
-    uint32_t after = *(uint32_t*)(uintptr_t)(cheats + 0x60);
-    *(uint32_t*)(uintptr_t)(vid + 0x60) = after;
-    *(uint32_t*)(uintptr_t)(vid + 0x64) = cheats;
-    *(uint32_t*)(uintptr_t)(cheats + 0x60) = vid;
-    if (after) *(uint32_t*)(uintptr_t)(after + 0x64) = vid;
-    else *(uint32_t*)(uintptr_t)(self + 0x18) = vid;   // was the tail
+
+    // Relocate title to left side
+    SetItemMetrics(self + 0x20, 0.28f, 0.14f, 0.038f, 1);
+
+    uint32_t ex = self + 0x43C;
+    uint32_t modsCfg = (uint32_t)(uintptr_t)g_modsCfgItem;
+    TextItemCtor(modsCfg, 0);
+    SetLabel(modsCfg, 0, 0x1F0);     // "MODS CONFIG"
+    SetAlign(modsCfg, 0, 1);
+    *(uint8_t*)(uintptr_t)(modsCfg + 0x49) = 1; // Selectable
+    *(uint8_t*)(uintptr_t)(modsCfg + 0x48) = 1; // Ensure visible
+    SetItemMetrics(modsCfg, 0.28f, 0.57f, 0.024f, 1);
+
+    // Insert modsCfg into the linked list BEFORE 'ex' (which is the last item)
+    uint32_t prev = *(uint32_t*)(uintptr_t)(ex + 0x64);
+    if (prev) {
+        *(uint32_t*)(uintptr_t)(prev + 0x60) = modsCfg;
+        *(uint32_t*)(uintptr_t)(modsCfg + 0x64) = prev;
+
+        *(uint32_t*)(uintptr_t)(modsCfg + 0x60) = ex;
+        *(uint32_t*)(uintptr_t)(ex + 0x64) = modsCfg;
+    }
+
+    // Initialize sub-menu items as a completely SEPARATE linked list
+    int dynamicModCount = tj::hybrid::GetModCount();
+    g_activeModCount = dynamicModCount + 3; // 2 built-in (Anim, Osama) + dynamic + 1 BACK
+    if (g_activeModCount > 35) g_activeModCount = 35;
+    
+    // Auto-calculate spacing so they fit on screen (from 0.25f to 0.85f)
+    float startY = 0.25f;
+    float endY = 0.85f;
+    float stepY = g_activeModCount > 1 ? (endY - startY) / (g_activeModCount - 1) : 0.06f;
+    if (stepY > 0.06f) stepY = 0.06f; // max spacing
+
+    for (int i = 0; i < g_activeModCount; ++i) {
+        uint32_t modIt = (uint32_t)(uintptr_t)g_modItems[i];
+        TextItemCtor(modIt, 0);
+        SetLabel(modIt, 0, 0x200 + i);
+        SetAlign(modIt, 0, 1);
+        *(uint8_t*)(uintptr_t)(modIt + 0x49) = 1; // Selectable
+        *(uint8_t*)(uintptr_t)(modIt + 0x48) = 1; // Always visible when active
+        
+        float yPos = startY + (i * stepY);
+        SetItemMetrics(modIt, 0.28f, yPos, 0.024f, 1);
+
+        // Link them together manually
+        if (i > 0) {
+            uint32_t prevMod = (uint32_t)(uintptr_t)g_modItems[i-1];
+            *(uint32_t*)(uintptr_t)(prevMod + 0x60) = modIt;
+            *(uint32_t*)(uintptr_t)(modIt + 0x64) = prevMod;
+        } else {
+            *(uint32_t*)(uintptr_t)(modIt + 0x64) = 0; // Head prev is NULL
+        }
+    }
+    *(uint32_t*)(uintptr_t)((uint32_t)(uintptr_t)g_modItems[g_activeModCount - 1] + 0x60) = 0; // Tail next is NULL
+}
+
+static uint32_t __fastcall Hk_OptionsUpdate(uint32_t self, uint32_t edx) {
+    (void)edx;
+
+    // FORMAT STRINGS FIRST! The text renderer will read these during Orig_OptionsUpdate.
+    _snprintf_s(g_modLabels[0], sizeof(g_modLabels[0]), _TRUNCATE, "MENU TRANSITIONS: %s", g_animMod ? "ON" : "OFF");
+    _snprintf_s(g_modLabels[1], sizeof(g_modLabels[1]), _TRUNCATE, "OSAMA BADGE: %s", g_osamaMod ? "ON" : "OFF");
+    
+    int dynamicModCount = tj::hybrid::GetModCount();
+    for (int i = 0; i < dynamicModCount && (i + 2) < 34; ++i) {
+        tj::hybrid::ModInfo* m = tj::hybrid::GetModInfo(i);
+        if (m) {
+            _snprintf_s(g_modLabels[i + 2], 64, _TRUNCATE, "%.20s: %s", m->name, m->enabled ? "ON" : "OFF");
+        }
+    }
+    if (g_activeModCount > 0) {
+        _snprintf_s(g_modLabels[g_activeModCount - 1], 64, _TRUNCATE, "BACK");
+    }
+
+    uint32_t optItems[] = {
+        self + 0xA0, self + 0x334, self + 0x124, self + 0x2B0, self + 0x22C,
+        (uint32_t)(uintptr_t)g_modsCfgItem, self + 0x43C
+    };
+
+    uint32_t master = *(uint32_t*)(uintptr_t)0x15C470C;
+    uint32_t input = master ? *(uint32_t*)(uintptr_t)(master + 0x4BC) : 0;
+    uint32_t sel = *(uint32_t*)(uintptr_t)(self + 4);
+    bool wasModsMenuOpen = g_modsMenuOpen;
+
+    if (input) {
+        if (!g_modsMenuOpen && sel == (uint32_t)(uintptr_t)g_modsCfgItem) {
+            bool clicked = false;
+            for (uint32_t pad = 0; pad < 4; ++pad) {
+                if (GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 1, pad)) clicked = true;
+            }
+            if (clicked) {
+                g_modsMenuOpen = true;
+                PlayUiSound(0);
+
+                // CRITICAL: Swap lists immediately before SetSelected so it doesn't crash
+                *(uint32_t*)(uintptr_t)(self + 0x14) = (uint32_t)(uintptr_t)g_modItems[0];
+                *(uint32_t*)(uintptr_t)(self + 0x18) = (uint32_t)(uintptr_t)g_modItems[g_activeModCount - 1];
+                for (uint32_t c = 0; c < 4; ++c) SetSelected(self, 0, (uint32_t)(uintptr_t)g_modItems[0], c);
+            }
+        }
+        else if (g_modsMenuOpen) {
+            bool a_pressed = false, b_pressed = false;
+            for (uint32_t pad = 0; pad < 4; ++pad) {
+                if (GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 1, pad)) a_pressed = true; // A (1)
+                if (GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 2, pad)) b_pressed = true; // B (2)
+            }
+            if (a_pressed) {
+                if (sel == (uint32_t)(uintptr_t)g_modItems[0]) {
+                    g_animMod = !g_animMod; PlayUiSound(0);
+                } else if (sel == (uint32_t)(uintptr_t)g_modItems[1]) {
+                    g_osamaMod = !g_osamaMod; PlayUiSound(0);
+                } else if (sel == (uint32_t)(uintptr_t)g_modItems[g_activeModCount - 1]) {
+                    b_pressed = true; // BACK option clicked with A
+                } else {
+                    for (int i = 2; i < g_activeModCount - 1; ++i) {
+                        if (sel == (uint32_t)(uintptr_t)g_modItems[i]) {
+                            tj::hybrid::ToggleMod(i - 2);
+                            PlayUiSound(0);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (b_pressed) {
+                g_modsMenuOpen = false;
+                PlayUiSound(1);
+
+                // CRITICAL: Swap lists immediately before SetSelected so it doesn't crash
+                *(uint32_t*)(uintptr_t)(self + 0x14) = self + 0xA0;
+                *(uint32_t*)(uintptr_t)(self + 0x18) = self + 0x43C;
+                for (uint32_t c = 0; c < 4; ++c) SetSelected(self, 0, (uint32_t)(uintptr_t)g_modsCfgItem, c);
+            }
+        }
+    }
+
+    // Swap lists BEFORE Orig_OptionsUpdate
+    if (g_modsMenuOpen) {
+        *(uint32_t*)(uintptr_t)(self + 0x14) = (uint32_t)(uintptr_t)g_modItems[0];
+        *(uint32_t*)(uintptr_t)(self + 0x18) = (uint32_t)(uintptr_t)g_modItems[g_activeModCount - 1];
+    } else {
+        *(uint32_t*)(uintptr_t)(self + 0x14) = self + 0xA0;
+        *(uint32_t*)(uintptr_t)(self + 0x18) = self + 0x43C;
+    }
+
+    uint32_t r = GCALL(Fastcall, FnUpdate, Orig_OptionsUpdate, self, 0);
+
+    // If we are inside MODS CONFIG or just exited it: stay in Options Screen (ID 6)!
+    if (g_modsMenuOpen || wasModsMenuOpen) {
+        r = 6;
+    }
+
+    // Track selection for Osama badge
+    s_lastMainAnimFrame = GfxCurrentFrame();
+    int currentFrame = GfxCurrentFrame();
+    bool isNewScreenEntry = (currentFrame - s_lastOptFrame > 2);
+    s_lastOptFrame = currentFrame;
+
+    if (isNewScreenEntry || s_lastModsMenuState != g_modsMenuOpen) {
+        s_optTransitionTick = 0;
+        s_lastModsMenuState = g_modsMenuOpen;
+        if (!g_modsMenuOpen) {
+            for (int i = 0; i < 7; ++i) s_optCurX[i] = 0.12f - (float)i * 0.015f;
+        } else {
+            for (int i = 0; i < g_activeModCount; ++i) s_modCurX[i] = 0.12f - (float)i * 0.015f;
+        }
+    }
+
+    s_optAnimTick++;
+    s_optTransitionTick++;
+
+    uint32_t selAfter = *(uint32_t*)(uintptr_t)(self + 4);
+    if (selAfter && (uintptr_t)selAfter >= 0x10000) {
+        s_liveSelY = *(float*)(uintptr_t)(selAfter + 0x44);
+    }
+
+    if (selAfter != s_optLastSel) {
+        s_optLastSel = selAfter;
+        for (int i = 0; i < 7; ++i) if (optItems[i] == selAfter) s_optSelTimer[i] = 0;
+        for (int i = 0; i < g_activeModCount; ++i) if ((uint32_t)(uintptr_t)g_modItems[i] == selAfter) s_modSelTimer[i] = 0;
+    }
+
+    // Title animation
+    if (g_animMod) {
+        float titleHover = 0.002f * sinf((float)s_optAnimTick * 0.08f);
+        SetItemMetrics(self + 0x20, 0.28f, 0.14f + titleHover, 0.038f, 1);
+    } else {
+        SetItemMetrics(self + 0x20, 0.28f, 0.14f, 0.038f, 1);
+    }
+
+    if (!g_modsMenuOpen) {
+        float optYs[] = { 0.22f, 0.29f, 0.36f, 0.43f, 0.50f, 0.57f, 0.64f };
+        for (int i = 0; i < 7; ++i) {
+            uint32_t it = optItems[i];
+            if (!it) continue;
+            bool isSel = (it == selAfter);
+            if (isSel) s_optSelTimer[i]++;
+
+            float targetScale = isSel ? 0.029f : 0.024f;
+            float targetX = isSel ? 0.31f : 0.28f;
+
+            if (g_animMod) {
+                // 1. Entrance / Transition cascade stagger bounce
+                float staggerDelay = (float)i * 1.5f;
+                float tEntry = (float)s_optTransitionTick - staggerDelay;
+                if (tEntry > 0.0f && tEntry < 14.0f) {
+                    float p = tEntry / 14.0f;
+                    float spring = 1.0f + 0.38f * sinf(p * 3.14159f) * (1.0f - p);
+                    targetScale *= spring;
+                }
+
+                // 2. Selection punch & rhythmic breathing hover
+                if (isSel) {
+                    if (s_optSelTimer[i] < 12) {
+                        float pSel = (float)s_optSelTimer[i] / 12.0f;
+                        float punch = 0.005f * sinf(pSel * 3.14159f * 1.5f) * (1.0f - pSel);
+                        targetScale += punch;
+                        targetX += 0.003f * sinf(pSel * 3.14159f);
+                    }
+                    targetScale += 0.0008f * sinf((float)s_optAnimTick * 0.14f);
+                    targetX += 0.0015f * sinf((float)s_optAnimTick * 0.08f);
+                }
+
+                // Smooth horizontal easing
+                s_optCurX[i] += (targetX - s_optCurX[i]) * 0.32f;
+                SetItemMetrics(it, s_optCurX[i], optYs[i], targetScale, 1);
+            } else {
+                SetItemMetrics(it, targetX, optYs[i], targetScale, 1);
+            }
+        }
+    } else {
+        float startY = 0.25f;
+        float endY = 0.85f;
+        float stepY = g_activeModCount > 1 ? (endY - startY) / (g_activeModCount - 1) : 0.06f;
+        if (stepY > 0.06f) stepY = 0.06f;
+        
+        for (int i = 0; i < g_activeModCount; ++i) {
+            uint32_t it = (uint32_t)(uintptr_t)g_modItems[i];
+            if (!it) continue;
+            bool isSel = (it == selAfter);
+            if (isSel) s_modSelTimer[i]++;
+
+            float targetScale = isSel ? 0.029f : 0.024f;
+            float targetX = isSel ? 0.31f : 0.28f;
+            float yPos = startY + (i * stepY);
+
+            if (g_animMod) {
+                float staggerDelay = (float)i * 1.5f;
+                float tEntry = (float)s_optTransitionTick - staggerDelay;
+                if (tEntry > 0.0f && tEntry < 14.0f) {
+                    float p = tEntry / 14.0f;
+                    float spring = 1.0f + 0.38f * sinf(p * 3.14159f) * (1.0f - p);
+                    targetScale *= spring;
+                }
+
+                if (isSel) {
+                    if (s_modSelTimer[i] < 12) {
+                        float pSel = (float)s_modSelTimer[i] / 12.0f;
+                        float punch = 0.005f * sinf(pSel * 3.14159f * 1.5f) * (1.0f - pSel);
+                        targetScale += punch;
+                        targetX += 0.003f * sinf(pSel * 3.14159f);
+                    }
+                    targetScale += 0.0008f * sinf((float)s_optAnimTick * 0.14f);
+                    targetX += 0.0015f * sinf((float)s_optAnimTick * 0.08f);
+                }
+
+                s_modCurX[i] += (targetX - s_modCurX[i]) * 0.32f;
+                SetItemMetrics(it, s_modCurX[i], yPos, targetScale, 1);
+            } else {
+                SetItemMetrics(it, targetX, yPos, targetScale, 1);
+            }
+        }
+    }
+
+    return r;
 }
 
 // ---- VIDEO screen builder (FUN_00028C00) post-hook: splice our RESOLUTION and
@@ -232,7 +555,6 @@ static void __fastcall Hk_VideoEnter(uint32_t self, uint32_t edx) {
 // arg read is a zeroed local) -> returns next screen id. Input tests: FUN_00013470 =
 // thiscall on the input object [master+0x4BC], (id, pad) -> al; id 3 = left, 4 = right
 // (from the WIDESCREEN handler's own usage; it passes pad = 0).
-using FnUpdate = uint32_t (__fastcall*)(uint32_t self, uint32_t);
 static uint32_t Orig_VideoUpdate = 0;
 // Auto-pair the game's WIDESCREEN (anamorphic 16:9 projection, settings byte
 // [0x16A254]) with the picked resolution's aspect: a 16:9 window without it renders a
@@ -297,11 +619,6 @@ void FeMenuFrameTick(int frame) {
                 int cur = *(uint16_t*)(uintptr_t)(mgr0 + 0x1A6);
                 if (cur != lastCur) { printf("[fe] map cursor -> %d (frame %d)\n", cur, frame); lastCur = cur; }
             }
-            if (scr == 4) {          // main menu: log the selected-item offset (for @menu)
-                static uint32_t lastSel = 0;
-                uint32_t sel = *(uint32_t*)(uintptr_t)(mgr0 + 4);
-                if (sel != lastSel) { printf("[fe] menu sel +0x%X (frame %d)\n", sel - mgr0, frame); lastSel = sel; }
-            }
         }
     }
     // Trigger once when the MAIN MENU (screen id 4) is first reached: by then the boot
@@ -356,10 +673,11 @@ static uint32_t __fastcall Hk_VideoUpdate(uint32_t self, uint32_t edx) {
 // own boot save prompt (screen 1): a message line + YES/NO items at x 0.25/0.75,
 // left/right to choose (input ids 3/4), A (id 1) to confirm, B (id 2) to cancel,
 // default NO. Retail strings: 0xD8 "Are you sure you want to quit?", 0x27 YES, 0x28 NO.
-static uint8_t (&g_exitMsg)[0x84] = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
-static uint8_t (&g_exitYes)[0x84] = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
-static uint8_t (&g_exitNo)[0x84]  = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
-static bool    g_exitModal = false;
+static uint8_t (&g_exitMsg)[0x84]   = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
+static uint8_t (&g_exitYes)[0x84]   = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
+static uint8_t (&g_exitNo)[0x84]    = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
+static uint8_t (&g_titleLogo)[0x84] = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
+static uint8_t (&g_titleSub)[0x84]  = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8);
 static uint8_t g_savedVis[24]; static uint32_t g_savedItems[24]; static int g_savedN = 0;
 using FnSetSel = void (__fastcall*)(uint32_t self, uint32_t, uint32_t item, uint32_t cursor);
 #define SetSelected(...) GCALL(Fastcall, FnSetSel, 0x1D230, __VA_ARGS__)
@@ -375,7 +693,8 @@ static void ExitModalShow(uint32_t self, bool show) {
         for (uint32_t it = *(uint32_t*)(uintptr_t)(self + 0x14); it && g_savedN < 24;
              it = *(uint32_t*)(uintptr_t)(it + 0x60)) {
             if (it == (uint32_t)(uintptr_t)g_exitMsg || it == (uint32_t)(uintptr_t)g_exitYes ||
-                it == (uint32_t)(uintptr_t)g_exitNo) continue;
+                it == (uint32_t)(uintptr_t)g_exitNo || it == (uint32_t)(uintptr_t)g_titleLogo ||
+                it == (uint32_t)(uintptr_t)g_titleSub) continue;
             g_savedItems[g_savedN] = it;
             g_savedVis[g_savedN++] = *(uint8_t*)(uintptr_t)(it + 0x48);
             *(uint8_t*)(uintptr_t)(it + 0x48) = 0;
@@ -396,31 +715,239 @@ static void ExitModalShow(uint32_t self, bool show) {
         SetSelected(self, 0, (uint32_t)(uintptr_t)(show ? g_exitNo : (uint8_t*)(uintptr_t)(self + 0x20)), c);
     g_exitModal = show;
 }
+static int s_animTick = 0;
+static uint32_t s_lastSel = 0;
+static int s_selTimer[5] = { 0, 0, 0, 0, 0 };
+
+static void ResetMenuAnimation() {
+    s_animTick = 0;
+    s_lastSel = 0;
+    for (int i = 0; i < 5; ++i) s_selTimer[i] = 100;
+}
+
+static void HideAllMainScreenItems(uint32_t self) {
+    uint32_t chal  = self + 0x20;
+    uint32_t multi = MeatMenuRow();
+    uint32_t lan   = self + 0x230;
+    uint32_t opts  = self + 0x338;
+    uint32_t exit_ = self + 0x1AC;
+    uint32_t items[5] = { chal, multi, lan, opts, exit_ };
+
+    for (int i = 0; i < 5; ++i) {
+        uint32_t it = items[i];
+        if (!it) continue;
+        *(uint8_t*)(uintptr_t)(it + 0x48) = 0; // completely hidden
+        *(float*)(uintptr_t)(it + 0x40) = 0.12f;
+        float zero = 0.0001f;
+        SetScale(it, 0, *(uint32_t*)&zero);
+        SetAlign(it, 0, 1);
+    }
+    *(uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)g_titleLogo + 0x48) = 0;
+    *(uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)g_titleSub  + 0x48) = 0;
+    float zero = 0.0001f;
+    SetScale((uint32_t)(uintptr_t)g_titleLogo, 0, *(uint32_t*)&zero);
+    SetScale((uint32_t)(uintptr_t)g_titleSub,  0, *(uint32_t*)&zero);
+}
+
+static uint32_t Orig_MenuEnter = 0;
+static void __fastcall Hk_MenuEnter(uint32_t self, uint32_t edx) {
+    (void)edx;
+    GCALL(Fastcall, FnThis, Orig_MenuEnter, self, 0);
+
+    // CRITICAL FIX: Retail's stock MenuEnter (0x21010) explicitly overwrote all item scales
+    // with huge 0.058f values on every screen enter, which caused the hideous 1-second blown-up text!
+    // We immediately clamp all main menu items to 0.024f baseline so returning from any submenu is seamless.
+    uint32_t chal  = self + 0x20;
+    uint32_t opts  = self + 0x338;
+    uint32_t ex    = self + 0x1AC;
+    uint32_t lan   = self + 0x230;
+    uint32_t multi = MeatMenuRow();
+    uint32_t mainItems[5] = { chal, multi, lan, opts, ex };
+    float mainYs[5] = { 0.28f, 0.38f, 0.48f, 0.58f, 0.68f };
+
+    for (int i = 0; i < 5; ++i) {
+        if (mainItems[i]) {
+            SetItemMetrics(mainItems[i], 0.28f, mainYs[i], 0.024f, 1);
+            *(uint8_t*)(uintptr_t)(mainItems[i] + 0x48) = 1; // Ensure visible
+        }
+    }
+
+    ResetMenuAnimation();
+}
+
 static uint32_t Orig_MenuBuild = 0;
 static void __fastcall Hk_MenuBuild(uint32_t self, uint32_t edx) {
     (void)edx;
     GCALL(Fastcall, FnThis, Orig_MenuBuild, self, 0);
-    g_exitModal = false;
-    uint32_t ex = self + 0x1AC;                  // the cut VERSUS item -> EXIT
-    SetLabel(ex, 0, 0x6A);                       // "EXIT"
-    *(float*)(uintptr_t)(ex + 0x44) = 0.85f;     // below OPTIONS (0.7)
-    *(uint8_t*)(uintptr_t)(ex + 0x48) = 1;       // visible
-    *(uint8_t*)(uintptr_t)(ex + 0x49) = 1;       // selectable
-    *(uint8_t*)(uintptr_t)(ex + 0x4B) = 0;       // not disabled
-    AppendItem(self, 0, ex);
-    // confirm-dialog items (hidden until EXIT is pressed), styled like the EXIT row
-    MakeCustomRow(g_exitMsg, 0xD8, 0.40f, ex, ex);           // "Are you sure...?"
-    MakeCustomRow(g_exitYes, 0x27, 0.60f, ex, (uint32_t)(uintptr_t)g_exitMsg);
-    MakeCustomRow(g_exitNo,  0x28, 0.60f, ex, (uint32_t)(uintptr_t)g_exitYes);
-    *(float*)(uintptr_t)((uint32_t)(uintptr_t)g_exitYes + 0x40) = 0.25f;
-    *(float*)(uintptr_t)((uint32_t)(uintptr_t)g_exitNo  + 0x40) = 0.75f;
-    uint32_t hide[3] = { (uint32_t)(uintptr_t)g_exitMsg, (uint32_t)(uintptr_t)g_exitYes,
-                         (uint32_t)(uintptr_t)g_exitNo };
-    for (uint32_t it : hide) { *(uint8_t*)(uintptr_t)(it + 0x48) = 0;
-                               *(uint8_t*)(uintptr_t)(it + 0x49) = 0; }
+    uint32_t ex = self + 0x1AC;                  // cut VERSUS item repurposed as EXIT
+    SetLabel(ex, 0, 0x6A);                       // 0x6A = "EXIT" (was 0x6C "VERSUS")
+    *(float*)(uintptr_t)(ex + 0x44) = 0.70f;     // CHALLENGE 0.30, MULTIPLAYER 0.40, LAN 0.50, OPTIONS 0.60, EXIT 0.70
+
+    // Relocate main menu options to left side (X = 0.28f) with centered alignment
+    uint32_t chal  = self + 0x20;
+    uint32_t opts  = self + 0x338;
+    
+    SetItemMetrics(chal, 0.28f, 0.30f, 0.024f, 1);
+    SetItemMetrics(opts, 0.28f, 0.60f, 0.024f, 1);
+    SetItemMetrics(ex,   0.28f, 0.70f, 0.024f, 1);
+
+    AppendItem(self, 0, ex);                     // now reached in normal nav
+    // Exit confirmation modal items: message at 0.40, YES at 0.25 / 0.55, NO at 0.75 / 0.55.
+    MakeCustomRow(g_exitMsg, 0xE5, 0.40f, ex, ex);
+    MakeCustomRow(g_exitYes, 0x27, 0.55f, ex, (uint32_t)(uintptr_t)g_exitMsg);
+    MakeCustomRow(g_exitNo,  0x28, 0.55f, ex, (uint32_t)(uintptr_t)g_exitYes);
+    *(float*)(uintptr_t)((uint32_t)(uintptr_t)g_exitYes + 0x40) = 0.35f;
+    *(float*)(uintptr_t)((uint32_t)(uintptr_t)g_exitNo  + 0x40) = 0.65f;
+    *(uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)g_exitMsg + 0x48) = 0; // hidden initially
+    *(uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)g_exitYes + 0x48) = 0;
+    *(uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)g_exitNo  + 0x48) = 0;
+    *(uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)g_exitMsg + 0x49) = 0; // not selectable
+    *(uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)g_exitYes + 0x49) = 0;
+    *(uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)g_exitNo  + 0x49) = 0;
+
+    // 3D Animated Title Badge (Logo + Subtitle)
+    static const uint16_t kStrLogo    = 0x1E0;
+    static const uint16_t kStrLogoSub = 0x1E1;
+    MakeCustomRow(g_titleLogo, kStrLogo, 0.12f, ex, (uint32_t)(uintptr_t)g_exitNo);
+    MakeCustomRow(g_titleSub,  kStrLogoSub, 0.17f, ex, (uint32_t)(uintptr_t)g_titleLogo);
+    *(uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)g_titleLogo + 0x49) = 0; // not selectable
+    *(uint8_t*)(uintptr_t)((uint32_t)(uintptr_t)g_titleSub  + 0x49) = 0; // not selectable
+
     LanMenuBuild(self);          // LAN GAME row on the other cut item (+0x230 -> screen 5)
     MeatMenuBuild(self);         // MULTIPLAYER row on +0x2B4; QUICK GAME/TOURNAMENT move into it
+
+    ResetMenuAnimation();
+    HideAllMainScreenItems(self);
+
+    uint32_t lan   = self + 0x230;
+    uint32_t mainItems[5] = { chal, MeatMenuRow(), lan, opts, ex };
+    float mainYs[5] = { 0.28f, 0.38f, 0.48f, 0.58f, 0.68f };
+    for (int i = 0; i < 5; ++i) {
+        if (mainItems[i]) {
+            SetItemMetrics(mainItems[i], 0.28f, mainYs[i], 0.024f, 1);
+        }
+    }
 }
+
+static void AnimateMainScreen(uint32_t self) {
+    if (g_exitModal) return;
+
+    s_lastMainAnimFrame = GfxCurrentFrame();
+    ++s_animTick;
+
+    // 3D Animated Floating Logo & Subtitle Badge above the options
+    uint32_t logo = (uint32_t)(uintptr_t)g_titleLogo;
+    uint32_t sub  = (uint32_t)(uintptr_t)g_titleSub;
+    if (logo && sub) {
+        *(uint8_t*)(uintptr_t)(logo + 0x48) = 1;
+        *(uint8_t*)(uintptr_t)(sub + 0x48)  = 1;
+        SetAlign(logo, 0, 1);
+        SetAlign(sub,  0, 1);
+
+        float t = (float)s_animTick;
+        // 3D perspective floating + rhythmic tilt wobble
+        float hoverY   = 0.004f * sinf(t * 0.08f);
+        float hoverX   = 0.002f * cosf(t * 0.06f);
+        float tilt3D   = 0.002f * sinf(t * 0.10f);
+
+        float logoScale = 0.042f + tilt3D;
+        float logoX     = 0.28f + hoverX;
+        float logoY     = 0.12f + hoverY;
+
+        float subScale  = 0.022f - tilt3D * 0.5f;
+        float subX      = 0.28f - hoverX * 0.5f;
+        float subY      = 0.17f + hoverY * 0.8f;
+
+        // Snappy cartoon spring drop-in from top on entrance
+        if (s_animTick < 12) {
+            float enterT = (float)s_animTick / 12.0f;
+            float spring = sinf(enterT * 3.14159f * 0.5f) + 0.45f * sinf(enterT * 3.14159f) * (1.0f - enterT);
+            logoScale *= spring;
+            logoY = -0.05f + (logoY - (-0.05f)) * spring;
+            subScale *= spring;
+            subY = -0.02f + (subY - (-0.02f)) * spring;
+        }
+
+        *(float*)(uintptr_t)(logo + 0x40) = logoX;
+        *(float*)(uintptr_t)(logo + 0x44) = logoY;
+        SetScale(logo, 0, *(uint32_t*)&logoScale);
+
+        *(float*)(uintptr_t)(sub + 0x40) = subX;
+        *(float*)(uintptr_t)(sub + 0x44) = subY;
+        SetScale(sub, 0, *(uint32_t*)&subScale);
+    }
+
+    uint32_t chal  = self + 0x20;
+    uint32_t multi = MeatMenuRow();
+    uint32_t lan   = self + 0x230;
+    uint32_t opts  = self + 0x338;
+    uint32_t exit_ = self + 0x1AC;
+
+    uint32_t items[5] = { chal, multi, lan, opts, exit_ };
+    uint32_t sel = *(uint32_t*)(uintptr_t)(self + 4);
+    bool suppress_b = false;
+    if (sel) {
+        s_liveSelY = *(float*)(uintptr_t)(sel + 0x44);
+    }
+
+    if (sel != s_lastSel) {
+        s_lastSel = sel;
+        for (int i = 0; i < 5; ++i) {
+            if (items[i] == sel) s_selTimer[i] = 0;
+        }
+    }
+
+    float mainYs[5] = { 0.28f, 0.38f, 0.48f, 0.58f, 0.68f };
+    for (int i = 0; i < 5; ++i) {
+        uint32_t it = items[i];
+        if (!it) continue;
+
+        bool isSel = (it == sel);
+        s_selTimer[i]++;
+
+        SetAlign(it, 0, 1);
+        *(uint8_t*)(uintptr_t)(it + 0x48) = 1; // Always visible
+
+        float targetScale = isSel ? 0.029f : 0.024f;
+        float targetX = isSel ? 0.31f : 0.28f;
+
+        if (g_animMod) {
+            // 1. Cartoon bouncy punch when selected
+            if (isSel) {
+                if (s_selTimer[i] < 14) {
+                    float selT = (float)s_selTimer[i] / 14.0f;
+                    float bounce = 0.005f * sinf(selT * 3.14159f * 1.5f) * (1.0f - selT);
+                    targetScale += bounce;
+                    targetX += 0.003f * sinf(selT * 3.14159f);
+                }
+                targetScale += 0.0008f * sinf((float)s_animTick * 0.14f);
+                targetX += 0.0015f * sinf((float)s_animTick * 0.08f);
+            }
+
+            // 2. Cascade entrance stagger when entering or returning to main menu
+            if (s_animTick < 16) {
+                float staggerDelay = (float)i * 1.5f;
+                float tEntry = (float)s_animTick - staggerDelay;
+                if (tEntry > 0.0f && tEntry < 14.0f) {
+                    float p = tEntry / 14.0f;
+                    float spring = 1.0f + 0.38f * sinf(p * 3.14159f) * (1.0f - p);
+                    targetScale *= spring;
+                }
+            }
+
+            float curX = *(float*)(uintptr_t)(it + 0x40);
+            if (curX < 0.05f || curX > 0.95f) curX = targetX;
+
+            float newX = curX + (targetX - curX) * 0.30f;
+            *(float*)(uintptr_t)(it + 0x40) = newX;
+
+            SetScale(it, 0, *(uint32_t*)&targetScale);
+        } else {
+            SetItemMetrics(it, targetX, mainYs[i], targetScale, 1);
+        }
+    }
+}
+
 static uint32_t Orig_MenuUpdate = 0;
 static uint32_t __fastcall Hk_MenuUpdate(uint32_t self, uint32_t edx) {
     (void)edx;
@@ -461,6 +988,7 @@ static uint32_t __fastcall Hk_MenuUpdate(uint32_t self, uint32_t edx) {
     // moves the cursor off it whenever fewer than two pads are connected.)
     if (input) {
         uint32_t sel = *(uint32_t*)(uintptr_t)(self + 4);
+    bool suppress_b = false;
         if (sel == MeatMenuRow())
             for (uint32_t pad = 0; pad < 4; ++pad)
                 if (GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 1, pad)) return 14;
@@ -470,6 +998,7 @@ static uint32_t __fastcall Hk_MenuUpdate(uint32_t self, uint32_t edx) {
         ExitModalShow(self, true);
         return 4;
     }
+    AnimateMainScreen(self);
     return LanMenuUpdate(self, r);                // r == 5 = the LAN row; also the launch gate
 }
 
@@ -498,48 +1027,95 @@ int InstallFeMenu() {
     }
     // Widescreen at boot: keep the saved setting ([0x16A254] loads from the save later);
     // it re-pairs whenever the user changes resolution in the menu.
-    RefreshLabel();
-    // Trampolines FIRST (PatchJump overwrites the prologues). Lengths hand-verified:
-    // 0x27590/0x28C00: push ebx/ebp/esi + mov esi,ecx + push edi = 6 bytes;
-    // 0x28BC0: mov al,[0x16A254] = 5 bytes; 0x28D30: push ecx + mov eax,[imm] = 6 bytes.
-    Orig_OptionsBuild = MakeGuestTramp(0x27590, 6, "fe:tr.optbuild");
-    Orig_VideoBuild   = MakeGuestTramp(0x28C00, 6, "fe:tr.vidbuild");
-    Orig_VideoEnter   = MakeGuestTramp(0x28BC0, 5, "fe:tr.videnter");
-    Orig_VideoUpdate  = MakeGuestTramp(0x28D30, 6, "fe:tr.vidupdate");
+    // options menu: builder 0x27590 (6 bytes), update 0x278C0 (6 bytes)
+    Orig_OptionsBuild  = MakeGuestTramp(0x27590, 6, "fe:tr.optbuild");
+    Orig_OptionsUpdate = MakeGuestTramp(0x278C0, 6, "fe:tr.optupdate");
     // main menu (screen 4): builder push ebx/ebp/esi + mov esi,ecx + push edi = 6 bytes;
-    // update push ecx + mov eax,[imm32] = 6 bytes (both verified in the disassembly).
-    Orig_MenuBuild    = MakeGuestTramp(0x21140, 6, "fe:tr.menubuild");
-    Orig_MenuUpdate   = MakeGuestTramp(0x212D0, 6, "fe:tr.menuupdate");
-    if (!Orig_OptionsBuild || !Orig_VideoBuild || !Orig_VideoEnter || !Orig_VideoUpdate ||
-        !Orig_MenuBuild || !Orig_MenuUpdate) {
+    // update push ecx + mov eax,[imm32] = 6 bytes.
+    Orig_MenuBuild     = MakeGuestTramp(0x21140, 6, "fe:tr.menubuild");
+    Orig_MenuEnter     = MakeGuestTramp(0x21010, 5, "fe:tr.menuenter");
+    Orig_MenuUpdate    = MakeGuestTramp(0x212D0, 6, "fe:tr.menuupdate");
+    if (!Orig_OptionsBuild || !Orig_OptionsUpdate || !Orig_MenuBuild || !Orig_MenuEnter || !Orig_MenuUpdate) {
         printf("[fe] trampoline alloc failed -- menu injection skipped\n");
         return 0;
     }
     int n = 0;
-    n += PatchJump(0x21140, HOOK_FC(Hk_MenuBuild),  "FE_MenuBuild");
-    n += PatchJump(0x212D0, HOOK_FC(Hk_MenuUpdate), "FE_MenuUpdate");
-    // Diagnostic bisect: TJ_FE_NOVID=1 leaves the VIDEO screen's enter/update stock.
-    char* e = nullptr; size_t sz = 0; _dupenv_s(&e, &sz, "TJ_FE_NOVID");
-    bool noVid = e && atoi(e); free(e);
-    n += PatchJump(0x19910, HOOK_CDECL(Hk_GetText),  "FE_GetText");
-    n += PatchJump(0x27590, HOOK_FC(Hk_OptionsBuild),"FE_OptionsBuild");
-    n += PatchJump(0x28C00, HOOK_FC(Hk_VideoBuild),  "FE_VideoBuild");
-    if (!noVid) {
-        n += PatchJump(0x28BC0, HOOK_FC(Hk_VideoEnter),  "FE_VideoEnter");
-        n += PatchJump(0x28D30, HOOK_FC(Hk_VideoUpdate), "FE_VideoUpdate");
-    }
-    // Retail bug hidden by the cut: the transition early-out returns screen id 8
-    // (AUDIO) instead of 9 (VIDEO). mov eax,8 at 0x28D62 -> imm32 at 0x28D63.
-    if (*(uint8_t*)(uintptr_t)0x28D62 == 0xB8 && *(uint32_t*)(uintptr_t)0x28D63 == 8) {
-        DWORD old; VirtualProtect((void*)(uintptr_t)0x28D63, 4, PAGE_EXECUTE_READWRITE, &old);
-        *(uint32_t*)(uintptr_t)0x28D63 = 9;
-        VirtualProtect((void*)(uintptr_t)0x28D63, 4, old, &old);
-        ++n;
-    } else {
-        printf("[fe] WARN: transition-id bytes @0x28D62 unexpected -- imm patch skipped\n");
-    }
+    n += PatchJump(0x27590, HOOK_FC(Hk_OptionsBuild),  "FE_OptionsBuild");
+    n += PatchJump(0x278C0, HOOK_FC(Hk_OptionsUpdate), "FE_OptionsUpdate");
+    n += PatchJump(0x21140, HOOK_FC(Hk_MenuBuild),     "FE_MenuBuild");
+    n += PatchJump(0x21010, HOOK_FC(Hk_MenuEnter),     "FE_MenuEnter");
+    n += PatchJump(0x212D0, HOOK_FC(Hk_MenuUpdate),    "FE_MenuUpdate");
+    n += PatchJump(0x19910, HOOK_CDECL(Hk_GetText),    "FE_GetText");
     printf("[fe] menu injection installed (%d patches), boot mode %dx%d\n", n, bootW, bootH);
     return n;
+}
+
+void FeMenuDrawCustomOverlay(tj::gfx::Device& dev, int frame) {
+    // Only draw when actively rendering the Main Menu or Options Menu
+    if (frame - s_lastMainAnimFrame > 1 || g_exitModal || !g_osamaMod) return;
+
+    static tj::gfx::TextureHandle s_osamaTex = -1;
+    if (s_osamaTex < 0) {
+        s_osamaTex = dev.CreateTexture(OsamaStickerPixels(), kOsamaStickerW, kOsamaStickerH);
+    }
+    if (s_osamaTex < 0) return;
+
+    static float s_smoothSelY = 0.30f;
+    s_smoothSelY += (s_liveSelY - s_smoothSelY) * 0.25f;
+
+    float t = (float)frame;
+    // 3D Floating hover
+    float hoverY = 0.003f * sinf(t * 0.16f);
+    float hoverX = 0.003f * cosf(t * 0.12f);
+
+    // 3D Continuous Spin (yaw angle around vertical axis)
+    float spinAngle = t * 0.07f;
+    float spinCos = cosf(spinAngle); // -1.0 to 1.0
+
+    // Positioned on the RIGHT of the active menu option (X = 0.455f)
+    // Vertical center aligned with text center line (+0.016f offset from item baseline)
+    float screenX = 0.455f + hoverX;
+    float screenY = s_smoothSelY + 0.016f + hoverY;
+
+    // Convert from [0..1] screen space to [-1..1] D3D clip space
+    float clipX = screenX * 2.0f - 1.0f;
+    float clipY = 1.0f - screenY * 2.0f;
+
+    // Pixel-perfect aspect ratio (16:9) so the circular sticker is a true circle
+    float halfW = 0.026f * spinCos;
+    float halfH = 0.026f * (16.0f / 9.0f); // 0.0462f
+
+    // Dynamic 3D lighting sheen based on spin angle
+    float light = (spinCos >= 0.0f) ? (0.90f + 0.10f * spinCos) : (0.75f - 0.15f * spinCos);
+    uint8_t cVal = (uint8_t)(255.0f * light);
+    uint32_t col = 0xFF000000u | (cVal << 16) | (cVal << 8) | cVal;
+
+    // Flip UVs on backside so the 3D sticker looks authentic
+    float u0 = (spinCos >= 0.0f) ? 0.0f : 1.0f;
+    float u1 = (spinCos >= 0.0f) ? 1.0f : 0.0f;
+
+    tj::gfx::VertexPTC verts[4] = {
+        { clipX - halfW, clipY + halfH, 0.0f, u0, 0.0f, col }, // Top-Left
+        { clipX + halfW, clipY + halfH, 0.0f, u1, 0.0f, col }, // Top-Right
+        { clipX + halfW, clipY - halfH, 0.0f, u1, 1.0f, col }, // Bottom-Right
+        { clipX - halfW, clipY - halfH, 0.0f, u0, 1.0f, col }  // Bottom-Left
+    };
+
+    uint16_t indices[6] = { 0, 1, 2, 0, 2, 3 };
+
+    static const float kIdentity[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
+    };
+
+    dev.SetTransform(kIdentity);
+    dev.SetTexture(s_osamaTex);
+    dev.SetBlendMode(tj::gfx::Device::BLEND_ALPHA, false);
+    dev.SetDepthTest(false);
+    dev.SetUvClamp(true, true);
+    dev.DrawIndexed(verts, 4, indices, 6);
 }
 
 } // namespace tj::hybrid

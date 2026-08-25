@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 
 namespace tj::hybrid {
 
@@ -105,9 +106,9 @@ static uint32_t MakeItem(uint8_t* mem, uint16_t label, float y, float scale, boo
     ItemCtor(it, 0);
     SetLabel(it, 0, label);
     SetValue(it, 0, 0x24);                      // no value column
-    SetAlign(it, 0, 1);                         // centre
+    SetAlign(it, 0, 1);                         // center align with glow
     SetScale(it, 0, *(const uint32_t*)&scale);
-    *(float*)(uintptr_t)(it + 0x40) = 0.5f;
+    *(float*)(uintptr_t)(it + 0x40) = 0.27f;    // left side
     *(float*)(uintptr_t)(it + 0x44) = y;
     *U8(it + 0x48) = 1;
     *U8(it + 0x49) = selectable ? 1 : 0;
@@ -121,24 +122,142 @@ static void Select(uint32_t self, int row) {
     for (uint32_t c = 0; c < 4; ++c) SetSelected(self, 0, it, c);
 }
 
+static int s_multiTick = 0;
+static int s_lastMultiSel = -1;
+static int s_multiTimer[3] = { 0, 0, 0 };
+
+static void ResetMultiAnimation() {
+    s_multiTick = 0;
+    s_lastMultiSel = -1;
+    for (int i = 0; i < 3; ++i) s_multiTimer[i] = 100;
+}
+
+static void HideAllMultiScreenItems() {
+    for (int i = 0; i < 3; ++i) {
+        uint32_t it = (uint32_t)(uintptr_t)g_rows[i];
+        if (!it) continue;
+        *(uint8_t*)(uintptr_t)(it + 0x48) = 0;
+        *(float*)(uintptr_t)(it + 0x40) = 0.12f;
+        float zero = 0.0001f;
+        SetScale(it, 0, *(uint32_t*)&zero);
+        SetAlign(it, 0, 1);
+    }
+    uint32_t t = (uint32_t)(uintptr_t)g_title;
+    if (t) {
+        *(uint8_t*)(uintptr_t)(t + 0x48) = 0;
+        *(float*)(uintptr_t)(t + 0x40) = 0.12f;
+        float zero = 0.0001f;
+        SetScale(t, 0, *(uint32_t*)&zero);
+        SetAlign(t, 0, 1);
+    }
+}
+
 // ---- screen 14 ---------------------------------------------------------------
 static void __fastcall Hk_MultiBuild(uint32_t self, uint32_t edx) {
     (void)edx;
-    const float kTitleScale = 0.075f, kRowScale = 0.055f;
-    AppendItem(self, 0, MakeItem(g_title, kTextBase + T_TITLE, 0.18f, kTitleScale, false));
-    AppendItem(self, 0, MakeItem(g_rows[0], kTextBase + T_QUICK, 0.40f, kRowScale, true));
-    AppendItem(self, 0, MakeItem(g_rows[1], kTextBase + T_TOURN, 0.53f, kRowScale, true));
-    AppendItem(self, 0, MakeItem(g_rows[2], kTextBase + T_MEAT,  0.66f, kRowScale, true));
+    const float kTitleScale = 0.055f, kRowScale = 0.034f;
+    AppendItem(self, 0, MakeItem(g_title, kTextBase + T_TITLE, 0.20f, kTitleScale, false));
+    AppendItem(self, 0, MakeItem(g_rows[0], kTextBase + T_QUICK, 0.36f, kRowScale, true));
+    AppendItem(self, 0, MakeItem(g_rows[1], kTextBase + T_TOURN, 0.48f, kRowScale, true));
+    AppendItem(self, 0, MakeItem(g_rows[2], kTextBase + T_MEAT,  0.60f, kRowScale, true));
     Select(self, 0);
+    ResetMultiAnimation();
+    HideAllMultiScreenItems();
 }
 
 static void __fastcall Hk_MultiEnter(uint32_t self, uint32_t edx) {
     (void)edx;
     Select(self, 0);
+    ResetMultiAnimation();
+    HideAllMultiScreenItems();
+}
+
+static void AnimateMultiScreenItems() {
+    ++s_multiTick;
+
+    if (g_sel != s_lastMultiSel) {
+        s_lastMultiSel = g_sel;
+        if (g_sel >= 0 && g_sel < 3) s_multiTimer[g_sel] = 0;
+    }
+
+    // Animate title (starts at frame 0)
+    uint32_t title = (uint32_t)(uintptr_t)g_title;
+    if (title) {
+        *(uint8_t*)(uintptr_t)(title + 0x48) = 1;
+        SetAlign(title, 0, 1);
+        if (s_multiTick < 10) {
+            float t = (float)s_multiTick / 10.0f;
+            float spring = sinf(t * 3.14159f * 0.5f) + 0.40f * sinf(t * 3.14159f) * (1.0f - t);
+            float scale = 0.055f * spring;
+            float x = 0.12f + (0.27f - 0.12f) * spring;
+            *(float*)(uintptr_t)(title + 0x40) = x;
+            SetScale(title, 0, *(uint32_t*)&scale);
+        } else {
+            *(float*)(uintptr_t)(title + 0x40) = 0.27f;
+            float scale = 0.055f;
+            SetScale(title, 0, *(uint32_t*)&scale);
+        }
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        uint32_t it = (uint32_t)(uintptr_t)g_rows[i];
+        if (!it) continue;
+
+        bool isSel = (i == g_sel);
+        s_multiTimer[i]++;
+
+        SetAlign(it, 0, 1);
+
+        int startFrame = (i + 1) * 3;
+        if (s_multiTick < startFrame) {
+            *(uint8_t*)(uintptr_t)(it + 0x48) = 0;
+            float zero = 0.0001f;
+            SetScale(it, 0, *(uint32_t*)&zero);
+            *(float*)(uintptr_t)(it + 0x40) = 0.12f;
+            continue;
+        }
+
+        *(uint8_t*)(uintptr_t)(it + 0x48) = 1;
+
+        float targetScale = isSel ? 0.040f : 0.033f;
+        float targetX = isSel ? 0.31f : 0.27f;
+
+        int enterElapsed = s_multiTick - startFrame;
+        if (enterElapsed < 10) {
+            float t = (float)enterElapsed / 10.0f;
+            float spring = sinf(t * 3.14159f * 0.5f) + 0.45f * sinf(t * 3.14159f) * (1.0f - t);
+            targetScale *= spring;
+            targetX = 0.12f + (targetX - 0.12f) * spring;
+
+            *(float*)(uintptr_t)(it + 0x40) = targetX;
+            SetScale(it, 0, *(uint32_t*)&targetScale);
+            continue;
+        }
+
+        if (isSel) {
+            if (s_multiTimer[i] < 14) {
+                float selT = (float)s_multiTimer[i] / 14.0f;
+                float bounce = 0.008f * sinf(selT * 3.14159f * 1.5f) * (1.0f - selT);
+                targetScale += bounce;
+                targetX += 0.005f * sinf(selT * 3.14159f);
+            }
+            targetScale += 0.0012f * sinf((float)s_multiTick * 0.14f);
+            targetX += 0.002f * sinf((float)s_multiTick * 0.08f);
+        }
+
+        float curX = *(float*)(uintptr_t)(it + 0x40);
+        if (curX < 0.05f || curX > 0.95f) curX = targetX;
+
+        float newX = curX + (targetX - curX) * 0.30f;
+        *(float*)(uintptr_t)(it + 0x40) = newX;
+
+        SetScale(it, 0, *(uint32_t*)&targetScale);
+    }
 }
 
 static uint32_t __fastcall Hk_MultiUpdate(uint32_t self, uint32_t edx) {
     (void)edx;
+    AnimateMultiScreenItems();
     uint32_t m = Master(), fe = FeMgr();
     uint32_t in = m ? *U32(m + 0x4BC) : 0;
     if (!fe) return 14;
@@ -217,13 +336,16 @@ void MeatMenuBuild(uint32_t self) {
     if (after) *U32(after + 0x64) = multi;
     else *U32(self + 0x18) = multi;
 
-    // five rows now, so re-space them all
-    static const float kY[5] = { 0.26f, 0.38f, 0.50f, 0.62f, 0.74f };
-    *(float*)(uintptr_t)(chal  + 0x44) = kY[0];
-    *(float*)(uintptr_t)(multi + 0x44) = kY[1];
-    *(float*)(uintptr_t)(lan   + 0x44) = kY[2];
-    *(float*)(uintptr_t)(opts  + 0x44) = kY[3];
-    *(float*)(uintptr_t)(exit_ + 0x44) = kY[4];
+    // five rows now, so re-space and align them with the background highlight glow
+    static const float kY[5] = { 0.30f, 0.40f, 0.50f, 0.60f, 0.70f };
+    uint32_t rows[5] = { chal, multi, lan, opts, exit_ };
+    for (int i = 0; i < 5; ++i) {
+        *(float*)(uintptr_t)(rows[i] + 0x44) = kY[i];
+        *(float*)(uintptr_t)(rows[i] + 0x40) = 0.27f;
+        SetAlign(rows[i], 0, 1); // center align with glow
+        float baseScale = 0.034f;
+        SetScale(rows[i], 0, *(uint32_t*)&baseScale);
+    }
 
     // Retail Build leaves the cursor on QUICK GAME, which no longer exists in this list -- and
     // a selection pointing at an unlinked item makes the first d-pad press land anywhere.

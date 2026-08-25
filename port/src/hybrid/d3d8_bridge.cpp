@@ -287,6 +287,7 @@ static uint8_t* g_pushbuf = nullptr;             // scratch pushbuffer (tokens w
 static const uint32_t kPushSize = 32u << 20;
 static uint32_t g_drawCalls = 0;                 // DrawVerticesUP calls since last Clear (diagnostic)
 static int      g_frame = 0;                     // frames presented (advanced in Br_Swap)
+int GfxCurrentFrame() { return g_frame; }
 static uint32_t g_dbgUiDraws = 0, g_dbg3dDraws = 0, g_dbgFvfDraws = 0, g_dbgSkips = 0;  // per-frame path counters
 static uint32_t g_frmTexCreate = 0, g_frmTexUpdate = 0;   // per-frame texture create/update (perf)
 static uint32_t g_texEvict = 0;          // cache evictions per window (thrash canary)
@@ -2187,6 +2188,10 @@ static void __stdcall Br_Swap(uint32_t flags) {
             if (ping[cur] >= 0 && (!inMatch || (g_frame & 7) == 0))
                 g_dev.CopyBackbufferTo(ping[cur]);
         }
+    }
+    {
+        extern void FeMenuDrawCustomOverlay(tj::gfx::Device& dev, int frame);
+        FeMenuDrawCustomOverlay(g_dev, g_frame);
     }
     { PhaseTimer _pt(&g_tSwap); g_dev.EndScene(); g_dev.Present(); }
     // NOTE: message pump runs on a dedicated UI thread (see EnsureDisplay), NOT here --
