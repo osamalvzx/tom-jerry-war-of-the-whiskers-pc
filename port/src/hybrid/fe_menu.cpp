@@ -270,11 +270,11 @@ static void __fastcall Hk_OptionsBuild(uint32_t self, uint32_t edx) {
     g_activeModCount = dynamicModCount + 4; // 3 built-in (Anim, Osama, Lang) + dynamic + 1 BACK
     if (g_activeModCount > 35) g_activeModCount = 35;
     
-    // Auto-calculate spacing so they fit on screen (from 0.25f to 0.85f)
-    float startY = 0.25f;
-    float endY = 0.85f;
-    float stepY = g_activeModCount > 1 ? (endY - startY) / (g_activeModCount - 1) : 0.06f;
-    if (stepY > 0.06f) stepY = 0.06f; // max spacing
+    // Auto-calculate spacing so they fit on screen
+    float startY = (g_activeModCount > 6) ? 0.20f : 0.25f;
+    float endY = 0.88f;
+    float stepY = g_activeModCount > 1 ? (endY - startY) / (g_activeModCount - 1) : 0.055f;
+    if (stepY > 0.055f) stepY = 0.055f; // max spacing
 
     for (int i = 0; i < g_activeModCount; ++i) {
         uint32_t modIt = (uint32_t)(uintptr_t)g_modItems[i];
@@ -487,18 +487,19 @@ static uint32_t __fastcall Hk_OptionsUpdate(uint32_t self, uint32_t edx) {
             }
         }
     } else {
-        float startY = 0.25f;
-        float endY = 0.85f;
-        float stepY = g_activeModCount > 1 ? (endY - startY) / (g_activeModCount - 1) : 0.06f;
-        if (stepY > 0.06f) stepY = 0.06f;
+        float startY = (g_activeModCount > 6) ? 0.20f : 0.25f;
+        float endY = 0.88f;
+        float stepY = g_activeModCount > 1 ? (endY - startY) / (g_activeModCount - 1) : 0.055f;
+        if (stepY > 0.055f) stepY = 0.055f;
         
+        float baseScale = (g_activeModCount > 6) ? 0.021f : 0.024f;
         for (int i = 0; i < g_activeModCount; ++i) {
             uint32_t it = (uint32_t)(uintptr_t)g_modItems[i];
             if (!it) continue;
             bool isSel = (it == selAfter);
             if (isSel) s_modSelTimer[i]++;
 
-            float targetScale = isSel ? 0.029f : 0.024f;
+            float targetScale = isSel ? (baseScale * 1.22f) : baseScale;
             float targetX = isSel ? 0.31f : 0.28f;
             float yPos = startY + (i * stepY);
 

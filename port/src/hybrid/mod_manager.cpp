@@ -21,6 +21,29 @@ static bool Exists(const char* p) {
     return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES;
 }
 
+static void CreateModTemplate(const char* modsDir, const char* folder, const char* name, const char* author, const char* desc, int enabled, const char* readme) {
+    char dir[MAX_PATH];
+    _snprintf_s(dir, sizeof(dir), _TRUNCATE, "%s\\%s", modsDir, folder);
+    if (!Exists(dir)) {
+        CreateDirectoryA(dir, nullptr);
+        char iniPath[MAX_PATH];
+        _snprintf_s(iniPath, sizeof(iniPath), _TRUNCATE, "%s\\mod.ini", dir);
+        FILE* fp = nullptr;
+        fopen_s(&fp, iniPath, "w");
+        if (fp) {
+            fprintf(fp, "[Mod]\nName=%s\nAuthor=%s\nDescription=%s\nEnabled=%d\n", name, author, desc, enabled);
+            fclose(fp);
+        }
+        char readmePath[MAX_PATH];
+        _snprintf_s(readmePath, sizeof(readmePath), _TRUNCATE, "%s\\README.txt", dir);
+        fopen_s(&fp, readmePath, "w");
+        if (fp) {
+            fprintf(fp, "%s", readme);
+            fclose(fp);
+        }
+    }
+}
+
 void SaveModsState() {
     char ini[MAX_PATH];
     IniPath(ini, sizeof(ini));
@@ -39,27 +62,30 @@ void InitMods() {
     _snprintf_s(modsDir, sizeof(modsDir), _TRUNCATE, "%s\\mods", root);
     CreateDirectoryA(modsDir, nullptr);
 
-    // Create a sample template mod if mods/ is empty
-    char sampleDir[MAX_PATH];
-    _snprintf_s(sampleDir, sizeof(sampleDir), _TRUNCATE, "%s\\Sample_Texture_Mod", modsDir);
-    if (!Exists(sampleDir)) {
-        CreateDirectoryA(sampleDir, nullptr);
-        char sampleIni[MAX_PATH];
-        _snprintf_s(sampleIni, sizeof(sampleIni), _TRUNCATE, "%s\\mod.ini", sampleDir);
-        FILE* fp = nullptr;
-        fopen_s(&fp, sampleIni, "w");
-        if (fp) {
-            fprintf(fp, "[Mod]\nName=Sample Texture Mod\nAuthor=TJ Modder\nDescription=Place custom GFX/ or AUD/ folders here to override game assets!\nEnabled=0\n");
-            fclose(fp);
-        }
-        char sampleReadme[MAX_PATH];
-        _snprintf_s(sampleReadme, sizeof(sampleReadme), _TRUNCATE, "%s\\README.txt", sampleDir);
-        fopen_s(&fp, sampleReadme, "w");
-        if (fp) {
-            fprintf(fp, "How to create a mod:\n1. Put your replaced files here matching the game directory structure (such as GFX/CAST/TOM/tom.XBD)\n2. Enable this mod in the in-game MODS CONFIG menu!\n");
-            fclose(fp);
-        }
-    }
+    // Initialize all standard mod categories if missing
+    CreateModTemplate(modsDir, "01_Arabic_Language_Pack", "ARABIC LANG PACK", "Osama (osamalvzx)",
+                      "Full Arabic localization and custom Arabic fonts package", 1,
+                      "MOD: 01_Arabic_Language_Pack\nPlace Arabic font textures in GFX/FE/\n");
+
+    CreateModTemplate(modsDir, "02_Character_Skins_Mod", "CHARACTER SKINS", "TJ Community",
+                      "Custom 3D character skins and costumes", 0,
+                      "MOD: 02_Character_Skins_Mod\nPlace character models in GFX/CAST/\n");
+
+    CreateModTemplate(modsDir, "03_Arenas_and_Stages_Mod", "ARENAS & STAGES", "TJ Community",
+                      "Custom arena textures and stage modifications", 0,
+                      "MOD: 03_Arenas_and_Stages_Mod\nPlace stage textures in GFX/<ARENA>/\n");
+
+    CreateModTemplate(modsDir, "04_Custom_Audio_and_Voices_Mod", "AUDIO & VOICES", "TJ Community",
+                      "Custom sound effects, voice lines, and music", 0,
+                      "MOD: 04_Custom_Audio_and_Voices_Mod\nPlace WAV files in AUDMUSIC/ or AUDSoundFX/\n");
+
+    CreateModTemplate(modsDir, "05_UI_and_HUD_Customizer", "UI & HUD CUSTOM", "TJ Community",
+                      "Custom menu graphics, health bars, and HUD", 0,
+                      "MOD: 05_UI_and_HUD_Customizer\nPlace UI textures in GFX/FE/ and GFX/OSD/\n");
+
+    CreateModTemplate(modsDir, "06_HD_Graphics_and_Textures_Mod", "HD GRAPHICS PACK", "TJ Community",
+                      "High-resolution remastered textures", 0,
+                      "MOD: 06_HD_Graphics_and_Textures_Mod\nPlace HD textures in GFX/\n");
 
     char searchPattern[MAX_PATH];
     _snprintf_s(searchPattern, sizeof(searchPattern), _TRUNCATE, "%s\\*", modsDir);

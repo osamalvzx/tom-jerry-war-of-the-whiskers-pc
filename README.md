@@ -1,111 +1,90 @@
-# Tom & Jerry: War of the Whiskers — native PC port
+# Tom & Jerry: War of the Whiskers — Native PC Port & Advanced Modding Engine 🎮
 
-A native Windows port of the 2003 Xbox game. **Not an emulator**: the original x86 game code
-runs in-process, with the Xbox kernel, Direct3D 8 and DirectSound replaced by real Windows
-implementations (D3D11, XAudio2, Win32 file I/O).
+[![GitHub Release](https://img.shields.io/github/v/release/osamalvzx/tom-jerry-war-of-the-whiskers-pc?color=green&label=Release)](https://github.com/osamalvzx/tom-jerry-war-of-the-whiskers-pc/releases)
+[![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-blue.svg)]()
+[![Modding Engine](https://img.shields.io/badge/Modding%20Engine-Active%20v2.0-orange.svg)]()
 
-**This project contains no game data.** You supply your own disc image; the installer extracts
-the game files from it. Nothing derived from the disc is distributed here.
+A native Windows PC port of the classic 2003 fighting game *Tom and Jerry: War of the Whiskers*. **Not an emulator**: the original x86 game code executes in-process, with the Xbox kernel, Direct3D 8, and DirectSound replaced by high-performance modern Windows subsystems (Direct3D 11, XAudio2, and Win32 file I/O).
 
 ---
 
-## Installing
+## 🌟 Key Features
 
-1. Download `tj_setup.exe` from [Releases](../../releases).
-2. Run it and point it at your own `.iso` of the game.
-3. It extracts the game files, installs the runtime, and creates shortcuts.
+- **Full Game Support**: All characters, all arenas, Challenge mode, and Quick Game.
+- **Local & LAN Multiplayer**: Up to 4 players on one PC or frame-locked deterministic LAN multiplayer.
+- **Widescreen & High Resolution**: Crisp rendering at 720p, 1080p, 1440p, 4K+ (Windowed, Borderless, Fullscreen).
+- **MEAT RUSH Mode**: A brand new fast-paced competitive collection game mode.
+- **Native In-Game Modding Engine (`MODS CONFIG`)**: Real-time asset overriding without touching original game files!
+- **Full Arabic Language & Localization Support 🇸🇦**: Reshaped Arabic text engine with RTL support and 3D country flag rendering.
 
-Saved games and settings live in `%LOCALAPPDATA%\TomJerryWOW`, so they survive uninstalling
-and a Program Files install can write them.
+---
 
-Windows 10 or 11, 64-bit. No redistributables to install — the VC++ runtime is included and
-everything else is part of Windows.
+## 🛠️ Modding Engine & Categories (`mods/` Folder)
 
-## What works
+The port features a complete, zero-overhead asset replacement system. Simply place your modified files into the `mods/` directory and toggle them live in-game under **`OPTIONS ➔ MODS CONFIG`**.
 
-- The full game: all characters, all arenas, Challenge and Quick Game.
-- **Local multiplayer up to 4 players** — one controller each, on one PC.
-- **Widescreen and any resolution**, windowed / borderless / exclusive fullscreen.
-- **Independent music and effects volume** — the original could only trade one against the other.
-- **Saving** works, to a normal Windows folder.
-- **LAN multiplayer** — host or join over the network, with a lobby, player names and
-  configurable fight settings. Frame-locked deterministic lockstep.
-- **Local players and LAN players mix freely.** Two people can share one PC and play against
-  another PC, with CPU opponents filling any seat that is left — four seats in total, in any
-  combination. Everyone at a PC picks their own character and team on their own controller,
-  and the second player appears as `<name> 2`.
-- **MEAT RUSH**, a brand new game mode — see below. Playable solo against the AI or over LAN.
+The game comes pre-configured with dedicated directories for every possible mod category:
 
-## MEAT RUSH
+| Folder Name | Mod Name | Description | Target Asset Paths |
+|---|---|---|---|
+| `01_Arabic_Language_Pack` | **ARABIC LANG PACK** | Full Arabic localization and custom Arabic fonts | `GFX/FE/` |
+| `02_Character_Skins_Mod` | **CHARACTER SKINS** | Custom 3D character models, costumes, and skins | `GFX/CAST/<CHARACTER>/` |
+| `03_Arenas_and_Stages_Mod` | **ARENAS & STAGES** | Arena textures, stage backgrounds, and lighting | `GFX/<ARENA>/` |
+| `04_Custom_Audio_and_Voices_Mod` | **AUDIO & VOICES** | Custom voice lines, sound effects, and BGM | `AUDMUSIC/`, `AUDSoundFX/` |
+| `05_UI_and_HUD_Customizer` | **UI & HUD CUSTOM** | Custom loading screens, menus, and health bars | `GFX/FE/`, `GFX/OSD/` |
+| `06_HD_Graphics_and_Textures_Mod` | **HD GRAPHICS PACK** | High-definition remastered textures and graphics | `GFX/` |
 
-A new mode built on top of the original game: **a race to collect, not a fight to the finish.**
+### How Modding Works:
+1. Open the `mods/` folder in your game directory.
+2. Inside any mod folder, place your modified files following the game's directory structure (e.g. `mods/02_Character_Skins_Mod/GFX/CAST/TOM/tom.XBD`).
+3. Launch the game, go to **`OPTIONS ➔ MODS CONFIG`**, and toggle the mod to **ON**.
+4. Settings are automatically saved to `tomjerry.ini`!
 
-**Nobody can be knocked out.** Punches, kicks and smashes still land, characters still get
-knocked down and sent flying, and every move works exactly as it always did — but health is
-taken out of the equation entirely and the health bars come off the HUD. You cannot lose by
-being beaten up, and you cannot win that way either.
+---
 
-**Instead, a turkey leg keeps dropping into the arena, and you grab it.** It is the only item
-that spawns — no weapons, no first-aid boxes, no mystery crates — and several are on the floor
-at any moment. Press **B** next to one and it is instantly yours: it vanishes on the spot and
-your counter goes up by one. It is never carried, never swung, never thrown, and **it cannot be
-destroyed** — kicking or smashing it just knocks it around, so the only way anything scores is
-a clean pickup.
+## 🇸🇦 الدليل العربي لنظام المودات والتعريب (Arabic Guide)
 
-That turns fighting into a tool rather than the goal. Punching someone away from a drumstick
-is how you deny them a point; a well-timed smash buys you the second you need to reach one
-first. Your count is shown under each player's portrait, so you always know who is ahead.
+تم تزويد هذا البورت بمحرك مودات متكامل يُمكنك من تعديل كل شيء في اللعبة بسهولة:
 
-**Winning.** First to the target wins immediately. Set the target on
-`OPTIONS → FIGHT SETTINGS → MEAT RUSH`: **5, 10, 15, 20 or UNLIMITED**. On UNLIMITED there is
-no target and the round is decided by the clock — whoever has collected the most when time runs
-out takes it, and an equal count is a draw. (UNLIMITED meat together with UNLIMITED time would
-never end, so the game will not let you start that combination.)
+### 1. خيارات المودات المدمجة (In-Game MODS CONFIG):
+- **حركة القوائم (MENU TRANSITIONS)**: تفعيل أو تعطيل الحركة الكرتونية السلسة للقوائم بمعدل 60 إطاراً.
+- **شعار أسامة 3D (OSAMA BADGE)**: تفعيل أو تعطيل الشعار ثلاثي الأبعاد المميز.
+- **اللغة (LANGUAGE)**: التبديل الفوري بين اللغة الإنجليزية واللغة العربية مع إظهار علم المملكة العربية السعودية 🇸🇦.
+- **المودات المخصصة**: تشغيل أو إيقاف أي مود داخل مجلد `mods/` بضغطة زر واحدة.
 
-**Where to find it:** `MAIN MENU → MULTIPLAYER → MEAT RUSH`, and in the LAN lobby's **MODE**
-row alongside QUICK MATCH and TOURNAMENT. It works in every arena — the drumstick is placed
-into each one at install time, so it looks the same wherever you play.
+### 2. أقسام مجلد المودات (`mods/`):
+- `01_Arabic_Language_Pack`: لوضع ملفات الخطوط العربية المعدلة لتعريب واجهة اللعبة.
+- `02_Character_Skins_Mod`: لتعديل أشكال وملابس شخصيات (توم، جيري، سبايك، بوتش، إلخ).
+- `03_Arenas_and_Stages_Mod`: لتعديل خامات وألوان الحلبات والمراحل (المطبخ، القصر المسكون، المختبر، السفينة).
+- `04_Custom_Audio_and_Voices_Mod`: لتغيير المؤثرات الصوتية وأصوات الشخصيات والموسيقى.
+- `05_UI_and_HUD_Customizer`: لتعديل واجهات القوائم وشاشات البداية وأشرطة الصحة.
+- `06_HD_Graphics_and_Textures_Mod`: لحزم تحسين جودة وتوضيح الجرافيكس (HD Textures).
 
-Controls are the game's own: **A** jump, **B** grab, **X** kick (**X** in mid-air smashes).
+---
 
-## Building
+## 📥 Installation & Setup
 
-Requires Visual Studio 2022 Build Tools with the **x86** toolset, and CMake.
+1. Download the latest release from the [Releases](https://github.com/osamalvzx/tom-jerry-war-of-the-whiskers-pc/releases) page.
+2. Run `setup.exe` to install the runtime and mod templates into your game directory.
+3. Launch the game using `PLAY.cmd` or the created desktop shortcut.
 
-```
+---
+
+## 🔨 Building from Source
+
+Requires **Visual Studio 2022 Build Tools (x86 toolset)** and **CMake**.
+
+```powershell
+# Configure build
 cmake -S port -B port/build -A Win32
+
+# Compile full release
 cmake --build port/build --config Release
 ```
 
-Key targets:
+---
 
-| target | what it is |
-|---|---|
-| `tj_loader` | the game executable (low-based host process) |
-| `tj_hybrid` | the port itself — kernel, graphics, audio, netplay, game modes |
-| `tj_setup` | the installer (**Release only** — it embeds the Release binaries) |
-| `diff_test` | differential test: 141 reimplemented functions vs. the original machine code |
-| `xdvdfs_test`, `xmf_test` | installer self-checks (disc reading, asset preparation) |
-
-`diff_test` needs images extracted from your own copy of the game — see
-`port/tools/extract_data_image.py`. They are deliberately not distributed.
-
-See [HOW_TO_TEST.md](HOW_TO_TEST.md) for how to run and verify each piece.
-
-## How it works, briefly
-
-`tj_loader.exe` reserves the Xbox virtual address range so Windows places its own allocations
-elsewhere, then loads `tj_hybrid.dll`, which maps `default.xbe` at its real addresses and wires
-the Xbox kernel imports to native implementations. The game's own code then runs unmodified;
-features are added by patching call sites and hooking vtables at known addresses.
-
-Determinism was the hard requirement for netplay: one simulation step is exactly one presented
-frame, no clock reaches gameplay, and both RNGs are reseeded at the match barrier — so two PCs
-exchanging only inputs stay in step.
-
-## Legal
-
-This is an unofficial, non-commercial project, not affiliated with or endorsed by the
-rights holders. It contains no game code or assets: you must own the game and supply your own
-disc image. Tom and Jerry and all related characters are the property of their respective
-owners.
+## 📜 Credits & Community
+- **Developer & Maintainer**: Osama ([@osamalvzx](https://github.com/osamalvzx))
+- **Based on**: Tom and Jerry: War of the Whiskers (VIS Entertainment / Warner Bros.)
