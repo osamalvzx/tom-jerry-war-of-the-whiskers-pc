@@ -26,6 +26,9 @@
 #include <cstdint>
 #include <cmath>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include "runtime/assets/xmf_texture.h"
 
 extern "C" uint32_t Device_NullSrvBinds();   // d3d8.cpp (dark-scene canary: stale handle binds)
 
@@ -640,6 +643,62 @@ static tj::gfx::TextureHandle ResolveTexture(void* res) {
     }
     if (w < 1 || w > 2048 || h < 1 || h > 2048) return tj::gfx::kNoTexture;
     g_lastTexLinear = sizef != 0; g_lastTexW = w; g_lastTexH = h;
+
+        const uint8_t* modPix = (const uint8_t*)(uintptr_t)*(uint32_t*)((char*)res + 0x04);
+        uint32_t modBytes = sizef ? pitch * h : SrcPixelBytes(fmt, w, h);
+        
+        uint64_t modHash = 0;
+        if (IsReadable((uint32_t)(uintptr_t)modPix, modBytes)) {
+            modHash = 5381;
+            for (uint32_t j=0; j<modBytes; j+=16) modHash = ((modHash << 5) + modHash) + modPix[j];
+        }
+        
+        if (modHash != 0) {
+            static std::unordered_map<uint64_t, tj::gfx::TextureHandle> s_skins;
+            auto it = s_skins.find(modHash);
+            if (it != s_skins.end()) {
+                if (it->second != tj::gfx::kNoTexture) return it->second;
+            } else {
+                char skinPath[256];
+                sprintf_s(skinPath, "mods\\Skins\\%llu.bmp", modHash);
+                FILE* fSkin = fopen(skinPath, "rb");
+                if (fSkin) {
+                    fseek(fSkin, 18, SEEK_SET);
+                    int32_t bw = 0, bh = 0;
+                    fread(&bw, 4, 1, fSkin);
+                    fread(&bh, 4, 1, fSkin);
+                    if (bh < 0) bh = -bh;
+                    fseek(fSkin, 54, SEEK_SET);
+                    std::vector<uint32_t> rgba(bw * bh);
+                    fread(rgba.data(), 4, bw * bh, fSkin);
+                    fclose(fSkin);
+                    for (int j=0; j<bw*bh; j++) {
+                        uint32_t p = rgba[j];
+                        rgba[j] = (p & 0xFF00FF00) | ((p & 0xFF) << 16) | ((p >> 16) & 0xFF);
+                    }
+                    tj::gfx::TextureHandle th = g_dev.CreateTexture(rgba.data(), bw, bh);
+                    s_skins[modHash] = th;
+                    return th;
+                } else {
+                    s_skins[modHash] = tj::gfx::kNoTexture;
+                }
+            }
+        }
+        
+        if (modHash != 0 && w >= 64 && h >= 64 && fmt != 0) {
+            static std::unordered_set<uint64_t> s_dumped;
+            if (s_dumped.find(modHash) == s_dumped.end()) {
+                s_dumped.insert(modHash);
+                CreateDirectoryA("textures_dump", NULL);
+                char dumpPath[256];
+                sprintf_s(dumpPath, "textures_dump\\%llu_%dx%d.bmp", modHash, w, h);
+                if (GetFileAttributesA(dumpPath) == INVALID_FILE_ATTRIBUTES) {
+                    FILE* fDump = fopen(dumpPath, "wb");
+                    if (fDump) fclose(fDump);
+                }
+            }
+        }
+
     // palette for P8: resource +8 -> palette resource -> its Data (256 ARGB); if the
     // resource doesn't carry one, fall back to the stage-0 palette the game bound via
     // SetPalette (the in-game material path binds palettes separately per stage).
