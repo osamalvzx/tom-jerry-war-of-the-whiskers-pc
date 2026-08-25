@@ -1,4 +1,4 @@
-// Frontend menu injection: re-enable the game's HIDDEN VIDEO options screen and add a
+﻿// Frontend menu injection: re-enable the game's HIDDEN VIDEO options screen and add a
 // native RESOLUTION row to it.
 //
 // The retail build ships a complete VIDEO screen (id 9: WIDESCREEN toggle + CONFIRM,
@@ -130,7 +130,7 @@ static char (&g_exitQ)[64] = *(char(*)[64])GuestObjAlloc(64, 8);  // filled at i
 // "exists on this PC" on a phone. The hybrid layer builds for BOTH targets from these same
 // sources, so the word is chosen at COMPILE time and concatenated into the literals: one
 // table, no runtime cost, and no way for the two wordings to drift apart.
-// ⚠ Line width: these are drawn into the retail dialog box, which was sized for the
+// âڑ  Line width: these are drawn into the retail dialog box, which was sized for the
 // longer original wording ("the Xbox hard disk"), so the extra characters are safe.
 #ifdef __ANDROID__
 #define TJ_HOST_WORD    "phone"
@@ -186,12 +186,12 @@ static char* __cdecl Hk_GetText(uint32_t idxArg) {
         if (strcmp(text, "CHEATS MENU") == 0) return (char*)GuestInternStr(AR_CHEATS_MENU);
         if (strcmp(text, "BACK") == 0) return (char*)GuestInternStr(AR_BACK);
         if (strcmp(text, "EXIT") == 0) return (char*)GuestInternStr(AR_EXIT);
-        if (strcmp(text, "YES") == 0) return (char*)GuestInternStr("ï»¤ï»ï»§"); // نعم
-        if (strcmp(text, "NO") == 0) return (char*)GuestInternStr("ïºï»"); // لا
+        if (strcmp(text, "YES") == 0) return (char*)GuestInternStr("أ¯آ»آ¤أ¯آ»آŒأ¯آ»آ§"); // ظ†ط¹ظ…
+        if (strcmp(text, "NO") == 0) return (char*)GuestInternStr("أ¯آ؛آژأ¯آ»آں"); // ظ„ط§
     }
     for (const auto& s : kSaveText) if (s.idx == idx) return (char*)s.text;
     // The guest STORES the returned pointer, so any host-image literal a provider hands back
-    // must be interned into the guest arena (below 4 GB) — identity passthrough on x86, the
+    // must be interned into the guest arena (below 4 GB) â€” identity passthrough on x86, the
     // relocation on ARM. (MeatMenuText/MeatCustomText return host .rodata; lan_ui/audio_ui
     // already return arena buffers, so intern is a no-op there.)
     if (const char* lan = LanCustomText(idx)) return (char*)GuestInternStr(lan);  // LAN UI rows (0x100+)
@@ -217,7 +217,7 @@ static char* __cdecl Hk_GetText(uint32_t idxArg) {
 
 // ---- minimal trampoline (prologue lengths hand-verified in the disassembly; the copied
 // bytes contain no relative branches) ----
-// (call-through trampolines now come from xdk_patch's guest-window pad — MakeGuestTramp)
+// (call-through trampolines now come from xdk_patch's guest-window pad â€” MakeGuestTramp)
 
 static void PlayUiSound(uint32_t id); // Forward declare
 #define TextItemCtor(...) GCALL(Fastcall, FnThis, 0x19E10, __VA_ARGS__)
@@ -267,7 +267,7 @@ static void __fastcall Hk_OptionsBuild(uint32_t self, uint32_t edx) {
 
     // Initialize sub-menu items as a completely SEPARATE linked list
     int dynamicModCount = tj::hybrid::GetModCount();
-    g_activeModCount = dynamicModCount + 3; // 2 built-in (Anim, Osama) + dynamic + 1 BACK
+    g_activeModCount = dynamicModCount + 4; // 3 built-in (Anim, Osama, Lang) + dynamic + 1 BACK
     if (g_activeModCount > 35) g_activeModCount = 35;
     
     // Auto-calculate spacing so they fit on screen (from 0.25f to 0.85f)
@@ -629,7 +629,7 @@ void FeMenuFrameTick(int frame) {
     // validator (FUN_0002dd00) range-checks 0/1 only and the saver signs the blob
     // as-is, so the pokes are save-safe. Re-applied EVERY frame: with no save on disk,
     // each frontend rebuild re-runs the save-load path, which RESETS the blob to
-    // locked defaults — a once-only poke got undone after the first match (observed:
+    // locked defaults â€” a once-only poke got undone after the first match (observed:
     // arena-sweep level-select rights clamped at Beach again from cycle 3).
     static int unlock = -1;
     if (unlock < 0) { char* e = nullptr; size_t n = 0; _dupenv_s(&e, &n, "TJ_UNLOCK");
