@@ -162,6 +162,7 @@ static bool g_animMod      = true; // Preserved for other code relying on this
 static int g_activeModCount = 0;
 
 
+static uint32_t Orig_GetText = 0;
 static char* __cdecl Hk_GetText(uint32_t idxArg) {
     uint16_t idx = (uint16_t)idxArg;
     switch (idx) {                                            // custom (DLL-side) strings
@@ -172,7 +173,8 @@ static char* __cdecl Hk_GetText(uint32_t idxArg) {
     
     // Original Text fetch for translation
     using FnGetText = char* (__cdecl*)(uint32_t);
-    char* text = GCALL(Cdecl, FnGetText, 0x19910, idxArg);
+    extern uint32_t Orig_GetText;
+    char* text = GCALL(Cdecl, FnGetText, Orig_GetText, idxArg);
     
     if (g_language == 1 && text) {
         if (strcmp(text, "CHALLENGE") == 0) return (char*)GuestInternStr(AR_CHALLENGE);
@@ -1077,7 +1079,8 @@ int InstallFeMenu() {
     Orig_MenuBuild     = MakeGuestTramp(0x21140, 6, "fe:tr.menubuild");
     Orig_MenuEnter     = MakeGuestTramp(0x21010, 5, "fe:tr.menuenter");
     Orig_MenuUpdate    = MakeGuestTramp(0x212D0, 6, "fe:tr.menuupdate");
-    if (!Orig_OptionsBuild || !Orig_OptionsUpdate || !Orig_MenuBuild || !Orig_MenuEnter || !Orig_MenuUpdate) {
+    Orig_GetText       = MakeGuestTramp(0x19910, 5, "fe:tr.gettext");
+    if (!Orig_OptionsBuild || !Orig_OptionsUpdate || !Orig_MenuBuild || !Orig_MenuEnter || !Orig_MenuUpdate || !Orig_GetText) {
         printf("[fe] trampoline alloc failed -- menu injection skipped\n");
         return 0;
     }
