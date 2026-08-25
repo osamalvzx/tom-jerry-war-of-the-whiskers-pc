@@ -62,32 +62,14 @@ void InitMods() {
     _snprintf_s(modsDir, sizeof(modsDir), _TRUNCATE, "%s\\mods", root);
     CreateDirectoryA(modsDir, nullptr);
 
-    // Initialize all standard mod categories if missing
-    CreateModTemplate(modsDir, "01_Arabic_Language_Pack", "ARABIC LANG PACK", "Osama (osamalvzx)",
-                      "Full Arabic localization and custom Arabic fonts package", 1,
-                      "MOD: 01_Arabic_Language_Pack\nPlace Arabic font textures in GFX/FE/\n");
 
-    CreateModTemplate(modsDir, "02_Character_Skins_Mod", "CHARACTER SKINS", "TJ Community",
-                      "Custom 3D character skins and costumes", 0,
-                      "MOD: 02_Character_Skins_Mod\nPlace character models in GFX/CAST/\n");
-
-    CreateModTemplate(modsDir, "03_Arenas_and_Stages_Mod", "ARENAS & STAGES", "TJ Community",
-                      "Custom arena textures and stage modifications", 0,
-                      "MOD: 03_Arenas_and_Stages_Mod\nPlace stage textures in GFX/<ARENA>/\n");
-
-    CreateModTemplate(modsDir, "04_Custom_Audio_and_Voices_Mod", "AUDIO & VOICES", "TJ Community",
-                      "Custom sound effects, voice lines, and music", 0,
-                      "MOD: 04_Custom_Audio_and_Voices_Mod\nPlace WAV files in AUDMUSIC/ or AUDSoundFX/\n");
-
-    CreateModTemplate(modsDir, "05_UI_and_HUD_Customizer", "UI & HUD CUSTOM", "TJ Community",
-                      "Custom menu graphics, health bars, and HUD", 0,
-                      "MOD: 05_UI_and_HUD_Customizer\nPlace UI textures in GFX/FE/ and GFX/OSD/\n");
-
-    CreateModTemplate(modsDir, "06_HD_Graphics_and_Textures_Mod", "HD GRAPHICS PACK", "TJ Community",
-                      "High-resolution remastered textures", 0,
-                      "MOD: 06_HD_Graphics_and_Textures_Mod\nPlace HD textures in GFX/\n");
+    // Initialize standard mods if missing
+    CreateModTemplate(modsDir, "Arabic_Language", "ARABIC LANG", "Osama", "Full Arabic localization", 1, "");
+    CreateModTemplate(modsDir, "Menu_Transitions", "MENU TRANS", "Osama", "Smooth UI animations", 1, "");
+    CreateModTemplate(modsDir, "Osama_Badge", "OSAMA BADGE", "Osama", "Display Osama signature", 1, "");
 
     char searchPattern[MAX_PATH];
+
     _snprintf_s(searchPattern, sizeof(searchPattern), _TRUNCATE, "%s\\*", modsDir);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(searchPattern, &fd);

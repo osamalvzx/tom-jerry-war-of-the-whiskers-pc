@@ -287,7 +287,7 @@ static void __fastcall Hk_OptionsBuild(uint32_t self, uint32_t edx) {
 
     // Initialize sub-menu items as a completely SEPARATE linked list
     int dynamicModCount = tj::hybrid::GetModCount();
-    g_activeModCount = dynamicModCount + 4; // 3 built-in (Anim, Osama, Lang) + dynamic + 1 BACK
+      g_activeModCount = dynamicModCount + 1; // 3 built-in (Anim, Osama, Lang) + dynamic + 1 BACK
     if (g_activeModCount > 35) g_activeModCount = 35;
     
     // Auto-calculate spacing so they fit on screen
@@ -323,27 +323,27 @@ static uint32_t __fastcall Hk_OptionsUpdate(uint32_t self, uint32_t edx) {
     (void)edx;
 
     // FORMAT STRINGS FIRST! The text renderer will read these during Orig_OptionsUpdate.
-    const char* s_on  = g_language ? AR_ON  : "ON";
-    const char* s_off = g_language ? AR_OFF : "OFF";
-    if (g_language) {
-        _snprintf_s(g_modLabels[0], sizeof(g_modLabels[0]), _TRUNCATE, "%s: %s", AR_MENU_TRANSITIONS, g_animMod ? s_on : s_off);
-        _snprintf_s(g_modLabels[1], sizeof(g_modLabels[1]), _TRUNCATE, "%s: %s", AR_OSAMA_BADGE, g_osamaMod ? s_on : s_off);
-    } else {
-        _snprintf_s(g_modLabels[0], sizeof(g_modLabels[0]), _TRUNCATE, "MENU TRANSITIONS: %s", g_animMod ? s_on : s_off);
-        _snprintf_s(g_modLabels[1], sizeof(g_modLabels[1]), _TRUNCATE, "OSAMA BADGE: %s", g_osamaMod ? s_on : s_off);
-    }
-    _snprintf_s(g_modLabels[2], sizeof(g_modLabels[2]), _TRUNCATE, "%s", g_language ? AR_LANGUAGE_ARABIC : AR_LANGUAGE_ENGLISH);
     
-    int dynamicModCount = tj::hybrid::GetModCount();
-    for (int i = 0; i < dynamicModCount && (i + 3) < 34; ++i) {
-        tj::hybrid::ModInfo* m = tj::hybrid::GetModInfo(i);
-        if (m) {
-            _snprintf_s(g_modLabels[i + 3], 64, _TRUNCATE, "%.20s: %s", m->name, m->enabled ? s_on : s_off);
-        }
-    }
-    if (g_activeModCount > 0) {
-        _snprintf_s(g_modLabels[g_activeModCount - 1], 64, _TRUNCATE, "%s", g_language ? AR_BACK : "BACK");
-    }
+      const char* s_on  = g_language ? AR_ON  : "ON";
+      const char* s_off = g_language ? AR_OFF : "OFF";
+      
+      int dynamicModCount = tj::hybrid::GetModCount();
+      for (int i = 0; i < dynamicModCount && i < 34; ++i) {
+          tj::hybrid::ModInfo* m = tj::hybrid::GetModInfo(i);
+          if (m) {
+              const char* label = m->name;
+              if (g_language) {
+                  if (strcmp(m->folder, "Arabic_Language") == 0) label = "حزمة التعريب";
+                  else if (strcmp(m->folder, "Menu_Transitions") == 0) label = "حركة القوائم";
+                  else if (strcmp(m->folder, "Osama_Badge") == 0) label = "شارة أسامة";
+              }
+              _snprintf_s(g_modLabels[i], 64, _TRUNCATE, "%.20s: %s", label, m->enabled ? s_on : s_off);
+          }
+      }
+      if (g_activeModCount > 0) {
+          _snprintf_s(g_modLabels[g_activeModCount - 1], 64, _TRUNCATE, "%s", g_language ? AR_BACK : "BACK");
+      }
+
 
     uint32_t optItems[] = {
         self + 0xA0, self + 0x334, self + 0x124, self + 0x2B0, self + 0x22C,
@@ -1109,26 +1109,21 @@ void __cdecl Hk_DrawText(uint32_t style, float x, float y, const char* fmt) {
           else if (strcmp(fmt, GuestInternStr("\xD8\xA5\xD9\x84\xD8\xBA\xD8\xA7\xD8\xA1")) == 0) { id = AR_STR_CANCEL; spaceCount = 6; }
           else if (strcmp(fmt, GuestInternStr("\xD8\xA7\xD8\xAE\xD8\xAA\xD9\x8A\xD8\xA7\xD8\xB1")) == 0) { id = AR_STR_SELECT; spaceCount = 6; }
         
-        // For strings that don't go through Hk_GetText (direct globals)
-        else if (strcmp(fmt, g_modLabels[0]) == 0) { id = g_animMod ? AR_STR_MENU_TRANS_ON : AR_STR_MENU_TRANS_OFF; spaceCount = 16; }
-        else if (strcmp(fmt, g_modLabels[1]) == 0) { id = g_osamaMod ? AR_STR_OSAMA_ON : AR_STR_OSAMA_OFF; spaceCount = 11; }
-        else if (strcmp(fmt, g_modLabels[2]) == 0) { id = AR_STR_LANG_ARABIC; spaceCount = 16; }
-        else {
-              for (int i = 0; i < tj::hybrid::GetModCount(); ++i) {
-                  if (strcmp(fmt, g_modLabels[i + 3]) == 0) {
-                      tj::hybrid::ModInfo* m = tj::hybrid::GetModInfo(i);
-                      if (m) {
-                          if (strcmp(m->folder, "01_Arabic_Language_Pack") == 0) { id = m->enabled ? AR_STR_MOD_ARABIC_ON : AR_STR_MOD_ARABIC_OFF; spaceCount = 16; }
-                          else if (strcmp(m->folder, "02_Character_Skins_Mod") == 0) { id = m->enabled ? AR_STR_MOD_SKINS_ON : AR_STR_MOD_SKINS_OFF; spaceCount = 16; }
-                          else if (strcmp(m->folder, "03_Arenas_and_Stages_Mod") == 0) { id = m->enabled ? AR_STR_MOD_ARENAS_ON : AR_STR_MOD_ARENAS_OFF; spaceCount = 16; }
-                          else if (strcmp(m->folder, "04_Custom_Audio_and_Voices_Mod") == 0) { id = m->enabled ? AR_STR_MOD_AUDIO_ON : AR_STR_MOD_AUDIO_OFF; spaceCount = 16; }
-                          else if (strcmp(m->folder, "05_UI_and_HUD_Customizer") == 0) { id = m->enabled ? AR_STR_MOD_UI_ON : AR_STR_MOD_UI_OFF; spaceCount = 16; }
-                          else if (strcmp(m->folder, "06_HD_Graphics_and_Textures_Mod") == 0) { id = m->enabled ? AR_STR_MOD_HD_ON : AR_STR_MOD_HD_OFF; spaceCount = 16; }
-                      }
-                      break;
-                  }
-              }
-          }
+        
+          else {
+                for (int i = 0; i < tj::hybrid::GetModCount(); ++i) {
+                    if (strcmp(fmt, g_modLabels[i]) == 0) {
+                        tj::hybrid::ModInfo* m = tj::hybrid::GetModInfo(i);
+                        if (m) {
+                            if (strcmp(m->folder, "Arabic_Language") == 0) { id = m->enabled ? AR_STR_MOD_ARABIC_ON : AR_STR_MOD_ARABIC_OFF; spaceCount = 16; }
+                            else if (strcmp(m->folder, "Menu_Transitions") == 0) { id = m->enabled ? AR_STR_MENU_TRANS_ON : AR_STR_MENU_TRANS_OFF; spaceCount = 16; }
+                            else if (strcmp(m->folder, "Osama_Badge") == 0) { id = m->enabled ? AR_STR_OSAMA_ON : AR_STR_OSAMA_OFF; spaceCount = 16; }
+                        }
+                        break;
+                    }
+                }
+            }
+
         
         if (id != AR_STR_COUNT) {
             if (s_arabQueueN < 64) {
@@ -1161,10 +1156,12 @@ int InstallFeMenu() {
     }
     // Boot resolution = same ini read (and clamp) the loader did for EnsureDisplay.
     char ini[MAX_PATH]; IniPath(ini, sizeof(ini));
-    g_language = GetPrivateProfileIntA("Mods", "Language", 0, ini);
-    g_animMod  = GetPrivateProfileIntA("Mods", "AnimMod", 1, ini) != 0;
-    g_osamaMod = GetPrivateProfileIntA("Mods", "OsamaMod", 1, ini) != 0;
-    int bootW = (int)GetPrivateProfileIntA("Display", "Width",  640, ini);
+    
+      g_language = tj::hybrid::IsModEnabled("Arabic_Language") ? 1 : 0;
+      g_animMod  = tj::hybrid::IsModEnabled("Menu_Transitions");
+      g_osamaMod = tj::hybrid::IsModEnabled("Osama_Badge");
+      int bootW = (int)GetPrivateProfileIntA("Display", "Width",  640, ini);
+
     int bootH = (int)GetPrivateProfileIntA("Display", "Height", 480, ini);
     if (bootW < 320 || bootW > 7680 || bootH < 240 || bootH > 4320) { bootW = 640; bootH = 480; }
     SyncModeFromDisplay(bootW, bootH);
