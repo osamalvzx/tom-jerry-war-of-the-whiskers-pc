@@ -1058,6 +1058,62 @@ static uint32_t __fastcall Hk_MenuUpdate(uint32_t self, uint32_t edx) {
     return LanMenuUpdate(self, r);                // r == 5 = the LAN row; also the launch gate
 }
 
+struct ArabDrawItem {
+    ArabicTextId id;
+    float x;
+    float y;
+    int frame;
+};
+static int s_arabFrameCounter = 0;
+static ArabDrawItem s_arabQueue[64];
+static int s_arabQueueN = 0;
+
+static uint32_t Orig_DrawText = 0;
+using FnDrawText = void (__cdecl*)(uint32_t style, float x, float y, const char* fmt);
+
+void __cdecl Hk_DrawText(uint32_t style, float x, float y, const char* fmt) {
+    if (g_language == 1 && fmt) {
+        ArabicTextId id = AR_STR_COUNT; // using AR_STR_COUNT as MAX
+        int spaceCount = 5;
+        
+        if (fmt == GuestInternStr(AR_CHALLENGE)) { id = AR_STR_CHALLENGE; spaceCount = 9; }
+        else if (fmt == GuestInternStr(AR_MULTIPLAYER)) { id = AR_STR_MULTIPLAYER; spaceCount = 11; }
+        else if (fmt == GuestInternStr(AR_LAN_GAME)) { id = AR_STR_LAN_GAME; spaceCount = 8; }
+        else if (fmt == GuestInternStr(AR_OPTIONS)) { id = AR_STR_OPTIONS; spaceCount = 7; }
+        else if (fmt == GuestInternStr(AR_FIGHT_SETTINGS)) { id = AR_STR_FIGHT_SETTINGS; spaceCount = 14; }
+        else if (fmt == GuestInternStr(AR_SAVE_GAME)) { id = AR_STR_SAVE_GAME; spaceCount = 9; }
+        else if (fmt == GuestInternStr(AR_AUDIO)) { id = AR_STR_AUDIO; spaceCount = 5; }
+        else if (fmt == GuestInternStr(AR_CREDITS)) { id = AR_STR_CREDITS; spaceCount = 7; }
+        else if (fmt == GuestInternStr(AR_CHEATS_MENU)) { id = AR_STR_CHEATS; spaceCount = 11; } // AR_STR_CHEATS
+        else if (fmt == GuestInternStr(AR_BACK)) { id = AR_STR_BACK; spaceCount = 4; }
+        else if (fmt == GuestInternStr(AR_EXIT)) { id = AR_STR_EXIT; spaceCount = 4; }
+        else if (fmt == GuestInternStr("أ¯آ»آ¤أ¯آ»آŒأ¯آ»آ§")) { id = AR_STR_YES; spaceCount = 3; }
+        else if (fmt == GuestInternStr("أ¯آ؛آژأ¯آ»آں")) { id = AR_STR_NO; spaceCount = 2; }
+        
+        // For strings that don't go through Hk_GetText (direct globals)
+        else if (fmt == g_modLabels[0]) { id = g_animMod ? AR_STR_MENU_TRANS_ON : AR_STR_MENU_TRANS_OFF; spaceCount = 16; }
+        else if (fmt == g_modLabels[1]) { id = g_osamaMod ? AR_STR_OSAMA_ON : AR_STR_OSAMA_OFF; spaceCount = 11; }
+        else if (fmt == g_modLabels[2]) { id = AR_STR_LANG_ARABIC; spaceCount = 16; }
+        else if (fmt == g_modLabels[3]) { id = AR_STR_MOD_ARABIC_ON; spaceCount = 16; }
+        
+        if (id != AR_STR_COUNT) {
+            if (s_arabQueueN < 64) {
+                s_arabQueue[s_arabQueueN++] = { id, x, y, s_arabFrameCounter };
+            }
+            // Draw spaces instead of the Arabic UTF-8 text
+            const char* spaces = "                                        ";
+            char temp[64];
+            strncpy_s(temp, spaces, spaceCount);
+            temp[spaceCount] = '\0';
+            GCALL(Cdecl, FnDrawText, Orig_DrawText, style, x, y, temp);
+            return;
+        }
+    }
+    // Call original for everything else
+    GCALL(Cdecl, FnDrawText, Orig_DrawText, style, x, y, fmt);
+}
+
+
 int InstallFeMenu() {
     // Guest-visible text: defaults for the arena-resident labels, and the save-text
     // literals duplicated into the arena (the guest stores Hk_GetText's pointers).
@@ -1094,6 +1150,7 @@ int InstallFeMenu() {
     Orig_MenuBuild     = MakeGuestTramp(0x21140, 6, "fe:tr.menubuild");
     Orig_MenuEnter     = MakeGuestTramp(0x21010, 5, "fe:tr.menuenter");
     Orig_MenuUpdate    = MakeGuestTramp(0x212D0, 6, "fe:tr.menuupdate");
+    Orig_DrawText      = MakeGuestTramp(0x167F0, 6, "fe:tr.drawtext");
     Orig_GetText       = MakeGuestTramp(0x19910, 5, "fe:tr.gettext");
     if (!Orig_OptionsBuild || !Orig_OptionsUpdate || !Orig_MenuBuild || !Orig_MenuEnter || !Orig_MenuUpdate || !Orig_GetText) {
         printf("[fe] trampoline alloc failed -- menu injection skipped\n");
@@ -1105,12 +1162,16 @@ int InstallFeMenu() {
     n += PatchJump(0x21140, HOOK_FC(Hk_MenuBuild),     "FE_MenuBuild");
     n += PatchJump(0x21010, HOOK_FC(Hk_MenuEnter),     "FE_MenuEnter");
     n += PatchJump(0x212D0, HOOK_FC(Hk_MenuUpdate),    "FE_MenuUpdate");
-    n += PatchJump(0x19910, HOOK_CDECL(Hk_GetText),    "FE_GetText");
+    n += PatchJump(0x167F0, HOOK_CDECL(Hk_DrawText), "FE_DrawText");
+      n += PatchJump(0x19910, HOOK_CDECL(Hk_GetText),    "FE_GetText");
     printf("[fe] menu injection installed (%d patches), boot mode %dx%d\n", n, bootW, bootH);
     return n;
 }
 
+
 void FeMenuDrawCustomOverlay(tj::gfx::Device& dev, int frame) {
+    s_arabFrameCounter = frame;
+
     // 1. Draw Arabic Custom Rendered Menu Items if Arabic Language is active
     if (g_language == 1) {
         static tj::gfx::TextureHandle s_arabicAtlasTex = -1;
