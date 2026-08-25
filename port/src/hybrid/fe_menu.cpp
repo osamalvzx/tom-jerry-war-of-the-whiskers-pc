@@ -1084,7 +1084,22 @@ static int s_arabQueueN = 0;
 static uint32_t Orig_DrawText = 0;
 using FnDrawText = void (__cdecl*)(uint32_t style, float x, float y, const char* fmt);
 
-void __cdecl Hk_DrawText(uint32_t style, float x, float y, const char* fmt) {
+
+
+static bool IsExactMatch(const char* fmt, const char* target) {
+    const char* p = strstr(fmt, target);
+    if (!p) return false;
+    return strlen(p) == strlen(target);
+}
+
+void __cdecl Hk_DrawText(
+uint32_t style, float x, float y, const char* fmt) {
+    if (fmt) {
+        static FILE* log = nullptr;
+        if (!log) fopen_s(&log, "drawtext_log.txt", "a");
+        if (log) { fprintf(log, "DrawText: '%s'\n", fmt); fflush(log); }
+    }
+
     if (g_language == 1 && fmt) {
         ArabicTextId id = AR_STR_COUNT; // using AR_STR_COUNT as MAX
         int spaceCount = 5;
