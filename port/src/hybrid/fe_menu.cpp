@@ -198,7 +198,12 @@ static char* __cdecl Hk_GetText(uint32_t idxArg) {
         if (strcmp(text, "BACK") == 0) return (char*)GuestInternStr(AR_BACK);
         if (strcmp(text, "EXIT") == 0) return (char*)GuestInternStr(AR_EXIT);
         if (strcmp(text, "YES") == 0) return (char*)GuestInternStr("أ¯آ»آ¤أ¯آ»آŒأ¯آ»آ§"); // ظ†ط¹ظ…
-        if (strcmp(text, "NO") == 0) return (char*)GuestInternStr("أ¯آ؛آژأ¯آ»آں"); // ظ„ط§
+        if (strcmp(text, "NO") == 0) return (char*)GuestInternStr("أ¯آ؛آژأ¯آ»آں");
+          if (strcmp(text, "MUSIC") == 0) return (char*)GuestInternStr("\xD9\x85\xD9\x88\xD8\xB3\xD9\x8A\xD9\x82\xD9\x89");
+          if (strcmp(text, "EFFECTS") == 0) return (char*)GuestInternStr("\xD8\xAA\xD8\xA3\xD8\xAB\xD9\x8A\xD8\xB1\xD8\xA7\xD8\xAA");
+          if (strcmp(text, "CONFIRM") == 0) return (char*)GuestInternStr("\xD8\xAA\xD8\xA3\xD9\x83\xD9\x8A\xD8\xAF");
+          if (strcmp(text, "CANCEL") == 0) return (char*)GuestInternStr("\xD8\xA5\xD9\x84\xD8\xBA\xD8\xA7\xD8\xA1");
+          if (strcmp(text, "SELECT") == 0) return (char*)GuestInternStr("\xD8\xA7\xD8\xAE\xD8\xAA\xD9\x8A\xD8\xA7\xD8\xB1"); // ظ„ط§
     }
     for (const auto& s : kSaveText) if (s.idx == idx) return (char*)s.text;
     // The guest STORES the returned pointer, so any host-image literal a provider hands back
@@ -1098,6 +1103,11 @@ void __cdecl Hk_DrawText(uint32_t style, float x, float y, const char* fmt) {
         else if (strcmp(fmt, GuestInternStr(AR_EXIT)) == 0) { id = AR_STR_EXIT; spaceCount = 4; }
         else if (strcmp(fmt, GuestInternStr("أ¯آ»آ¤أ¯آ»آŒأ¯آ»آ§")) == 0) { id = AR_STR_YES; spaceCount = 3; }
         else if (strcmp(fmt, GuestInternStr("أ¯آ؛آژأ¯آ»آں")) == 0) { id = AR_STR_NO; spaceCount = 2; }
+          else if (strcmp(fmt, GuestInternStr("\xD9\x85\xD9\x88\xD8\xB3\xD9\x8A\xD9\x82\xD9\x89")) == 0) { id = AR_STR_MUSIC; spaceCount = 5; }
+          else if (strcmp(fmt, GuestInternStr("\xD8\xAA\xD8\xA3\xD8\xAB\xD9\x8A\xD8\xB1\xD8\xA7\xD8\xAA")) == 0) { id = AR_STR_EFFECTS; spaceCount = 7; }
+          else if (strcmp(fmt, GuestInternStr("\xD8\xAA\xD8\xA3\xD9\x83\xD9\x8A\xD8\xAF")) == 0) { id = AR_STR_CONFIRM; spaceCount = 7; }
+          else if (strcmp(fmt, GuestInternStr("\xD8\xA5\xD9\x84\xD8\xBA\xD8\xA7\xD8\xA1")) == 0) { id = AR_STR_CANCEL; spaceCount = 6; }
+          else if (strcmp(fmt, GuestInternStr("\xD8\xA7\xD8\xAE\xD8\xAA\xD9\x8A\xD8\xA7\xD8\xB1")) == 0) { id = AR_STR_SELECT; spaceCount = 6; }
         
         // For strings that don't go through Hk_GetText (direct globals)
         else if (strcmp(fmt, g_modLabels[0]) == 0) { id = g_animMod ? AR_STR_MENU_TRANS_ON : AR_STR_MENU_TRANS_OFF; spaceCount = 16; }
@@ -1209,6 +1219,7 @@ void FeMenuDrawCustomOverlay(tj::gfx::Device& dev, int frame) {
                     float scale = 0.040f;
                     if (s_arabQueue[i].id == AR_STR_OPTIONS || s_arabQueue[i].id == AR_STR_FIGHT_SETTINGS || s_arabQueue[i].id == AR_STR_AUDIO || s_arabQueue[i].id == AR_STR_CREDITS || s_arabQueue[i].id == AR_STR_SAVE_GAME || s_arabQueue[i].id == AR_STR_CHEATS || s_arabQueue[i].id == AR_STR_MODS_CONFIG) scale = 0.038f;
                     if (s_arabQueue[i].id == AR_STR_YES || s_arabQueue[i].id == AR_STR_NO) scale = 0.024f;
+                      if (s_arabQueue[i].id == AR_STR_CANCEL || s_arabQueue[i].id == AR_STR_SELECT) scale = 0.026f;
                     
                     DrawArabicTextQuad(dev, s_arabicAtlasTex, s_arabQueue[i].id, s_arabQueue[i].x, s_arabQueue[i].y, scale);
             }
