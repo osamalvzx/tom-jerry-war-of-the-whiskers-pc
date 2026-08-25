@@ -176,7 +176,15 @@ static char* __cdecl Hk_GetText(uint32_t idxArg) {
     using FnGetText = char* (__cdecl*)(uint32_t);
     extern uint32_t Orig_GetText;
     char* text = GCALL(Cdecl, FnGetText, Orig_GetText, idxArg);
+   
+    // Also fetch text from our custom providers if Orig_GetText didn't have it (or to override)
+    if (const char* lan = LanCustomText(idx)) text = (char*)lan;
+    else if (const char* a = AudioCustomText(idx)) text = (char*)a;
+    else if (const char* mt = MeatCustomText(idx)) text = (char*)mt;
+    else if (const char* mm = MeatMenuText(idx)) text = (char*)mm;
     
+    for (const auto& s : kSaveText) { if (s.idx == idx) { text = (char*)s.text; break; } }
+ 
     if (g_language == 1 && text) {
         if (strcmp(text, "CHALLENGE") == 0) return (char*)GuestInternStr(AR_CHALLENGE);
         if (strcmp(text, "MULTIPLAYER") == 0) return (char*)GuestInternStr(AR_MULTIPLAYER);
@@ -1076,25 +1084,25 @@ void __cdecl Hk_DrawText(uint32_t style, float x, float y, const char* fmt) {
         ArabicTextId id = AR_STR_COUNT; // using AR_STR_COUNT as MAX
         int spaceCount = 5;
         
-        if (fmt == GuestInternStr(AR_CHALLENGE)) { id = AR_STR_CHALLENGE; spaceCount = 9; }
-        else if (fmt == GuestInternStr(AR_MULTIPLAYER)) { id = AR_STR_MULTIPLAYER; spaceCount = 11; }
-        else if (fmt == GuestInternStr(AR_LAN_GAME)) { id = AR_STR_LAN_GAME; spaceCount = 8; }
-        else if (fmt == GuestInternStr(AR_OPTIONS)) { id = AR_STR_OPTIONS; spaceCount = 7; }
-        else if (fmt == GuestInternStr(AR_FIGHT_SETTINGS)) { id = AR_STR_FIGHT_SETTINGS; spaceCount = 14; }
-        else if (fmt == GuestInternStr(AR_SAVE_GAME)) { id = AR_STR_SAVE_GAME; spaceCount = 9; }
-        else if (fmt == GuestInternStr(AR_AUDIO)) { id = AR_STR_AUDIO; spaceCount = 5; }
-        else if (fmt == GuestInternStr(AR_CREDITS)) { id = AR_STR_CREDITS; spaceCount = 7; }
-        else if (fmt == GuestInternStr(AR_CHEATS_MENU)) { id = AR_STR_CHEATS; spaceCount = 11; } // AR_STR_CHEATS
-        else if (fmt == GuestInternStr(AR_BACK)) { id = AR_STR_BACK; spaceCount = 4; }
-        else if (fmt == GuestInternStr(AR_EXIT)) { id = AR_STR_EXIT; spaceCount = 4; }
-        else if (fmt == GuestInternStr("أ¯آ»آ¤أ¯آ»آŒأ¯آ»آ§")) { id = AR_STR_YES; spaceCount = 3; }
-        else if (fmt == GuestInternStr("أ¯آ؛آژأ¯آ»آں")) { id = AR_STR_NO; spaceCount = 2; }
+        if (strcmp(fmt, GuestInternStr(AR_CHALLENGE)) == 0) { id = AR_STR_CHALLENGE; spaceCount = 9; }
+        else if (strcmp(fmt, GuestInternStr(AR_MULTIPLAYER)) == 0) { id = AR_STR_MULTIPLAYER; spaceCount = 11; }
+        else if (strcmp(fmt, GuestInternStr(AR_LAN_GAME)) == 0) { id = AR_STR_LAN_GAME; spaceCount = 8; }
+        else if (strcmp(fmt, GuestInternStr(AR_OPTIONS)) == 0) { id = AR_STR_OPTIONS; spaceCount = 7; }
+        else if (strcmp(fmt, GuestInternStr(AR_FIGHT_SETTINGS)) == 0) { id = AR_STR_FIGHT_SETTINGS; spaceCount = 14; }
+        else if (strcmp(fmt, GuestInternStr(AR_SAVE_GAME)) == 0) { id = AR_STR_SAVE_GAME; spaceCount = 9; }
+        else if (strcmp(fmt, GuestInternStr(AR_AUDIO)) == 0) { id = AR_STR_AUDIO; spaceCount = 5; }
+        else if (strcmp(fmt, GuestInternStr(AR_CREDITS)) == 0) { id = AR_STR_CREDITS; spaceCount = 7; }
+        else if (strcmp(fmt, GuestInternStr(AR_CHEATS_MENU)) == 0) { id = AR_STR_CHEATS; spaceCount = 11; } // AR_STR_CHEATS
+        else if (strcmp(fmt, GuestInternStr(AR_BACK)) == 0) { id = AR_STR_BACK; spaceCount = 4; }
+        else if (strcmp(fmt, GuestInternStr(AR_EXIT)) == 0) { id = AR_STR_EXIT; spaceCount = 4; }
+        else if (strcmp(fmt, GuestInternStr("أ¯آ»آ¤أ¯آ»آŒأ¯آ»آ§")) == 0) { id = AR_STR_YES; spaceCount = 3; }
+        else if (strcmp(fmt, GuestInternStr("أ¯آ؛آژأ¯آ»آں")) == 0) { id = AR_STR_NO; spaceCount = 2; }
         
         // For strings that don't go through Hk_GetText (direct globals)
-        else if (fmt == g_modLabels[0]) { id = g_animMod ? AR_STR_MENU_TRANS_ON : AR_STR_MENU_TRANS_OFF; spaceCount = 16; }
-        else if (fmt == g_modLabels[1]) { id = g_osamaMod ? AR_STR_OSAMA_ON : AR_STR_OSAMA_OFF; spaceCount = 11; }
-        else if (fmt == g_modLabels[2]) { id = AR_STR_LANG_ARABIC; spaceCount = 16; }
-        else if (fmt == g_modLabels[3]) { id = AR_STR_MOD_ARABIC_ON; spaceCount = 16; }
+        else if (strcmp(fmt, g_modLabels[0]) == 0) { id = g_animMod ? AR_STR_MENU_TRANS_ON : AR_STR_MENU_TRANS_OFF; spaceCount = 16; }
+        else if (strcmp(fmt, g_modLabels[1]) == 0) { id = g_osamaMod ? AR_STR_OSAMA_ON : AR_STR_OSAMA_OFF; spaceCount = 11; }
+        else if (strcmp(fmt, g_modLabels[2]) == 0) { id = AR_STR_LANG_ARABIC; spaceCount = 16; }
+        else if (strcmp(fmt, g_modLabels[3]) == 0) { id = AR_STR_MOD_ARABIC_ON; spaceCount = 16; }
         
         if (id != AR_STR_COUNT) {
             if (s_arabQueueN < 64) {
@@ -1180,83 +1188,20 @@ void FeMenuDrawCustomOverlay(tj::gfx::Device& dev, int frame) {
         }
         
         if (s_arabicAtlasTex >= 0) {
-            // Main Menu (Screen 4)
-            if (frame - s_lastMainAnimFrame <= 2 && !g_exitModal && (frame - s_lastOptFrame > 2)) {
-                float mainYs[5] = { 0.28f, 0.38f, 0.48f, 0.58f, 0.68f };
-                ArabicTextId mainTexts[5] = {
-                    AR_STR_CHALLENGE,
-                    AR_STR_MULTIPLAYER,
-                    AR_STR_LAN_GAME,
-                    AR_STR_OPTIONS,
-                    AR_STR_EXIT
-                };
-                for (int i = 0; i < 5; ++i) {
-                    DrawArabicTextQuad(dev, s_arabicAtlasTex, mainTexts[i], s_mainCurX[i], mainYs[i], s_mainScale[i]);
+            for (int i = 0; i < s_arabQueueN; ++i) {
+                if (s_arabQueue[i].frame == frame) {
+                    float scale = 0.040f;
+                    if (s_arabQueue[i].id == AR_STR_OPTIONS || s_arabQueue[i].id == AR_STR_FIGHT_SETTINGS || s_arabQueue[i].id == AR_STR_AUDIO || s_arabQueue[i].id == AR_STR_CREDITS || s_arabQueue[i].id == AR_STR_SAVE_GAME || s_arabQueue[i].id == AR_STR_CHEATS) scale = 0.038f;
+                    if (s_arabQueue[i].id == AR_STR_YES || s_arabQueue[i].id == AR_STR_NO) scale = 0.024f;
+                    
+                    DrawArabicTextQuad(dev, s_arabicAtlasTex, s_arabQueue[i].id, s_arabQueue[i].x, s_arabQueue[i].y, scale);
                 }
             }
-            // Options Menu & Mods Config Menu (Screen 10)
-            else if (frame - s_lastOptFrame <= 2) {
-                if (!g_modsMenuOpen) {
-                    float optYs[7] = { 0.22f, 0.29f, 0.36f, 0.43f, 0.50f, 0.57f, 0.64f };
-                    ArabicTextId optTexts[7] = {
-                        AR_STR_FIGHT_SETTINGS,
-                        AR_STR_SAVE_GAME,
-                        AR_STR_AUDIO,
-                        AR_STR_CREDITS,
-                        AR_STR_CHEATS,
-                        AR_STR_MODS_CONFIG,
-                        AR_STR_BACK
-                    };
-                    for (int i = 0; i < 7; ++i) {
-                        DrawArabicTextQuad(dev, s_arabicAtlasTex, optTexts[i], s_optCurX[i], optYs[i], s_optScale[i]);
-                    }
-                } else {
-                    float startY = (g_activeModCount > 6) ? 0.20f : 0.25f;
-                    float endY = 0.88f;
-                    float stepY = g_activeModCount > 1 ? (endY - startY) / (g_activeModCount - 1) : 0.055f;
-                    if (stepY > 0.055f) stepY = 0.055f;
-                    
-                    // Row 0: Menu Transitions
-                    DrawArabicTextQuad(dev, s_arabicAtlasTex, g_animMod ? AR_STR_MENU_TRANS_ON : AR_STR_MENU_TRANS_OFF,
-                                       s_modCurX[0], startY, s_modScale[0]);
-                    // Row 1: Osama Badge
-                    DrawArabicTextQuad(dev, s_arabicAtlasTex, g_osamaMod ? AR_STR_OSAMA_ON : AR_STR_OSAMA_OFF,
-                                       s_modCurX[1], startY + stepY, s_modScale[1]);
-                    // Row 2: Language
-                    DrawArabicTextQuad(dev, s_arabicAtlasTex, AR_STR_LANG_ARABIC,
-                                       s_modCurX[2], startY + 2.0f * stepY, s_modScale[2]);
-                    
-                    // Dynamic Mod Rows
-                    static const ArabicTextId kModTextOn[6] = {
-                        AR_STR_MOD_ARABIC_ON, AR_STR_MOD_SKINS_ON, AR_STR_MOD_ARENAS_ON,
-                        AR_STR_MOD_AUDIO_ON, AR_STR_MOD_UI_ON, AR_STR_MOD_HD_ON
-                    };
-                    static const ArabicTextId kModTextOff[6] = {
-                        AR_STR_MOD_ARABIC_OFF, AR_STR_MOD_SKINS_OFF, AR_STR_MOD_ARENAS_OFF,
-                        AR_STR_MOD_AUDIO_OFF, AR_STR_MOD_UI_OFF, AR_STR_MOD_HD_OFF
-                    };
-                    
-                    for (int i = 0; i < 6 && (i + 3) < (g_activeModCount - 1); ++i) {
-                        tj::hybrid::ModInfo* m = tj::hybrid::GetModInfo(i);
-                        bool en = m ? m->enabled : false;
-                        DrawArabicTextQuad(dev, s_arabicAtlasTex, en ? kModTextOn[i] : kModTextOff[i],
-                                           s_modCurX[i + 3], startY + (float)(i + 3) * stepY, s_modScale[i + 3]);
-                    }
-                    
-                    // Last Row: BACK
-                    if (g_activeModCount > 0) {
-                        int backIdx = g_activeModCount - 1;
-                        DrawArabicTextQuad(dev, s_arabicAtlasTex, AR_STR_BACK,
-                                           s_modCurX[backIdx], startY + (float)backIdx * stepY, s_modScale[backIdx]);
-                    }
-                }
-            }
+            if (s_arabQueueN > 0 && s_arabQueue[s_arabQueueN - 1].frame != frame) s_arabQueueN = 0;
+            s_arabQueueN = 0;
             
-            // Exit Modal Overlay
             if (g_exitModal) {
                 DrawArabicTextQuad(dev, s_arabicAtlasTex, AR_STR_EXIT_CONFIRM, 0.28f, 0.40f, 0.026f);
-                DrawArabicTextQuad(dev, s_arabicAtlasTex, AR_STR_YES, 0.38f, 0.52f, 0.024f);
-                DrawArabicTextQuad(dev, s_arabicAtlasTex, AR_STR_NO, 0.56f, 0.52f, 0.024f);
             }
         }
     }
