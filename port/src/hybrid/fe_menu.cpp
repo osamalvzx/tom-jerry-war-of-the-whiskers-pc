@@ -18,6 +18,7 @@
 //   indices >= 0xE3 never occur in retail data, so they address our custom strings.
 #include "arabic_strings.h"
 #include "saudi_flag_rgba.h"
+#include "arabic_atlas_rgba.h"
 #include "us_flag_rgba.h"
 #include "hybrid/xdk_patch.h"
 #include "hybrid/mod_manager.h"
@@ -238,6 +239,10 @@ static int      s_optSelTimer[7]    = { 0 };
 static int      s_modSelTimer[35]   = { 0 };
 static float    s_optCurX[7]        = { 0.28f, 0.28f, 0.28f, 0.28f, 0.28f, 0.28f, 0.28f };
 static float    s_modCurX[35]       = { 0.28f };
+static float    s_optScale[7]       = { 0.024f, 0.024f, 0.024f, 0.024f, 0.024f, 0.024f, 0.024f };
+static float    s_modScale[35]      = { 0.021f };
+static float    s_mainCurX[5]       = { 0.28f, 0.28f, 0.28f, 0.28f, 0.28f };
+static float    s_mainScale[5]      = { 0.024f, 0.024f, 0.024f, 0.024f, 0.024f };
 static bool     s_lastModsMenuState = false;
 static int      s_lastOptFrame      = -100;
 
@@ -483,8 +488,11 @@ static uint32_t __fastcall Hk_OptionsUpdate(uint32_t self, uint32_t edx) {
 
                 // Smooth horizontal easing
                 s_optCurX[i] += (targetX - s_optCurX[i]) * 0.32f;
+                s_optScale[i] = targetScale;
                 SetItemMetrics(it, s_optCurX[i], optYs[i], targetScale, 1);
             } else {
+                s_optCurX[i] = targetX;
+                s_optScale[i] = targetScale;
                 SetItemMetrics(it, targetX, optYs[i], targetScale, 1);
             }
         }
@@ -526,8 +534,11 @@ static uint32_t __fastcall Hk_OptionsUpdate(uint32_t self, uint32_t edx) {
                 }
 
                 s_modCurX[i] += (targetX - s_modCurX[i]) * 0.32f;
+                s_modScale[i] = targetScale;
                 SetItemMetrics(it, s_modCurX[i], yPos, targetScale, 1);
             } else {
+                s_modCurX[i] = targetX;
+                s_modScale[i] = targetScale;
                 SetItemMetrics(it, targetX, yPos, targetScale, 1);
             }
         }
@@ -981,9 +992,13 @@ static void AnimateMainScreen(uint32_t self) {
 
             float newX = curX + (targetX - curX) * 0.30f;
             *(float*)(uintptr_t)(it + 0x40) = newX;
+            s_mainCurX[i] = newX;
+            s_mainScale[i] = targetScale;
 
             SetScale(it, 0, *(uint32_t*)&targetScale);
         } else {
+            s_mainCurX[i] = targetX;
+            s_mainScale[i] = targetScale;
             SetItemMetrics(it, targetX, mainYs[i], targetScale, 1);
         }
     }
@@ -1096,6 +1111,96 @@ int InstallFeMenu() {
 }
 
 void FeMenuDrawCustomOverlay(tj::gfx::Device& dev, int frame) {
+    // 1. Draw Arabic Custom Rendered Menu Items if Arabic Language is active
+    if (g_language == 1) {
+        static tj::gfx::TextureHandle s_arabicAtlasTex = -1;
+        if (s_arabicAtlasTex < 0) {
+            s_arabicAtlasTex = dev.CreateTexture(ArabicAtlasPixels(), kArabicAtlasW, kArabicAtlasH);
+        }
+        
+        if (s_arabicAtlasTex >= 0) {
+            // Main Menu (Screen 4)
+            if (frame - s_lastMainAnimFrame <= 2 && !g_exitModal && (frame - s_lastOptFrame > 2)) {
+                float mainYs[5] = { 0.28f, 0.38f, 0.48f, 0.58f, 0.68f };
+                ArabicTextId mainTexts[5] = {
+                    AR_STR_CHALLENGE,
+                    AR_STR_MULTIPLAYER,
+                    AR_STR_LAN_GAME,
+                    AR_STR_OPTIONS,
+                    AR_STR_EXIT
+                };
+                for (int i = 0; i < 5; ++i) {
+                    DrawArabicTextQuad(dev, s_arabicAtlasTex, mainTexts[i], s_mainCurX[i], mainYs[i], s_mainScale[i]);
+                }
+            }
+            // Options Menu & Mods Config Menu (Screen 10)
+            else if (frame - s_lastOptFrame <= 2) {
+                if (!g_modsMenuOpen) {
+                    float optYs[7] = { 0.22f, 0.29f, 0.36f, 0.43f, 0.50f, 0.57f, 0.64f };
+                    ArabicTextId optTexts[7] = {
+                        AR_STR_FIGHT_SETTINGS,
+                        AR_STR_SAVE_GAME,
+                        AR_STR_AUDIO,
+                        AR_STR_CREDITS,
+                        AR_STR_CHEATS,
+                        AR_STR_MODS_CONFIG,
+                        AR_STR_BACK
+                    };
+                    for (int i = 0; i < 7; ++i) {
+                        DrawArabicTextQuad(dev, s_arabicAtlasTex, optTexts[i], s_optCurX[i], optYs[i], s_optScale[i]);
+                    }
+                } else {
+                    float startY = (g_activeModCount > 6) ? 0.20f : 0.25f;
+                    float endY = 0.88f;
+                    float stepY = g_activeModCount > 1 ? (endY - startY) / (g_activeModCount - 1) : 0.055f;
+                    if (stepY > 0.055f) stepY = 0.055f;
+                    
+                    // Row 0: Menu Transitions
+                    DrawArabicTextQuad(dev, s_arabicAtlasTex, g_animMod ? AR_STR_MENU_TRANS_ON : AR_STR_MENU_TRANS_OFF,
+                                       s_modCurX[0], startY, s_modScale[0]);
+                    // Row 1: Osama Badge
+                    DrawArabicTextQuad(dev, s_arabicAtlasTex, g_osamaMod ? AR_STR_OSAMA_ON : AR_STR_OSAMA_OFF,
+                                       s_modCurX[1], startY + stepY, s_modScale[1]);
+                    // Row 2: Language
+                    DrawArabicTextQuad(dev, s_arabicAtlasTex, AR_STR_LANG_ARABIC,
+                                       s_modCurX[2], startY + 2.0f * stepY, s_modScale[2]);
+                    
+                    // Dynamic Mod Rows
+                    static const ArabicTextId kModTextOn[6] = {
+                        AR_STR_MOD_ARABIC_ON, AR_STR_MOD_SKINS_ON, AR_STR_MOD_ARENAS_ON,
+                        AR_STR_MOD_AUDIO_ON, AR_STR_MOD_UI_ON, AR_STR_MOD_HD_ON
+                    };
+                    static const ArabicTextId kModTextOff[6] = {
+                        AR_STR_MOD_ARABIC_OFF, AR_STR_MOD_SKINS_OFF, AR_STR_MOD_ARENAS_OFF,
+                        AR_STR_MOD_AUDIO_OFF, AR_STR_MOD_UI_OFF, AR_STR_MOD_HD_OFF
+                    };
+                    
+                    for (int i = 0; i < 6 && (i + 3) < (g_activeModCount - 1); ++i) {
+                        tj::hybrid::ModInfo* m = tj::hybrid::GetModInfo(i);
+                        bool en = m ? m->enabled : false;
+                        DrawArabicTextQuad(dev, s_arabicAtlasTex, en ? kModTextOn[i] : kModTextOff[i],
+                                           s_modCurX[i + 3], startY + (float)(i + 3) * stepY, s_modScale[i + 3]);
+                    }
+                    
+                    // Last Row: BACK
+                    if (g_activeModCount > 0) {
+                        int backIdx = g_activeModCount - 1;
+                        DrawArabicTextQuad(dev, s_arabicAtlasTex, AR_STR_BACK,
+                                           s_modCurX[backIdx], startY + (float)backIdx * stepY, s_modScale[backIdx]);
+                    }
+                }
+            }
+            
+            // Exit Modal Overlay
+            if (g_exitModal) {
+                DrawArabicTextQuad(dev, s_arabicAtlasTex, AR_STR_EXIT_CONFIRM, 0.28f, 0.40f, 0.026f);
+                DrawArabicTextQuad(dev, s_arabicAtlasTex, AR_STR_YES, 0.38f, 0.52f, 0.024f);
+                DrawArabicTextQuad(dev, s_arabicAtlasTex, AR_STR_NO, 0.56f, 0.52f, 0.024f);
+            }
+        }
+    }
+
+    // 2. Draw Flags for Language Selection Row
     if (g_modsMenuOpen && s_optLastSel == (uint32_t)(uintptr_t)g_modItems[2]) {
         static tj::gfx::TextureHandle s_flagTexEn = -1;
         static tj::gfx::TextureHandle s_flagTexAr = -1;
@@ -1132,7 +1237,7 @@ void FeMenuDrawCustomOverlay(tj::gfx::Device& dev, int frame) {
         }
     }
 
-    // Only draw when actively rendering the Main Menu or Options Menu
+    // 3. Draw 3D Osama Rotating Badge
     if (frame - s_lastMainAnimFrame > 1 || g_exitModal || !g_osamaMod) return;
 
     static tj::gfx::TextureHandle s_osamaTex = -1;
