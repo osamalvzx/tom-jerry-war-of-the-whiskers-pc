@@ -1086,13 +1086,34 @@ using FnDrawText = void (__cdecl*)(uint32_t style, float x, float y, const char*
 
 
 
-static bool IsExactMatch(const char* fmt, const char* target) {
-    const char* p = strstr(fmt, target);
-    if (!p) return false;
-    return strlen(p) == strlen(target);
+
+static bool MatchLoose(const char* fmt, const char* target) {
+    if (!fmt || !target) return false;
+    const char* f = fmt;
+    while (*f) {
+        const char* f_scan = f;
+        const char* t_scan = target;
+        bool matched = true;
+        while (*t_scan) {
+            if (*t_scan == ' ') { t_scan++; continue; }
+            while (*f_scan) {
+                if (*f_scan == '\x07' && *(f_scan + 1) != '\0') { f_scan += 2; continue; } // skip color code
+                if (*f_scan == '\x08' && *(f_scan + 1) != '\0') { f_scan += 2; continue; } // skip button icon
+                if (*f_scan == ' ' || *f_scan < 32) { f_scan++; continue; }
+                break;
+            }
+            if (!*f_scan || tolower((unsigned char)*f_scan) != tolower((unsigned char)*t_scan)) { matched = false; break; }
+            f_scan++;
+            t_scan++;
+        }
+        if (matched) return true;
+        f++;
+    }
+    return false;
 }
 
 void __cdecl Hk_DrawText(
+
 uint32_t style, float x, float y, const char* fmt) {
     if (fmt) {
         static FILE* log = nullptr;
