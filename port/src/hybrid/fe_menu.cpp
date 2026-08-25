@@ -1103,7 +1103,22 @@ void __cdecl Hk_DrawText(uint32_t style, float x, float y, const char* fmt) {
         else if (strcmp(fmt, g_modLabels[0]) == 0) { id = g_animMod ? AR_STR_MENU_TRANS_ON : AR_STR_MENU_TRANS_OFF; spaceCount = 16; }
         else if (strcmp(fmt, g_modLabels[1]) == 0) { id = g_osamaMod ? AR_STR_OSAMA_ON : AR_STR_OSAMA_OFF; spaceCount = 11; }
         else if (strcmp(fmt, g_modLabels[2]) == 0) { id = AR_STR_LANG_ARABIC; spaceCount = 16; }
-        else if (strcmp(fmt, g_modLabels[3]) == 0) { id = AR_STR_MOD_ARABIC_ON; spaceCount = 16; }
+        else {
+              for (int i = 0; i < tj::hybrid::GetModCount(); ++i) {
+                  if (strcmp(fmt, g_modLabels[i + 3]) == 0) {
+                      tj::hybrid::ModInfo* m = tj::hybrid::GetModInfo(i);
+                      if (m) {
+                          if (strcmp(m->folder, "01_Arabic_Language_Pack") == 0) { id = m->enabled ? AR_STR_MOD_ARABIC_ON : AR_STR_MOD_ARABIC_OFF; spaceCount = 16; }
+                          else if (strcmp(m->folder, "02_Character_Skins_Mod") == 0) { id = m->enabled ? AR_STR_MOD_SKINS_ON : AR_STR_MOD_SKINS_OFF; spaceCount = 16; }
+                          else if (strcmp(m->folder, "03_Arenas_and_Stages_Mod") == 0) { id = m->enabled ? AR_STR_MOD_ARENAS_ON : AR_STR_MOD_ARENAS_OFF; spaceCount = 16; }
+                          else if (strcmp(m->folder, "04_Custom_Audio_and_Voices_Mod") == 0) { id = m->enabled ? AR_STR_MOD_AUDIO_ON : AR_STR_MOD_AUDIO_OFF; spaceCount = 16; }
+                          else if (strcmp(m->folder, "05_UI_and_HUD_Customizer") == 0) { id = m->enabled ? AR_STR_MOD_UI_ON : AR_STR_MOD_UI_OFF; spaceCount = 16; }
+                          else if (strcmp(m->folder, "06_HD_Graphics_and_Textures_Mod") == 0) { id = m->enabled ? AR_STR_MOD_HD_ON : AR_STR_MOD_HD_OFF; spaceCount = 16; }
+                      }
+                      break;
+                  }
+              }
+          }
         
         if (id != AR_STR_COUNT) {
             if (s_arabQueueN < 64) {
