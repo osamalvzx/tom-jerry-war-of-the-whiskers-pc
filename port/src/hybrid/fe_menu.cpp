@@ -16,6 +16,9 @@
 //   Screen: +0x04 selected item, vtbl+0x18 AppendItem. Text lookup FUN_00019910 =
 //   cdecl(idx) -> char*: base 0x114C20, 0xFF bytes/entry, 0xE3 entries/language --
 //   indices >= 0xE3 never occur in retail data, so they address our custom strings.
+#include "arabic_strings.h"
+#include "saudi_flag_rgba.h"
+#include "us_flag_rgba.h"
 #include "hybrid/xdk_patch.h"
 #include "hybrid/mod_manager.h"
 #include "hybrid/meat_rush.h"
@@ -153,7 +156,8 @@ static uint8_t (&g_modsCfgItem)[0x84] = *(uint8_t(*)[0x84])GuestObjAlloc(0x84, 8
 static uint8_t (&g_modItems)[35][0x84] = *(uint8_t(*)[35][0x84])GuestObjAlloc(35 * 0x84, 8);
 static char (&g_modLabels)[35][64] = *(char(*)[35][64])GuestObjAlloc(35 * 64, 8);
 static bool g_modsMenuOpen = false;
-static bool g_osamaMod     = true; // Preserved for other code relying on this
+static bool g_osamaMod     = true;
+static int g_language = 0; // 0=EN, 1=AR // Preserved for other code relying on this
 static bool g_animMod      = true; // Preserved for other code relying on this
 static int g_activeModCount = 0;
 
@@ -164,6 +168,26 @@ static char* __cdecl Hk_GetText(uint32_t idxArg) {
     case 0xE3: return g_resLabel;
     case 0xE4: return g_dispLabel;
     case 0xE5: return g_exitQ;
+    }
+    
+    // Original Text fetch for translation
+    using FnGetText = char* (__cdecl*)(uint32_t);
+    char* text = GCALL(Cdecl, FnGetText, 0x19910, idxArg);
+    
+    if (g_language == 1 && text) {
+        if (strcmp(text, "CHALLENGE") == 0) return (char*)GuestInternStr(AR_CHALLENGE);
+        if (strcmp(text, "MULTIPLAYER") == 0) return (char*)GuestInternStr(AR_MULTIPLAYER);
+        if (strcmp(text, "LAN GAME") == 0) return (char*)GuestInternStr(AR_LAN_GAME);
+        if (strcmp(text, "OPTIONS") == 0) return (char*)GuestInternStr(AR_OPTIONS);
+        if (strcmp(text, "FIGHT SETTINGS") == 0) return (char*)GuestInternStr(AR_FIGHT_SETTINGS);
+        if (strcmp(text, "SAVE GAME") == 0) return (char*)GuestInternStr(AR_SAVE_GAME);
+        if (strcmp(text, "AUDIO") == 0) return (char*)GuestInternStr(AR_AUDIO);
+        if (strcmp(text, "CREDITS") == 0) return (char*)GuestInternStr(AR_CREDITS);
+        if (strcmp(text, "CHEATS MENU") == 0) return (char*)GuestInternStr(AR_CHEATS_MENU);
+        if (strcmp(text, "BACK") == 0) return (char*)GuestInternStr(AR_BACK);
+        if (strcmp(text, "EXIT") == 0) return (char*)GuestInternStr(AR_EXIT);
+        if (strcmp(text, "YES") == 0) return (char*)GuestInternStr("ï»¤ï»ï»§"); // نعم
+        if (strcmp(text, "NO") == 0) return (char*)GuestInternStr("ïºï»"); // لا
     }
     for (const auto& s : kSaveText) if (s.idx == idx) return (char*)s.text;
     // The guest STORES the returned pointer, so any host-image literal a provider hands back
@@ -180,7 +204,7 @@ static char* __cdecl Hk_GetText(uint32_t idxArg) {
     static const uint16_t kStrModBase = 0x200;
     if (idx == kStrLogo)    return (char*)GuestInternStr("TOM & JERRY");
     if (idx == kStrLogoSub) return (char*)GuestInternStr("WAR OF THE WHISKERS");
-    if (idx == kStrModsCfg) return (char*)GuestInternStr("MODS CONFIG");
+    if (idx == kStrModsCfg) return (char*)GuestInternStr(g_language ? AR_MODS_CONFIG : "MODS CONFIG");
     if (idx >= kStrModBase && idx < kStrModBase + 35) {
         return g_modLabels[idx - kStrModBase];
     }
@@ -279,18 +303,26 @@ static uint32_t __fastcall Hk_OptionsUpdate(uint32_t self, uint32_t edx) {
     (void)edx;
 
     // FORMAT STRINGS FIRST! The text renderer will read these during Orig_OptionsUpdate.
-    _snprintf_s(g_modLabels[0], sizeof(g_modLabels[0]), _TRUNCATE, "MENU TRANSITIONS: %s", g_animMod ? "ON" : "OFF");
-    _snprintf_s(g_modLabels[1], sizeof(g_modLabels[1]), _TRUNCATE, "OSAMA BADGE: %s", g_osamaMod ? "ON" : "OFF");
+    const char* s_on  = g_language ? AR_ON  : "ON";
+    const char* s_off = g_language ? AR_OFF : "OFF";
+    if (g_language) {
+        _snprintf_s(g_modLabels[0], sizeof(g_modLabels[0]), _TRUNCATE, "%s: %s", AR_MENU_TRANSITIONS, g_animMod ? s_on : s_off);
+        _snprintf_s(g_modLabels[1], sizeof(g_modLabels[1]), _TRUNCATE, "%s: %s", AR_OSAMA_BADGE, g_osamaMod ? s_on : s_off);
+    } else {
+        _snprintf_s(g_modLabels[0], sizeof(g_modLabels[0]), _TRUNCATE, "MENU TRANSITIONS: %s", g_animMod ? s_on : s_off);
+        _snprintf_s(g_modLabels[1], sizeof(g_modLabels[1]), _TRUNCATE, "OSAMA BADGE: %s", g_osamaMod ? s_on : s_off);
+    }
+    _snprintf_s(g_modLabels[2], sizeof(g_modLabels[2]), _TRUNCATE, "%s", g_language ? AR_LANGUAGE_ARABIC : AR_LANGUAGE_ENGLISH);
     
     int dynamicModCount = tj::hybrid::GetModCount();
-    for (int i = 0; i < dynamicModCount && (i + 2) < 34; ++i) {
+    for (int i = 0; i < dynamicModCount && (i + 3) < 34; ++i) {
         tj::hybrid::ModInfo* m = tj::hybrid::GetModInfo(i);
         if (m) {
-            _snprintf_s(g_modLabels[i + 2], 64, _TRUNCATE, "%.20s: %s", m->name, m->enabled ? "ON" : "OFF");
+            _snprintf_s(g_modLabels[i + 3], 64, _TRUNCATE, "%.20s: %s", m->name, m->enabled ? s_on : s_off);
         }
     }
     if (g_activeModCount > 0) {
-        _snprintf_s(g_modLabels[g_activeModCount - 1], 64, _TRUNCATE, "BACK");
+        _snprintf_s(g_modLabels[g_activeModCount - 1], 64, _TRUNCATE, "%s", g_language ? AR_BACK : "BACK");
     }
 
     uint32_t optItems[] = {
@@ -326,16 +358,22 @@ static uint32_t __fastcall Hk_OptionsUpdate(uint32_t self, uint32_t edx) {
                 if (GCALL(Fastcall, FnThisU32U32, 0x13470, input, 0, 2, pad)) b_pressed = true; // B (2)
             }
             if (a_pressed) {
+                char ini[MAX_PATH]; IniPath(ini, sizeof(ini));
                 if (sel == (uint32_t)(uintptr_t)g_modItems[0]) {
                     g_animMod = !g_animMod; PlayUiSound(0);
+                    WritePrivateProfileStringA("Mods", "AnimMod", g_animMod ? "1" : "0", ini);
                 } else if (sel == (uint32_t)(uintptr_t)g_modItems[1]) {
                     g_osamaMod = !g_osamaMod; PlayUiSound(0);
+                    WritePrivateProfileStringA("Mods", "OsamaMod", g_osamaMod ? "1" : "0", ini);
+                } else if (sel == (uint32_t)(uintptr_t)g_modItems[2]) {
+                    g_language = g_language ? 0 : 1; PlayUiSound(0);
+                    WritePrivateProfileStringA("Mods", "Language", g_language ? "1" : "0", ini);
                 } else if (sel == (uint32_t)(uintptr_t)g_modItems[g_activeModCount - 1]) {
                     b_pressed = true; // BACK option clicked with A
                 } else {
-                    for (int i = 2; i < g_activeModCount - 1; ++i) {
+                    for (int i = 3; i < g_activeModCount - 1; ++i) {
                         if (sel == (uint32_t)(uintptr_t)g_modItems[i]) {
-                            tj::hybrid::ToggleMod(i - 2);
+                            tj::hybrid::ToggleMod(i - 3);
                             PlayUiSound(0);
                             break;
                         }
@@ -1015,6 +1053,9 @@ int InstallFeMenu() {
     }
     // Boot resolution = same ini read (and clamp) the loader did for EnsureDisplay.
     char ini[MAX_PATH]; IniPath(ini, sizeof(ini));
+    g_language = GetPrivateProfileIntA("Mods", "Language", 0, ini);
+    g_animMod  = GetPrivateProfileIntA("Mods", "AnimMod", 1, ini) != 0;
+    g_osamaMod = GetPrivateProfileIntA("Mods", "OsamaMod", 1, ini) != 0;
     int bootW = (int)GetPrivateProfileIntA("Display", "Width",  640, ini);
     int bootH = (int)GetPrivateProfileIntA("Display", "Height", 480, ini);
     if (bootW < 320 || bootW > 7680 || bootH < 240 || bootH > 4320) { bootW = 640; bootH = 480; }
@@ -1051,6 +1092,42 @@ int InstallFeMenu() {
 }
 
 void FeMenuDrawCustomOverlay(tj::gfx::Device& dev, int frame) {
+    if (g_modsMenuOpen && s_optLastSel == (uint32_t)(uintptr_t)g_modItems[2]) {
+        static tj::gfx::TextureHandle s_flagTexEn = -1;
+        static tj::gfx::TextureHandle s_flagTexAr = -1;
+        if (s_flagTexEn < 0) s_flagTexEn = dev.CreateTexture(UsFlagPixels(), kUsFlagW, kUsFlagH);
+        if (s_flagTexAr < 0) s_flagTexAr = dev.CreateTexture(SaudiFlagPixels(), kSaudiFlagW, kSaudiFlagH);
+        
+        tj::gfx::TextureHandle ftex = g_language ? s_flagTexAr : s_flagTexEn;
+        if (ftex >= 0) {
+            float screenX = 0.65f;
+            float screenY = s_liveSelY + 0.016f;
+            float clipX = screenX * 2.0f - 1.0f;
+            float clipY = 1.0f - screenY * 2.0f;
+            float halfW = 0.035f;
+            float halfH = 0.035f * (16.0f / 9.0f) * ((float)kUsFlagH / (float)kUsFlagW);
+            uint32_t col = 0xFFFFFFFFu;
+            
+            tj::gfx::VertexPTC verts[4] = {
+                { clipX - halfW, clipY + halfH, 0.0f, 0.0f, 0.0f, col },
+                { clipX + halfW, clipY + halfH, 0.0f, 1.0f, 0.0f, col },
+                { clipX + halfW, clipY - halfH, 0.0f, 1.0f, 1.0f, col },
+                { clipX - halfW, clipY - halfH, 0.0f, 0.0f, 1.0f, col }
+            };
+            uint16_t indices[6] = { 0, 1, 2, 0, 2, 3 };
+            static const float kIdentity[16] = {
+                1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f
+            };
+            dev.SetTransform(kIdentity);
+            dev.SetTexture(ftex);
+            dev.SetBlendMode(tj::gfx::Device::BLEND_ALPHA, false);
+            dev.SetDepthTest(false);
+            dev.SetUvClamp(true, true);
+            dev.DrawIndexed(verts, 4, indices, 6);
+        }
+    }
+
     // Only draw when actively rendering the Main Menu or Options Menu
     if (frame - s_lastMainAnimFrame > 1 || g_exitModal || !g_osamaMod) return;
 
